@@ -1,0 +1,14 @@
+# Vula! Print Label Printer - Desktop App Requirements
+# For Debian 13 Trixie
+#
+# NOTE: PyQt6 and PyQt6-Qt6 are intentionally NOT listed here.
+# They are installed as system packages (python3-pyqt6) via apt in
+# install_printer_app.sh and inherited by the venv through
+# --system-site-packages.  Listing them here would cause pip to
+# re-download 80+ MB of Qt6 binaries unnecessarily.
+
+# HTTP Client
+requests>=2.31.0
+
+# Optional: better SSL certificate handling
+certifi>=2023.0.0
