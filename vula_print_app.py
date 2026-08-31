@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
 Vula! Print Label Printer Desktop Application
-Modern PyQt6 GUI for managing and printing label requests
+Modern PyQt6 GUI for managing and printing label requests — multi-store edition.
+
+Supports N store connections (each with its own API base URL / API key / printer
+user id) feeding a single unified label print queue and a single physical POS
+printer. See the "Multi-store connections" section below for the core model.
 """
 
 import sys
@@ -10,6 +14,7 @@ import re
 import os
 import subprocess
 import time
+from dataclasses import dataclass, field, asdict
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -21,13 +26,13 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QMessageBox, QFrame,
     QProgressBar, QTextEdit, QLineEdit, QComboBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QStatusBar,
-    QScrollArea, QDialog
+    QScrollArea, QDialog, QListWidget, QListWidgetItem, QFormLayout,
+    QDialogButtonBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QProcess
 from PyQt6.QtGui import QFont, QIcon, QPalette, QColor, QPixmap, QPainter, QPen, QBrush, QImage
 
 import requests
-
 
 
 def _load_env_file(env_file: Path) -> None:
@@ -57,6 +62,80 @@ API_BASE_URL = os.getenv("PRINTER_API_BASE_URL", "https://store.baytalemirati.co
 API_KEY = os.getenv("PRINTER_API_KEY", "")
 APP_CONFIG_FILE = Path.home() / ".config" / "vula_print" / "settings.json"
 APP_HISTORY_FILE = Path.home() / ".config" / "vula_print" / "print_history.json"
+
+MAX_STORE_CONNECTIONS = 4  # sane ceiling; UI/plan is built primarily around 2
+
+
+# ─────────────────────────────────────────────────────────────────
+# Multi-store connections
+# ─────────────────────────────────────────────────────────────────
+#
+# Each StoreConnection is a fully independent backend target: its own base
+# URL, API key, and printer user id. All HTTP calls (label queue, POS slips,
+# POS EOD reports, config fetch) are parameterised by a StoreConnection.
+#
+# Threading rule: StoreConnection objects are plain Python objects living on
+# the main (GUI) thread. They must NEVER be passed across a pyqtSignal — Qt
+# signal payloads should stay to primitives (str/int/dict/list) so there's no
+# ambiguity about thread ownership. Workers (POSPollWorker) are constructed
+# with copies of the primitive fields they need (api_base, api_key, user_id)
+# plus a `connection_id` string used purely to tag emitted results so the
+# main thread can look the StoreConnection back up in self.store_connections.
+#
+# Label-queue request dicts (which stay on the main thread, never crossing a
+# signal) are tagged with "_connection_id" for the same lookup; we do not
+# stash the object itself in the dict because it eventually gets rendered by
+# widgets/history-serialised, and keeping it string-based avoids accidental
+# JSON-serialisation crashes.
+@dataclass
+class StoreConnection:
+    connection_id: str          # stable id, e.g. "conn_1"; never shown to the user
+    name: str                   # display name, e.g. "Store A"
+    api_base_url: str = ""
+    api_key: str = ""
+    printer_user_id: Optional[int] = None
+    config_version: int = 0
+    synced_config_version: int = 0
+
+    # Per-connection POS state (never crosses a signal directly; only the
+    # primitive fields needed by a worker are read out into POSPollWorker).
+    pos_in_flight_ids: set = field(default_factory=set)
+    pos_completion_retry_ids: set = field(default_factory=set)
+    pos_eod_in_flight_ids: set = field(default_factory=set)
+    pos_eod_completion_retry_ids: set = field(default_factory=set)
+
+    # Independent backoff so one dead store never slows polling of a healthy
+    # one. This is a failure backoff only — there is no throttling of normal,
+    # successful polling, since label/POS printing must stay instant.
+    pos_backoff_seconds: int = 1
+    pos_backoff_until: float = 0.0
+
+    # Per-connection status text for the connections dialog / status pill.
+    last_status: str = "Not tested"
+    last_connected: bool = False
+
+    def is_configured(self) -> bool:
+        return bool(self.api_base_url.strip() and self.api_key.strip())
+
+    def to_settings_dict(self) -> Dict[str, Any]:
+        """Only persist the durable fields — not in-flight/backoff runtime state."""
+        return {
+            "connection_id": self.connection_id,
+            "name": self.name,
+            "api_base_url": self.api_base_url,
+            "api_key": self.api_key,
+            "printer_user_id": self.printer_user_id,
+        }
+
+    @classmethod
+    def from_settings_dict(cls, data: Dict[str, Any]) -> "StoreConnection":
+        return cls(
+            connection_id=data.get("connection_id") or f"conn_{id(data)}",
+            name=data.get("name") or "Store",
+            api_base_url=(data.get("api_base_url") or "").strip(),
+            api_key=(data.get("api_key") or "").strip(),
+            printer_user_id=data.get("printer_user_id"),
+        )
 
 
 # ── Code 39 encoding table ──────────────────────────────────────────────────
@@ -216,9 +295,9 @@ class TSPLRenderer:
 
 class PrinterScanner(QThread):
     """Background thread to scan for USB printers."""
-    
+
     printers_found = pyqtSignal(list)
-    
+
     def run(self):
         """Scan for available USB printers."""
         printers = []
@@ -228,27 +307,27 @@ class PrinterScanner(QThread):
                 printers = sorted([str(p) for p in usb_path.glob("lp*")])
         except Exception as e:
             print(f"Error scanning for printers: {e}")
-        
+
         self.printers_found.emit(printers)
 
 
 class PrintJob(QThread):
     """Background thread for printing labels."""
-    
+
     progress = pyqtSignal(int, int)  # current, total
     finished = pyqtSignal(bool, str)  # success, message
-    
+
     def __init__(self, printer_device: str, items: List[Dict[str, Any]]):
         super().__init__()
         self.printer_device = printer_device
         self.items = items
         self.label_width_dots = 320
         self.horizontal_shift_dots = 16
-    
+
     def _tspl_escape(self, s: str) -> str:
         """Escape a string for TSPL commands."""
         return (s or "").replace('\\', '\\\\').replace('"', '\\"')
-    
+
     def _center_x_for_text(self, text: str, font: str = "4", xmul: int = 1) -> int:
         """Calculate centered X position for text."""
         font_char_width = {
@@ -259,7 +338,7 @@ class PrintJob(QThread):
         width = len(text or "") * char_w
         x = int((self.label_width_dots - width) / 2)
         return max(0, x) + self.horizontal_shift_dots
-    
+
     def _center_x_for_code39(self, data: str, narrow: int = 2, wide: int = 4) -> int:
         """Calculate centered X position for Code39 barcode."""
         n = max(1, int(narrow))
@@ -270,7 +349,7 @@ class PrintJob(QThread):
         width = (char_count * per_char_modules) + ((char_count - 1) * inter_gap)
         x = int((self.label_width_dots - width) / 2)
         return max(0, x) + self.horizontal_shift_dots
-    
+
     def _format_price(self, price_cents: int, currency: str = "ZAR") -> str:
         """Format price for display."""
         symbol = "R" if currency == "ZAR" else currency
@@ -303,7 +382,7 @@ class PrintJob(QThread):
             line1 = text[:max_chars]
         line2 = text[len(line1):].strip()[:max_chars]  # hard-truncate remainder
         return [line1, line2] if line2 else [line1]
-    
+
     def _generate_label_tspl(self, item: Dict[str, Any]) -> str:
         """Generate TSPL commands for a single label."""
         title         = (item.get("title") or "")
@@ -356,20 +435,20 @@ class PrintJob(QThread):
 
         tspl.append("PRINT 1")
         return "\n".join(tspl) + "\n"
-    
+
     def run(self):
         """Execute print job."""
         try:
             total = sum(item.get("qty_to_print", 0) for item in self.items)
             current = 0
-            
+
             for item in self.items:
                 qty = item.get("qty_to_print", 0)
-                
+
                 for i in range(qty):
                     # Generate label
                     tspl = self._generate_label_tspl(item)
-                    
+
                     # Send to printer
                     try:
                         with open(self.printer_device, 'wb') as printer:
@@ -386,15 +465,15 @@ class PrintJob(QThread):
                     except Exception as e:
                         self.finished.emit(False, f"Printer error: {e}")
                         return
-                    
+
                     current += 1
                     self.progress.emit(current, total)
-                    
+
                     # Small delay between labels
                     time.sleep(0.2)
-            
+
             self.finished.emit(True, f"Successfully printed {total} labels")
-            
+
         except Exception as e:
             self.finished.emit(False, f"Print job failed: {e}")
 
@@ -556,19 +635,23 @@ class POSSlipPrintJob(QThread):
             out += self._txt(footer_note[:48])
             out += self._esc(ESC, 0x61, 0x00)
 
-        # QR code and website
+        # QR code and website (fail‑safe: skip if printer doesn't support QR)
         website_url = str(self.detail_payload.get("website_url", "") or "").strip()
         qr_data = str(self.detail_payload.get("qr_data", "") or "").strip()
         if qr_data:
-            out += self._txt(self._line_sep())
-            out += self._esc(ESC, 0x61, 0x01)  # center
-            qr_cmd = self._qr_code_escpos(qr_data)
-            if qr_cmd:
-                out += qr_cmd
-                out += b"\n"
-            if website_url:
-                out += self._txt(website_url[:48])
-            out += self._esc(ESC, 0x61, 0x00)  # left
+            try:
+                qr_cmd = self._qr_code_escpos(qr_data)
+                if qr_cmd:
+                    out += self._txt(self._line_sep())
+                    out += self._esc(ESC, 0x61, 0x01)  # center
+                    out += qr_cmd
+                    out += b"\n"
+                    if website_url:
+                        out += self._txt(website_url[:48])
+                    out += self._esc(ESC, 0x61, 0x00)  # left
+            except Exception:
+                # QR printing failed – skip and continue with rest of receipt
+                pass
 
         # Loyalty note
         out += self._txt(self._line_sep())
@@ -632,6 +715,40 @@ class POSSlipPrintJob(QThread):
             return bytes(raster)
         except Exception:
             return b""
+
+    def _qr_code_escpos(self, data: str, module_size: int = 4, ec_level: int = 48) -> bytes:
+        """Build ESC/POS QR code command bytes for the given text data."""
+        if not data:
+            return b""
+        data_bytes = data.encode('utf-8')
+        # Limit to max QR capacity for level L (version 40)
+        if len(data_bytes) > 7089:
+            return b""
+
+        out = bytearray()
+        GS = 0x1D
+        k = 0x6B  # 'k'
+
+        # 1. Set QR code model to 2 (auto)
+        out += bytes([GS, k, 4, 0, 2, 0, 0])
+
+        # 2. Set module size
+        out += bytes([GS, k, 3, 0, 5, module_size])
+
+        # 3. Set error correction level: 48 = L, 49 = M, 50 = Q, 51 = H
+        out += bytes([GS, k, 3, 0, 6, ec_level])
+
+        # 4. Store data (auto encode)
+        store_len = 3 + len(data_bytes)  # cn + fn + m + data
+        pL = store_len & 0xFF
+        pH = (store_len >> 8) & 0xFF
+        out += bytes([GS, k, pL, pH, 49, 80, 48])  # cn=49, fn=80, m=48 (UTF-8)
+        out += data_bytes
+
+        # 5. Print QR code
+        out += bytes([GS, k, 3, 0, 49, 81, 48])  # cn=49, fn=81, m=48
+
+        return bytes(out)
 
     def run(self):
         try:
@@ -770,21 +887,27 @@ class POSEODReportPrintJob(QThread):
 
 
 class POSPollWorker(QThread):
-    """Off-main-thread worker for the complete POS poll cycle.
+    """Off-main-thread worker for one connection's complete POS poll cycle.
 
     Performs all blocking HTTP I/O (pending check + detail fetch, EOD reports)
-    in a background QThread so the Qt main event loop — and the UI — remain
-    fully responsive at all times.  Emits exactly one signal per run().
+    for a SINGLE StoreConnection in a background QThread so the Qt main event
+    loop — and the UI — remain fully responsive at all times.
+
+    Only primitive fields (str/int/frozenset) are passed in; the worker never
+    receives or emits a StoreConnection object. Every signal carries
+    `connection_id` (a plain string) so the main thread can look up which
+    StoreConnection the result belongs to.
     """
 
-    slip_ready     = pyqtSignal(int, dict)   # (request_id, detail_payload)
-    eod_slip_ready = pyqtSignal(int, dict)   # (request_id, detail_payload)
-    all_clear      = pyqtSignal()
-    poll_error     = pyqtSignal(str, int)    # (message, http_status)  0=network
-    poll_fatal     = pyqtSignal(str, int)    # (message, http_status)  auth/config
+    slip_ready     = pyqtSignal(str, int, dict)   # (connection_id, request_id, detail_payload)
+    eod_slip_ready = pyqtSignal(str, int, dict)   # (connection_id, request_id, detail_payload)
+    all_clear      = pyqtSignal(str)              # (connection_id)
+    poll_error     = pyqtSignal(str, str, int)     # (connection_id, message, http_status) 0=network
+    poll_fatal     = pyqtSignal(str, str, int)     # (connection_id, message, http_status) auth/config
 
     def __init__(
         self,
+        connection_id: str,
         api_base: str,
         api_key: str,
         user_id: int,
@@ -793,6 +916,7 @@ class POSPollWorker(QThread):
         parent=None,
     ):
         super().__init__(parent)
+        self._connection_id = connection_id
         self._api_base = api_base.rstrip("/")
         self._api_key = api_key
         self._user_id = user_id
@@ -806,6 +930,8 @@ class POSPollWorker(QThread):
         return headers
 
     def run(self):
+        cid = self._connection_id
+
         # ── 1. Poll POS slips ──────────────────────────────────────────────
         try:
             r = requests.get(
@@ -814,14 +940,14 @@ class POSPollWorker(QThread):
                 timeout=10,
             )
         except Exception as e:
-            self.poll_error.emit(str(e), 0)
+            self.poll_error.emit(cid, str(e), 0)
             return
 
         if r.status_code in (401, 503, 400):
-            self.poll_fatal.emit(f"HTTP {r.status_code}", r.status_code)
+            self.poll_fatal.emit(cid, f"HTTP {r.status_code}", r.status_code)
             return
         if r.status_code != 200:
-            self.poll_error.emit(f"HTTP {r.status_code}", r.status_code)
+            self.poll_error.emit(cid, f"HTTP {r.status_code}", r.status_code)
             return
 
         pending = sorted(
@@ -840,14 +966,14 @@ class POSPollWorker(QThread):
                     timeout=10,
                 )
             except Exception as e:
-                self.poll_error.emit(f"Detail #{req_id}: {e}", 0)
+                self.poll_error.emit(cid, f"Detail #{req_id}: {e}", 0)
                 return
             if dr.status_code == 404:
                 continue  # already gone, try next slip
             if dr.status_code != 200:
-                self.poll_error.emit(f"Detail #{req_id}: HTTP {dr.status_code}", dr.status_code)
+                self.poll_error.emit(cid, f"Detail #{req_id}: HTTP {dr.status_code}", dr.status_code)
                 return
-            self.slip_ready.emit(req_id, dr.json())
+            self.slip_ready.emit(cid, req_id, dr.json())
             return
 
         # ── 2. No POS slips — check EOD reports ───────────────────────────
@@ -868,11 +994,11 @@ class POSPollWorker(QThread):
                 timeout=10,
             )
         except Exception:
-            self.all_clear.emit()
+            self.all_clear.emit(cid)
             return
 
         if eod_r.status_code != 200:
-            self.all_clear.emit()
+            self.all_clear.emit(cid)
             return
 
         eod_pending = sorted(
@@ -890,25 +1016,29 @@ class POSPollWorker(QThread):
                     timeout=10,
                 )
             except Exception:
-                self.all_clear.emit()
+                self.all_clear.emit(cid)
                 return
             if dr.status_code != 200:
-                self.all_clear.emit()
+                self.all_clear.emit(cid)
                 return
-            self.eod_slip_ready.emit(req_id, dr.json())
+            self.eod_slip_ready.emit(cid, req_id, dr.json())
             return
 
-        self.all_clear.emit()
+        self.all_clear.emit(cid)
 
 
 class VulaPrintApp(QMainWindow):
     """Main application window."""
-    
+
     def __init__(self):
         super().__init__()
-        
-        self.api_base_url = API_BASE_URL
-        self.api_key = API_KEY
+
+        # ── Multi-store connections ──────────────────────────────────
+        # self.store_connections is the single source of truth for backend
+        # targets. Legacy single api_base_url/api_key are migrated into the
+        # first connection on load (see load_settings).
+        self.store_connections: List[StoreConnection] = []
+
         self.selected_printer = None
         self.pos_selected_printer = None
         self.printer_calibrated = False
@@ -916,32 +1046,22 @@ class VulaPrintApp(QMainWindow):
         self.last_selected_printer: Optional[str] = None
         self.last_selected_pos_printer: Optional[str] = None
         self.auto_connect_on_startup = True
-        self.printer_user_id: Optional[int] = None
         self.pos_poll_interval_seconds = 2  # default 2s; HTTP is off-thread so low interval is safe
-        env_user_id = os.getenv("PRINTER_USER_ID", "").strip()
-        if env_user_id.isdigit() and int(env_user_id) > 0:
-            self.printer_user_id = int(env_user_id)
         self.calibration_job: Optional[PrintJob] = None
         self.print_job: Optional[PrintJob] = None
         self.pos_print_job: Optional[POSSlipPrintJob] = None
         self.pos_eod_print_job: Optional[POSEODReportPrintJob] = None
         self._pos_poll_worker: Optional[POSPollWorker] = None
-        self.pos_in_flight_ids: set[int] = set()
-        self.pos_completion_retry_ids: set[int] = set()
-        self.pos_eod_in_flight_ids: set[int] = set()
-        self.pos_eod_completion_retry_ids: set[int] = set()
-        self.pos_backoff_seconds = 1
-        self.pos_backoff_until = 0.0
+        # Round-robin cursor over store_connections for the POS poll cycle.
+        # Only one worker / one physical POS print job runs at a time; each
+        # timer tick advances to the next connection so both stores get
+        # serviced fairly without ever printing two slips concurrently.
+        self._pos_poll_cursor = 0
         self.last_successful_pos_poll_at: Optional[datetime] = None
         self.last_successful_pos_print_at: Optional[datetime] = None
         self._selected_request: Optional[Dict[str, Any]] = None   # tracks table selection
         self._current_print_request: Optional[Dict[str, Any]] = None  # for history
 
-        self.printer_print_type = ""
-        self.printer_role = ""
-        self.printer_store_id: Optional[int] = None
-        self.config_version = 0
-        self.synced_config_version = 0
         self.logo_dark_url = ""
         self.logo_light_url = ""
         self.discovered_printers: list[str] = []
@@ -949,50 +1069,102 @@ class VulaPrintApp(QMainWindow):
 
         self.load_settings()
         self.apply_brand_theme_from_css()
-        
+
         self.init_ui()
         self.setup_auto_refresh()
-        
+
         # Auto-scan for printers on startup
         self.scan_for_printers()
         QTimer.singleShot(500, self.ensure_onboarded)
 
+    # ─────────────────────────────────────────────────────────────
+    # Connection helpers
+    # ─────────────────────────────────────────────────────────────
+    @property
+    def active_connections(self) -> List[StoreConnection]:
+        """Connections with both a URL and an API key set."""
+        return [c for c in self.store_connections if c.is_configured()]
+
+    def get_connection_by_id(self, connection_id: str) -> Optional[StoreConnection]:
+        for conn in self.store_connections:
+            if conn.connection_id == connection_id:
+                return conn
+        return None
+
+    def _new_connection_id(self) -> str:
+        existing = {c.connection_id for c in self.store_connections}
+        i = 1
+        while f"conn_{i}" in existing:
+            i += 1
+        return f"conn_{i}"
+
+    # ─────────────────────────────────────────────────────────────
+    # Settings persistence
+    # ─────────────────────────────────────────────────────────────
     def load_settings(self):
-        """Load persisted app settings."""
+        """Load persisted app settings, including the store connection list."""
         try:
             if not APP_CONFIG_FILE.exists():
+                self._apply_default_connection_if_empty()
                 return
 
             with open(APP_CONFIG_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
-            self.api_base_url = (data.get("api_base_url") or self.api_base_url).strip()
-            self.api_key = (data.get("api_key") or self.api_key).strip()
+            connections_data = data.get("store_connections")
+            if connections_data:
+                self.store_connections = [
+                    StoreConnection.from_settings_dict(c) for c in connections_data
+                ]
+            else:
+                # Legacy migration: single api_base_url / api_key -> one connection
+                legacy_base = (data.get("api_base_url") or "").strip()
+                legacy_key = (data.get("api_key") or "").strip()
+                legacy_user_id = data.get("printer_user_id")
+                if legacy_base and legacy_key:
+                    self.store_connections = [StoreConnection(
+                        connection_id="conn_1",
+                        name="Store 1",
+                        api_base_url=legacy_base,
+                        api_key=legacy_key,
+                        printer_user_id=legacy_user_id if isinstance(legacy_user_id, int) else None,
+                    )]
+
             self.brand_logo_path = data.get("brand_logo_path") or self.brand_logo_path
             roles = data.get("printer_roles") or {}
             self.last_selected_printer = roles.get("label") or data.get("label_printer_device") or None
             self.last_selected_pos_printer = roles.get("pos_slip") or data.get("pos_slip_printer_device") or None
             self.auto_connect_on_startup = bool(data.get("auto_connect_on_startup", True))
-            raw_user_id = data.get("printer_user_id")
-            if raw_user_id is not None and str(raw_user_id).strip().isdigit():
-                parsed_user_id = int(str(raw_user_id).strip())
-                self.printer_user_id = parsed_user_id if parsed_user_id > 0 else None
             self.pos_poll_interval_seconds = int(data.get("pos_poll_interval_seconds", 5) or 5)
         except Exception as e:
             print(f"Warning: failed to load settings: {e}")
+
+        self._apply_default_connection_if_empty()
+
+    def _apply_default_connection_if_empty(self):
+        """Seed one connection from env vars if settings had none at all."""
+        if self.store_connections:
+            return
+        if API_BASE_URL and API_KEY:
+            self.store_connections = [StoreConnection(
+                connection_id="conn_1",
+                name="Store 1",
+                api_base_url=API_BASE_URL,
+                api_key=API_KEY,
+            )]
+        else:
+            self.store_connections = [StoreConnection(connection_id="conn_1", name="Store 1")]
 
     def save_settings(self):
         """Persist app settings."""
         try:
             APP_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
             data = {
-                "api_base_url": self.api_base_url,
-                "api_key": self.api_key,
+                "store_connections": [c.to_settings_dict() for c in self.store_connections],
                 "brand_logo_path": self.brand_logo_path,
                 "label_printer_device": self.last_selected_printer,
                 "pos_slip_printer_device": self.last_selected_pos_printer,
                 "auto_connect_on_startup": self.auto_connect_on_startup,
-                "printer_user_id": self.printer_user_id,
                 "pos_poll_interval_seconds": self.pos_poll_interval_seconds,
                 "printer_roles": {
                     "label": self.last_selected_printer,
@@ -1005,7 +1177,7 @@ class VulaPrintApp(QMainWindow):
             print(f"Warning: failed to save settings: {e}")
 
     def _set_connection_status(self, connected: bool, status_code: Optional[int] = None):
-        """Update API connection indicators in the UI."""
+        """Update the aggregate API connection indicator in the UI."""
         if connected:
             self.connection_status.setText("Connected")
             self.connection_status.setStyleSheet(
@@ -1029,184 +1201,154 @@ class VulaPrintApp(QMainWindow):
             f"color:{self.C_RED}; font-size:10px; font-weight:600;"
         )
 
-    def ensure_onboarded(self):
-        """Fetch backend config when settings already exist.
+    def _refresh_connection_status_summary(self):
+        """Aggregate status pill reflects: any connected = green with count."""
+        active = self.active_connections
+        if not active:
+            self._set_connection_status(False)
+            return
+        connected_count = sum(1 for c in active if c.last_connected)
+        if connected_count == len(active):
+            self.connection_status.setText(f"{connected_count}/{len(active)} stores")
+            self.connection_status.setStyleSheet(
+                f"background:#0f2a1a; color:{self.C_GREEN}; border:1px solid #1a5a2a;"
+                f"border-radius:12px; font-size:11px; font-weight:600; padding:4px 10px;"
+            )
+            self.header_connection_status.setText(f"● {connected_count}/{len(active)} stores")
+            self.header_connection_status.setStyleSheet(
+                f"color:{self.C_GREEN}; font-size:10px; font-weight:600;"
+            )
+        elif connected_count > 0:
+            self.connection_status.setText(f"{connected_count}/{len(active)} stores")
+            self.connection_status.setStyleSheet(
+                f"background:#2a1f1a; color:{self.C_WARNING}; border:1px solid #5a3b2a;"
+                f"border-radius:12px; font-size:11px; font-weight:600; padding:4px 10px;"
+            )
+            self.header_connection_status.setText(f"● {connected_count}/{len(active)} stores")
+            self.header_connection_status.setStyleSheet(
+                f"color:{self.C_WARNING}; font-size:10px; font-weight:600;"
+            )
+        else:
+            self._set_connection_status(False)
 
-        First-run setup is handled by onboarding.py before the main app starts,
-        so we do not show that wizard here again.
-        """
-        if self.api_base_url and self.api_key:
-            self.fetch_printer_config(show_dialogs=False)
+    def ensure_onboarded(self):
+        """Fetch backend config for all connections when settings already exist."""
+        if self.active_connections:
+            self.fetch_all_printer_configs(show_dialogs=False)
             return
 
         self._set_connection_status(False)
-        self._update_pos_worker_status("Run onboarding first")
+        self._update_pos_worker_status("Add a store connection first")
         self.status_bar.showMessage(
-            "Run the setup wizard to configure backend URL and printer API key."
+            "Add at least one store connection (sidebar) to configure backend URL and API key."
         )
 
-    def check_api_connection(self, show_dialogs: bool = True, fetch_queue_on_success: bool = True) -> bool:
-        """Check API connectivity and update status indicators."""
-        if not self.api_key:
+    # ─────────────────────────────────────────────────────────────
+    # Per-connection config / test / headers
+    # ─────────────────────────────────────────────────────────────
+    def _headers_for(self, conn: StoreConnection, include_json: bool = False) -> Dict[str, str]:
+        headers = {"X-Printer-API-Key": conn.api_key}
+        if conn.printer_user_id:
+            headers["X-Printer-User-Id"] = str(conn.printer_user_id)
+        if include_json:
+            headers["Content-Type"] = "application/json"
+        return headers
+
+    def fetch_all_printer_configs(self, show_dialogs: bool = False) -> None:
+        """Fetch backend config for every configured connection."""
+        if not self.active_connections:
             self._set_connection_status(False)
-            self._update_pos_worker_status("Set PRINTER_API_KEY in .env")
-            if show_dialogs:
-                QMessageBox.warning(
-                    self,
-                    "Missing API Key",
-                    "PRINTER_API_KEY is not configured.\n"
-                    "Create .env from .env.example and set PRINTER_API_KEY.",
-                )
-            return False
-
-        try:
-            headers = self._headers()
-            label_response = requests.get(
-                f"{self.api_base_url}/admin/api/label-printing/pending",
-                headers=headers,
-                timeout=5
-            )
-
-            if label_response.status_code == 200:
-                self._set_connection_status(True)
-                if fetch_queue_on_success:
-                    self.pending_requests = label_response.json()
-                    self.update_requests_table()
-                    self.status_bar.showMessage(f"Loaded {len(self.pending_requests)} pending request(s)")
-
-                pos_status_msg = "POS pending check skipped (set PRINTER_USER_ID)"
-                if self.printer_user_id:
-                    pos_headers = self._pos_headers()
-                    pos_response = requests.get(
-                        f"{self.api_base_url}/admin/api/pos-slips/pending",
-                        headers=pos_headers,
-                        timeout=5,
-                    )
-                    if pos_response.status_code == 200:
-                        pos_status_msg = "POS API connected"
-                    elif pos_response.status_code == 400:
-                        pos_status_msg = "POS API rejected PRINTER_USER_ID"
-                    elif pos_response.status_code in (401, 503):
-                        pos_status_msg = f"POS API unavailable ({pos_response.status_code})"
-                    else:
-                        pos_status_msg = f"POS API error ({pos_response.status_code})"
-
-                self._update_pos_worker_status(pos_status_msg)
-                if show_dialogs:
-                    QMessageBox.information(
-                        self,
-                        "Connection Success",
-                        f"Label API connected successfully.\n{pos_status_msg}",
-                    )
-                return True
-
-            self._set_connection_status(False, status_code=label_response.status_code)
-            self._update_pos_worker_status(f"Label API error ({label_response.status_code})")
-            if show_dialogs:
-                QMessageBox.warning(self, "Connection Error", f"Server returned: {label_response.status_code}")
-            return False
-
-        except Exception as e:
-            self._set_connection_status(False)
-            self._update_pos_worker_status("Connection failed")
-            if show_dialogs:
-                QMessageBox.critical(self, "Connection Failed", f"Failed to connect: {e}")
-            return False
-
-    def auto_connect_to_api(self):
-        """Attempt API connection on startup without interrupting users."""
-        if not self.auto_connect_on_startup:
+            self._update_pos_worker_status("Add a store connection first")
             return
-        if not self.api_base_url:
-            return
-        self.fetch_printer_config(show_dialogs=False)
 
+        any_ok = False
+        for conn in self.active_connections:
+            ok = self._fetch_config_for_connection(conn, show_dialogs)
+            any_ok = any_ok or ok
 
-    def fetch_printer_config(self, show_dialogs: bool = False) -> bool:
-        """Fetch this printer registration's backend config."""
-        if not self.api_base_url or not self.api_key:
-            self._set_connection_status(False)
-            self._update_pos_worker_status("Setup required")
-            return False
+        self._refresh_connection_status_summary()
+        if any_ok:
+            self.fetch_pending_requests()
+        self.upload_discovered_printers_if_ready()
 
+    def _fetch_config_for_connection(self, conn: StoreConnection, show_dialogs: bool = False) -> bool:
+        """Fetch a single connection's printer-app config (user id, roles, branding, version)."""
         try:
             response = requests.get(
-                f"{self.api_base_url}/admin/api/printer-app/config",
-                headers={"X-Printer-API-Key": self.api_key},
+                f"{conn.api_base_url}/admin/api/printer-app/config",
+                headers={"X-Printer-API-Key": conn.api_key},
                 timeout=8,
             )
         except Exception as e:
-            self._set_connection_status(False)
-            self._update_pos_worker_status("Connection failed")
+            conn.last_connected = False
+            conn.last_status = "Connection failed"
             if show_dialogs:
-                QMessageBox.critical(self, "Connection Failed", str(e))
+                QMessageBox.critical(self, "Connection Failed", f"{conn.name}: {e}")
             return False
 
         if response.status_code == 200:
             cfg = response.json()
 
-            self.printer_user_id = int(cfg.get("user_id") or 0) or None
-            self.printer_print_type = cfg.get("print_type", "")
-            self.printer_role = cfg.get("role", "")
-            self.printer_store_id = cfg.get("store_id")
-            self.config_version = int(cfg.get("config_version") or 0)
-            self.synced_config_version = int(cfg.get("synced_config_version") or 0)
-            self.logo_dark_url = cfg.get("logo_dark_url", "")
-            self.logo_light_url = cfg.get("logo_light_url", "")
+            conn.printer_user_id = int(cfg.get("user_id") or 0) or None
+            conn.config_version = int(cfg.get("config_version") or 0)
+            conn.synced_config_version = int(cfg.get("synced_config_version") or 0)
+            conn.last_connected = True
+            conn.last_status = "Connected"
 
-            self.fetch_brand_css()
-            self.apply_brand_theme_from_css()
-            self.download_brand_logo()
+            # Branding (logo / CSS) is app-global rather than per-store; the
+            # first connection whose config successfully loads wins. This
+            # mirrors the pre-existing single-store assumption baked into
+            # the UI theme, and avoids re-theming the whole app on every
+            # multi-store poll.
+            if not self.logo_dark_url and not self.logo_light_url:
+                self.logo_dark_url = cfg.get("logo_dark_url", "")
+                self.logo_light_url = cfg.get("logo_light_url", "")
+                self.fetch_brand_css(conn)
+                self.apply_brand_theme_from_css()
+                self.download_brand_logo(conn)
 
-            self.api_url_input.setText(self.api_base_url)
-            self.printer_user_id_input.setText(str(self.printer_user_id or ""))
             self.save_settings()
 
-            self._set_connection_status(True)
-            self._update_pos_worker_status("Config loaded")
-            self.status_bar.showMessage(
-                f"Printer config loaded · role={self.printer_role} type={self.printer_print_type}"
-            )
+            if conn.config_version > conn.synced_config_version:
+                self.ack_printer_config(conn, conn.config_version)
 
-            if self.config_version > self.synced_config_version:
-                self.ack_printer_config(self.config_version)
-
-            self.fetch_pending_requests()
-            self.upload_discovered_printers_if_ready()
+            if show_dialogs:
+                QMessageBox.information(
+                    self, "Connection Success",
+                    f"{conn.name}: connected (user_id={conn.printer_user_id})."
+                )
             return True
 
-        self._set_connection_status(False, status_code=response.status_code)
-
+        conn.last_connected = False
         if response.status_code == 401:
-            message = "Invalid printer API key"
+            conn.last_status = "Invalid API key"
         else:
-            message = f"Printer config error: HTTP {response.status_code}"
+            conn.last_status = f"HTTP {response.status_code}"
 
-        self._update_pos_worker_status(message)
         if show_dialogs:
-            QMessageBox.warning(self, "Printer Config Error", message)
+            QMessageBox.warning(self, "Printer Config Error", f"{conn.name}: {conn.last_status}")
 
         return False
 
-    def ack_printer_config(self, config_version: int) -> None:
+    def ack_printer_config(self, conn: StoreConnection, config_version: int) -> None:
         try:
             requests.post(
-                f"{self.api_base_url}/admin/api/printer-app/config/ack",
-                headers=self._headers(include_json=True),
+                f"{conn.api_base_url}/admin/api/printer-app/config/ack",
+                headers=self._headers_for(conn, include_json=True),
                 json={"config_version": int(config_version)},
                 timeout=8,
             )
-            self.synced_config_version = int(config_version)
+            conn.synced_config_version = int(config_version)
         except Exception:
             pass
 
-    def fetch_brand_css(self) -> None:
+    def fetch_brand_css(self, conn: StoreConnection) -> None:
         """Fetch and cache the current branded CSS from the backend."""
         try:
             css_path = "/admin/api/printer-app/brand-css"
             response = requests.get(
-                f"{self.api_base_url}{css_path}",
-                headers={"X-Printer-API-Key": self.api_key},
+                f"{conn.api_base_url}{css_path}",
+                headers={"X-Printer-API-Key": conn.api_key},
                 timeout=8,
             )
             if response.status_code == 200:
@@ -1260,17 +1402,17 @@ class VulaPrintApp(QMainWindow):
         self.C_WARNING = _colour("--status-warn-text", self.C_WARNING)
         self.C_SIDEBAR = _colour("--bg-sidebar", self.C_SIDEBAR)
 
-    def download_brand_logo(self) -> None:
+    def download_brand_logo(self, conn: StoreConnection) -> None:
         """Download and cache the backend-provided printer brand logo.
 
         Prefers the dark logo because the printer app uses a dark UI.
         """
         relative = self.logo_dark_url or self.logo_light_url
-        if not relative or not self.api_base_url:
+        if not relative or not conn.api_base_url:
             return
 
         relative = relative.lstrip("/")
-        url = urljoin(self.api_base_url.rstrip("/") + "/", relative)
+        url = urljoin(conn.api_base_url.rstrip("/") + "/", relative)
 
         try:
             response = requests.get(url, timeout=8)
@@ -1297,7 +1439,7 @@ class VulaPrintApp(QMainWindow):
             pass
 
     def upload_discovered_printers_if_ready(self) -> None:
-        if not self.api_base_url or not self.api_key or not self.discovered_printers:
+        if not self.discovered_printers:
             return
 
         payload = []
@@ -1312,17 +1454,41 @@ class VulaPrintApp(QMainWindow):
                 }
             )
 
-        try:
-            requests.post(
-                f"{self.api_base_url}/admin/api/printer-app/discovered-printers",
-                headers=self._headers(include_json=True),
-                json=payload,
-                timeout=8,
-            )
-        except Exception:
-            pass
+        for conn in self.active_connections:
+            try:
+                requests.post(
+                    f"{conn.api_base_url}/admin/api/printer-app/discovered-printers",
+                    headers=self._headers_for(conn, include_json=True),
+                    json=payload,
+                    timeout=8,
+                )
+            except Exception:
+                pass
 
-    
+    def test_all_connections(self):
+        """Test connectivity for every configured connection and report per-store results."""
+        active = self.active_connections
+        if not active:
+            QMessageBox.warning(self, "No Connections", "Add at least one store connection first.")
+            return
+
+        results = []
+        for conn in active:
+            ok = self._fetch_config_for_connection(conn, show_dialogs=False)
+            results.append((conn.name, ok, conn.last_status))
+
+        self._refresh_connection_status_summary()
+        self.save_settings()
+
+        lines = []
+        for name, ok, status in results:
+            mark = "✓" if ok else "✗"
+            lines.append(f"{mark}  {name}: {status}")
+        QMessageBox.information(self, "Connection Test Results", "\n".join(lines))
+
+        if any(ok for _, ok, _ in results):
+            self.fetch_pending_requests()
+
     # ─────────────────────────────────────────────────────────────
     # Shared style constants
     # ─────────────────────────────────────────────────────────────
@@ -1580,8 +1746,8 @@ class VulaPrintApp(QMainWindow):
         pc_layout.addWidget(test_pos_btn)
         config_layout.addWidget(printer_card)
 
-        # ── Connection card ─────────────────────────────
-        config_layout.addWidget(self._section_heading("API CONNECTION"))
+        # ── Store connections card ──────────────────────
+        config_layout.addWidget(self._section_heading("STORE CONNECTIONS"))
 
         conn_card = QWidget()
         conn_card.setStyleSheet(self._card_style(8))
@@ -1589,27 +1755,13 @@ class VulaPrintApp(QMainWindow):
         cc_layout.setContentsMargins(12, 12, 12, 12)
         cc_layout.setSpacing(8)
 
-        # connection status pill
+        # aggregate connection status pill
         self.connection_status = QLabel("Disconnected")
         self.connection_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.connection_status.setStyleSheet(
             f"background:#2a1a1a; color:{self.C_RED}; border:1px solid #5a2a2a;"
             f"border-radius:12px; font-size:11px; font-weight:600; padding:4px 10px;"
         )
-
-        url_lbl = QLabel("SERVER URL")
-        url_lbl.setStyleSheet(self._label_style(small=True))
-        self.api_url_input = QLineEdit(self.api_base_url)
-        self.api_url_input.setPlaceholderText("https://example.com")
-        self.api_url_input.setStyleSheet(self._input_style())
-        self.api_url_input.textChanged.connect(self.on_api_url_changed)
-
-        user_id_lbl = QLabel("PRINTER USER ID")
-        user_id_lbl.setStyleSheet(self._label_style(small=True))
-        self.printer_user_id_input = QLineEdit("" if self.printer_user_id is None else str(self.printer_user_id))
-        self.printer_user_id_input.setPlaceholderText("Fetched from backend")
-        self.printer_user_id_input.setReadOnly(True)
-        self.printer_user_id_input.setStyleSheet(self._input_style())
 
         self.pos_worker_status = QLabel("POS worker paused")
         self.pos_worker_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1618,17 +1770,19 @@ class VulaPrintApp(QMainWindow):
             f"border-radius:12px; font-size:11px; font-weight:600; padding:4px 10px;"
         )
 
-        connect_btn = QPushButton("Test Connection")
+        manage_btn = QPushButton("Manage Connections")
+        manage_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        manage_btn.setStyleSheet(self._btn_primary())
+        manage_btn.clicked.connect(self.show_connections_dialog)
+
+        connect_btn = QPushButton("Test All Connections")
         connect_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         connect_btn.setStyleSheet(self._btn_secondary())
-        connect_btn.clicked.connect(self.test_api_connection)
+        connect_btn.clicked.connect(self.test_all_connections)
 
         cc_layout.addWidget(self.connection_status)
-        cc_layout.addWidget(url_lbl)
-        cc_layout.addWidget(self.api_url_input)
-        cc_layout.addWidget(user_id_lbl)
-        cc_layout.addWidget(self.printer_user_id_input)
         cc_layout.addWidget(self.pos_worker_status)
+        cc_layout.addWidget(manage_btn)
         cc_layout.addWidget(connect_btn)
         config_layout.addWidget(conn_card)
 
@@ -1765,11 +1919,7 @@ class VulaPrintApp(QMainWindow):
         bar_layout.addWidget(history_btn)
 
         return bar
-    
-    # (create_header removed — replaced by _build_sidebar / _build_top_bar)
-    
-    # (create_printer_panel removed — replaced by _build_sidebar)
-    
+
     def _build_queue_panel(self) -> QWidget:
         """Build the print queue panel (right / main content area)."""
         panel = QWidget()
@@ -1779,19 +1929,22 @@ class VulaPrintApp(QMainWindow):
         layout.setSpacing(10)
 
         # ── Table ────────────────────────────────────────────────
+        # Column 1 is now "Store" so operators can see which connection
+        # a request came from at a glance.
         self.requests_table = QTableWidget()
-        self.requests_table.setColumnCount(6)
+        self.requests_table.setColumnCount(7)
         self.requests_table.setHorizontalHeaderLabels(
-            ["ID", "Source", "Created By", "Labels", "Created At", ""]
+            ["ID", "Store", "Source", "Created By", "Labels", "Created At", ""]
         )
         hdr = self.requests_table.horizontalHeader()
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
-        self.requests_table.setColumnWidth(5, 118)
+        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
+        self.requests_table.setColumnWidth(6, 118)
         self.requests_table.verticalHeader().setVisible(False)
         self.requests_table.setShowGrid(False)
         self.requests_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -1882,7 +2035,7 @@ class VulaPrintApp(QMainWindow):
         layout.addWidget(self.progress_bar)
 
         return panel
-    
+
     def setup_auto_refresh(self):
         """Setup automatic refresh timer."""
         self.refresh_timer = QTimer()
@@ -1896,22 +2049,22 @@ class VulaPrintApp(QMainWindow):
         # Poll backend config version so token/config updates are picked up quickly.
         self.config_refresh_timer = QTimer()
         self.config_refresh_timer.timeout.connect(
-            lambda: self.fetch_printer_config(show_dialogs=False)
+            lambda: self.fetch_all_printer_configs(show_dialogs=False)
         )
         self.config_refresh_timer.start(60_000)
-    
+
     def scan_for_printers(self):
         """Scan for available USB printers."""
         self.status_bar.showMessage("Scanning for printers...")
         self.scanner = PrinterScanner()
         self.scanner.printers_found.connect(self.on_printers_found)
         self.scanner.start()
-    
+
     def on_printers_found(self, printers: List[str]):
         """Handle printer scan results."""
         self.printer_combo.clear()
         self.pos_printer_combo.clear()
-        
+
         self.discovered_printers = list(printers or [])
 
         if not printers:
@@ -1937,7 +2090,7 @@ class VulaPrintApp(QMainWindow):
                     self.pos_printer_combo.setCurrentIndex(pos_index)
 
             self.upload_discovered_printers_if_ready()
-    
+
     def on_printer_selected(self, index: int):
         """Handle printer selection."""
         if index > 0:  # Skip placeholder
@@ -1975,23 +2128,14 @@ class VulaPrintApp(QMainWindow):
             self.pos_selected_printer = None
             self._update_pos_worker_status()
 
-    def on_printer_user_id_changed(self, text: str):
-        """Persist printer user id for POS queue scoping."""
-        value = text.strip()
-        if value.isdigit() and int(value) > 0:
-            self.printer_user_id = int(value)
-        else:
-            self.printer_user_id = None
-        self.save_settings()
-        self._update_pos_worker_status()
-
     def _update_pos_worker_status(self, extra_note: Optional[str] = None):
         """Refresh POS worker readiness indicator."""
-        ready = bool(self.pos_selected_printer and self.printer_user_id)
+        connections_with_user = [c for c in self.active_connections if c.printer_user_id]
+        ready = bool(self.pos_selected_printer and connections_with_user)
         if ready:
-            text = "POS worker ready"
+            text = f"POS worker ready · {len(connections_with_user)} store(s)"
             if extra_note:
-                text = f"POS worker ready · {extra_note}"
+                text = f"{text} · {extra_note}"
             self.pos_worker_status.setText(text)
             self.pos_worker_status.setStyleSheet(
                 f"background:#0f2a1a; color:{self.C_GREEN}; border:1px solid #1a5a2a;"
@@ -2007,153 +2151,400 @@ class VulaPrintApp(QMainWindow):
                 f"border-radius:12px; font-size:11px; font-weight:600; padding:4px 10px;"
             )
 
-    def _headers(self, include_json: bool = False) -> Dict[str, str]:
-        headers = {"X-Printer-API-Key": self.api_key}
-        if self.printer_user_id:
-            headers["X-Printer-User-Id"] = str(self.printer_user_id)
-        if include_json:
-            headers["Content-Type"] = "application/json"
-        return headers
+    # ─────────────────────────────────────────────────────────────
+    # Store connections management dialog
+    # ─────────────────────────────────────────────────────────────
+    def show_connections_dialog(self):
+        dialog = _ConnectionsDialog(self)
+        dialog.exec()
+        # Any add/edit/remove already mutated self.store_connections directly;
+        # persist + refresh derived UI state.
+        self.save_settings()
+        self._update_pos_worker_status()
+        self._refresh_connection_status_summary()
+        if self.active_connections:
+            self.fetch_all_printer_configs(show_dialogs=False)
 
-    def _pos_headers(self, include_json: bool = False) -> Dict[str, str]:
-        return self._headers(include_json=include_json)
-
-    def _complete_pos_request(self, request_id: int) -> bool:
-        """Mark a POS request as complete. Returns True when resolved."""
+    # ─────────────────────────────────────────────────────────────
+    # Label queue — fetch from ALL connections, merge, tag connection_id
+    # ─────────────────────────────────────────────────────────────
+    def _complete_label_request(self, conn: StoreConnection, request_id: int) -> bool:
         try:
             response = requests.post(
-                f"{self.api_base_url}/admin/api/pos-slips/complete",
-                headers=self._pos_headers(include_json=True),
+                f"{conn.api_base_url}/admin/api/label-printing/complete",
+                headers=self._headers_for(conn, include_json=True),
                 json={"request_id": request_id},
                 timeout=10,
             )
-            if response.status_code == 200:
-                return True
-            if response.status_code in (400, 404):
-                return True
-            return False
+            return response.status_code == 200
         except Exception:
             return False
 
-    def _complete_pos_eod_request(self, request_id: int) -> bool:
-        """Mark a POS EOD report request as complete. Returns True when resolved."""
-        try:
-            response = requests.post(
-                f"{self.api_base_url}/admin/api/pos-eod-reports/complete",
-                headers=self._pos_headers(include_json=True),
-                json={"request_id": request_id},
-                timeout=10,
-            )
-            if response.status_code == 200:
-                return True
-            if response.status_code in (400, 404):
-                return True
-            return False
-        except Exception:
-            return False
-
-    def _ensure_latest_pos_eod_report(self) -> None:
-        """Ask backend to auto-queue/update previous-day EOD report for this printer user."""
-        try:
-            requests.post(
-                f"{self.api_base_url}/admin/api/pos-eod-reports/ensure-latest",
-                headers=self._pos_headers(include_json=True),
-                json={},
-                timeout=8,
-            )
-        except Exception:
-            # Best effort only; polling pending queue remains source of truth.
+    def fetch_pending_requests(self):
+        """Fetch pending label print requests from every active connection and merge them."""
+        active = self.active_connections
+        if not active:
+            self.pending_requests = []
+            self.update_requests_table()
+            self.status_bar.showMessage("No store connections configured")
             return
 
-    def poll_pos_slips(self):
-        """Dispatch a POSPollWorker (non-blocking) to handle the full poll cycle.
+        merged: List[Dict[str, Any]] = []
+        any_ok = False
+        errors = []
 
-        All blocking HTTP I/O is performed inside POSPollWorker.run() on a
-        background QThread.  This method returns immediately so the Qt event
-        loop — and the UI — are never frozen by network calls.
-        """
+        for conn in active:
+            try:
+                headers = self._headers_for(conn)
+                response = requests.get(
+                    f"{conn.api_base_url}/admin/api/label-printing/pending",
+                    headers=headers,
+                    timeout=10,
+                )
+                if response.status_code == 200:
+                    any_ok = True
+                    items = response.json()
+                    for item in items:
+                        # Tag with a plain string id only — never store the
+                        # StoreConnection object itself in a dict that may be
+                        # JSON-serialised (history) or passed around widely.
+                        item["_connection_id"] = conn.connection_id
+                        item["_connection_name"] = conn.name
+                        merged.append(item)
+                else:
+                    errors.append(f"{conn.name}: HTTP {response.status_code}")
+            except Exception as e:
+                errors.append(f"{conn.name}: {e}")
+
+        # Newest first across all stores
+        merged.sort(key=lambda x: str(x.get("created_at", "")), reverse=True)
+        self.pending_requests = merged
+        self.update_requests_table()
+
+        if any_ok:
+            msg = f"Loaded {len(self.pending_requests)} pending request(s) across {len(active)} store(s)"
+            if errors:
+                msg += f" — {len(errors)} store(s) failed"
+            self.status_bar.showMessage(msg)
+        else:
+            self.status_bar.showMessage(f"Failed to fetch requests: {'; '.join(errors) if errors else 'unknown error'}")
+
+    def update_requests_table(self):
+        """Update the requests table with pending requests (now including a Store column)."""
+        self.requests_table.setRowCount(len(self.pending_requests))
+
+        for row, request in enumerate(self.pending_requests):
+            def _cell(text: str, align=Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft) -> QTableWidgetItem:
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(align)
+                return item
+
+            self.requests_table.setItem(row, 0, _cell(
+                str(request.get("id", "")),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter
+            ))
+            self.requests_table.setItem(row, 1, _cell(request.get("_connection_name", "")))
+            source = request.get("source", "").replace("_", " ").title()
+            self.requests_table.setItem(row, 2, _cell(source))
+            self.requests_table.setItem(row, 3, _cell(request.get("created_by_username", "")))
+            self.requests_table.setItem(row, 4, _cell(
+                str(request.get("total_labels", 0)),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter
+            ))
+
+            created_at = request.get("created_at", "")
+            if created_at:
+                try:
+                    dt_obj = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                    created_at = dt_obj.strftime("%d %b %Y  %H:%M")
+                except Exception:
+                    pass
+            self.requests_table.setItem(row, 5, _cell(created_at))
+
+            print_btn = QPushButton("Print")
+            print_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            print_btn.setStyleSheet(self._btn_primary())
+            print_btn.clicked.connect(lambda checked, r=request: self.print_request(r))
+            # Wrap in a widget so padding looks right
+            btn_wrap = QWidget()
+            btn_wrap.setStyleSheet(f"background:{self.C_SURFACE};")
+            bw_layout = QHBoxLayout(btn_wrap)
+            bw_layout.setContentsMargins(8, 5, 8, 5)
+            bw_layout.addWidget(print_btn)
+            self.requests_table.setCellWidget(row, 6, btn_wrap)
+
+        if self.pending_requests:
+            self.requests_table.selectRow(0)
+            self.show_request_details(self.pending_requests[0])
+
+    def _connection_for_request(self, request: Dict[str, Any]) -> Optional[StoreConnection]:
+        return self.get_connection_by_id(request.get("_connection_id", ""))
+
+    def show_request_details(self, request: Dict[str, Any]):
+        """Show details of selected request, fetched from its owning connection."""
+        conn = self._connection_for_request(request)
+        if not conn:
+            self.details_text.setText("Error: could not determine store connection for this request.")
+            return
+        try:
+            headers = self._headers_for(conn)
+            response = requests.get(
+                f"{conn.api_base_url}/admin/api/label-printing/request/{request['id']}",
+                headers=headers,
+                timeout=10
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                items = data.get("items", [])
+
+                details = f"Store: {conn.name}\n"
+                details += f"Request ID: {request['id']}\n"
+                details += f"Source: {request.get('source', '')}\n"
+                details += f"Note: {request.get('note', '')}\n"
+                details += f"Total Labels: {request.get('total_labels', 0)}\n\n"
+                details += "Items:\n"
+                details += "-" * 50 + "\n"
+
+                for item in items:
+                    details += f"• {item.get('title', '')} - {item.get('variant_label', '')}\n"
+                    details += f"  SKU: {item.get('sku', '')} | Qty: {item.get('qty_to_print', 0)}\n"
+
+                self.details_text.setText(details)
+
+        except Exception as e:
+            self.details_text.setText(f"Error loading details: {e}")
+
+    def print_request(self, request: Dict[str, Any]):
+        """Print labels for a specific request, using its owning connection."""
+        conn = self._connection_for_request(request)
+        if not conn:
+            QMessageBox.critical(self, "Error", "Could not determine store connection for this request.")
+            return
+
+        if not self.selected_printer:
+            QMessageBox.warning(self, "No Printer", "Please select a printer first.")
+            return
+
+        if not self.printer_calibrated:
+            reply = QMessageBox.question(
+                self,
+                "Printer Not Calibrated",
+                "Printer has not been calibrated. Print anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.No:
+                return
+
+        try:
+            # Fetch request details from the correct store
+            headers = self._headers_for(conn)
+            response = requests.get(
+                f"{conn.api_base_url}/admin/api/label-printing/request/{request['id']}",
+                headers=headers,
+                timeout=10
+            )
+
+            if response.status_code != 200:
+                QMessageBox.critical(self, "Error", "Failed to fetch print job details")
+                return
+
+            data = response.json()
+            items = data.get("items", [])
+
+            if not items:
+                QMessageBox.warning(self, "No Items", "This request has no items to print.")
+                return
+
+            # Track for history saving
+            self._current_print_request = request
+
+            # Start print job
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setValue(0)
+
+            self.print_job = PrintJob(self.selected_printer, items)
+            self.print_job.progress.connect(self.on_print_progress)
+            self.print_job.finished.connect(
+                lambda s, m: self.on_print_finished(s, m, request['id'], conn.connection_id)
+            )
+            self.print_job.start()
+
+            self.status_bar.showMessage(f"Printing request #{request['id']} ({conn.name})...")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Print Error", f"Failed to start print job: {e}")
+            self.progress_bar.setVisible(False)
+
+    def on_print_progress(self, current: int, total: int):
+        """Update progress bar."""
+        if total > 0:
+            percentage = int((current / total) * 100)
+            self.progress_bar.setValue(percentage)
+            self.status_bar.showMessage(f"Printing: {current}/{total} labels")
+
+    def on_print_finished(self, success: bool, message: str, request_id: int, connection_id: str):
+        """Handle print job completion, completing on the SAME connection that supplied it."""
+        self.progress_bar.setVisible(False)
+        conn = self.get_connection_by_id(connection_id)
+
+        if success:
+            if conn and self._complete_label_request(conn, request_id):
+                self._save_to_history(self._current_print_request)
+                QMessageBox.information(self, "Success", message)
+                self.fetch_pending_requests()  # Refresh list
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Print Complete",
+                    f"{message}\n\nWarning: Failed to mark as completed on server."
+                )
+        else:
+            QMessageBox.critical(self, "Print Failed", message)
+
+        self.status_bar.showMessage("Ready")
+
+    # ─────────────────────────────────────────────────────────────
+    # POS polling — round-robin across connections, one print job at a time
+    # ─────────────────────────────────────────────────────────────
+    #
+    # There is exactly one physical POS printer, so we must never have two
+    # POS/EOD print jobs running concurrently, and never two POSPollWorkers
+    # running concurrently either (that would mean two connections racing to
+    # decide "print now"). poll_pos_slips() advances a round-robin cursor by
+    # exactly one connection per timer tick, so with N connections a full
+    # sweep takes N ticks — while still keeping each tick's HTTP work fully
+    # off the main thread and firing print jobs the instant something is
+    # pending, satisfying the "instant printing" requirement without needing
+    # artificial rate limiting.
+    def _complete_pos_request(self, conn: StoreConnection, request_id: int) -> bool:
+        try:
+            response = requests.post(
+                f"{conn.api_base_url}/admin/api/pos-slips/complete",
+                headers=self._headers_for(conn, include_json=True),
+                json={"request_id": request_id},
+                timeout=10,
+            )
+            if response.status_code == 200:
+                return True
+            if response.status_code in (400, 404):
+                return True
+            return False
+        except Exception:
+            return False
+
+    def _complete_pos_eod_request(self, conn: StoreConnection, request_id: int) -> bool:
+        try:
+            response = requests.post(
+                f"{conn.api_base_url}/admin/api/pos-eod-reports/complete",
+                headers=self._headers_for(conn, include_json=True),
+                json={"request_id": request_id},
+                timeout=10,
+            )
+            if response.status_code == 200:
+                return True
+            if response.status_code in (400, 404):
+                return True
+            return False
+        except Exception:
+            return False
+
+    def poll_pos_slips(self):
+        """Advance the round-robin cursor and dispatch a POSPollWorker for the next
+        eligible connection. Non-blocking: returns immediately."""
         if self.pos_print_job and self.pos_print_job.isRunning():
             return
         if self.pos_eod_print_job and self.pos_eod_print_job.isRunning():
             return
         if self._pos_poll_worker and self._pos_poll_worker.isRunning():
             return
-        if not self.api_key:
-            self._update_pos_worker_status("Missing PRINTER_API_KEY")
-            return
-        if not self.pos_selected_printer or not self.printer_user_id:
+        if not self.pos_selected_printer:
             self._update_pos_worker_status()
             return
-        if time.time() < self.pos_backoff_until:
+
+        eligible = [c for c in self.active_connections if c.printer_user_id]
+        if not eligible:
+            self._update_pos_worker_status()
             return
 
-        # Flush any pending completion retries (lightweight POSTs)
-        if self.pos_completion_retry_ids:
-            retry_ids = sorted(list(self.pos_completion_retry_ids))
-            for req_id in retry_ids:
-                if self._complete_pos_request(req_id):
-                    self.pos_completion_retry_ids.discard(req_id)
-        if self.pos_eod_completion_retry_ids:
-            retry_ids = sorted(list(self.pos_eod_completion_retry_ids))
-            for req_id in retry_ids:
-                if self._complete_pos_eod_request(req_id):
-                    self.pos_eod_completion_retry_ids.discard(req_id)
+        # Flush any pending completion retries across ALL eligible connections
+        # (lightweight POSTs; doesn't block picking a connection to poll).
+        for conn in eligible:
+            if conn.pos_completion_retry_ids:
+                for req_id in sorted(conn.pos_completion_retry_ids):
+                    if self._complete_pos_request(conn, req_id):
+                        conn.pos_completion_retry_ids.discard(req_id)
+            if conn.pos_eod_completion_retry_ids:
+                for req_id in sorted(conn.pos_eod_completion_retry_ids):
+                    if self._complete_pos_eod_request(conn, req_id):
+                        conn.pos_eod_completion_retry_ids.discard(req_id)
 
-        self._pos_poll_worker = POSPollWorker(
-            api_base=self.api_base_url,
-            api_key=self.api_key,
-            user_id=self.printer_user_id,
-            in_flight_ids=frozenset(self.pos_in_flight_ids),
-            eod_in_flight_ids=frozenset(self.pos_eod_in_flight_ids),
-        )
-        self._pos_poll_worker.slip_ready.connect(self._on_poll_slip_ready)
-        self._pos_poll_worker.eod_slip_ready.connect(self._on_poll_eod_slip_ready)
-        self._pos_poll_worker.all_clear.connect(self._on_poll_all_clear)
-        self._pos_poll_worker.poll_error.connect(self._on_poll_error)
-        self._pos_poll_worker.poll_fatal.connect(self._on_poll_fatal)
-        self._pos_poll_worker.start()
+        # Round-robin: find the next eligible connection (by index in
+        # store_connections) that isn't currently backed off.
+        now = time.time()
+        n = len(eligible)
+        for step in range(n):
+            idx = (self._pos_poll_cursor + step) % n
+            conn = eligible[idx]
+            if now < conn.pos_backoff_until:
+                continue
+            self._pos_poll_cursor = (idx + 1) % n
 
-    def _register_pos_backoff(self):
-        """Apply exponential backoff for transient POS API failures."""
-        self.pos_backoff_until = time.time() + min(self.pos_backoff_seconds, 30)
-        self.pos_backoff_seconds = min(self.pos_backoff_seconds * 2, 30)
-
-    def _start_pos_print(self, request_id: int):
-        """Fetch detail payload and start POS print job."""
-        try:
-            response = requests.get(
-                f"{self.api_base_url}/admin/api/pos-slips/request/{request_id}",
-                headers=self._pos_headers(),
-                timeout=10,
+            self._pos_poll_worker = POSPollWorker(
+                connection_id=conn.connection_id,
+                api_base=conn.api_base_url,
+                api_key=conn.api_key,
+                user_id=conn.printer_user_id,
+                in_flight_ids=frozenset(conn.pos_in_flight_ids),
+                eod_in_flight_ids=frozenset(conn.pos_eod_in_flight_ids),
             )
-        except Exception as e:
-            self.pos_in_flight_ids.discard(request_id)
-            self.status_bar.showMessage(f"POS detail error #{request_id}: {e}")
+            self._pos_poll_worker.slip_ready.connect(self._on_poll_slip_ready)
+            self._pos_poll_worker.eod_slip_ready.connect(self._on_poll_eod_slip_ready)
+            self._pos_poll_worker.all_clear.connect(self._on_poll_all_clear)
+            self._pos_poll_worker.poll_error.connect(self._on_poll_error)
+            self._pos_poll_worker.poll_fatal.connect(self._on_poll_fatal)
+            self._pos_poll_worker.start()
             return
 
-        if response.status_code == 404:
-            self.pos_in_flight_ids.discard(request_id)
-            return
-        if response.status_code != 200:
-            self.pos_in_flight_ids.discard(request_id)
-            self.status_bar.showMessage(f"POS detail failed #{request_id}: {response.status_code}")
-            return
+        # Every eligible connection is currently backed off.
+        self._update_pos_worker_status("All stores backing off")
 
-        detail = response.json()
+    def _register_pos_backoff(self, conn: StoreConnection):
+        """Apply exponential backoff for transient POS API failures — per connection,
+        so one dead store never slows polling of a healthy one."""
+        conn.pos_backoff_until = time.time() + min(conn.pos_backoff_seconds, 30)
+        conn.pos_backoff_seconds = min(conn.pos_backoff_seconds * 2, 30)
+
+    # ── POSPollWorker signal handlers ──────────────────────────────────────
+
+    def _on_poll_slip_ready(self, connection_id: str, request_id: int, detail: dict):
+        """POS slip detail fetched off-thread; start print job on main thread."""
+        conn = self.get_connection_by_id(connection_id)
+        if not conn:
+            return
+        conn.pos_in_flight_ids.add(request_id)
+        self.last_successful_pos_poll_at = datetime.now()
+        conn.pos_backoff_seconds = 1
+        conn.pos_backoff_until = 0.0
+        self._update_pos_worker_status(f"Printing via {conn.name}")
         self.pos_print_job = POSSlipPrintJob(self.pos_selected_printer, detail)
-        self.pos_print_job.finished.connect(lambda s, m: self._on_pos_print_finished(s, m, request_id))
+        self.pos_print_job.finished.connect(
+            lambda s, m: self._on_pos_print_finished(s, m, request_id, connection_id)
+        )
         self.pos_print_job.start()
-        self.status_bar.showMessage(f"Printing POS slip #{request_id}...")
+        self.status_bar.showMessage(f"Printing POS slip #{request_id} ({conn.name})...")
 
-    def _on_pos_print_finished(self, success: bool, message: str, request_id: int):
+    def _on_pos_print_finished(self, success: bool, message: str, request_id: int, connection_id: str):
         """Handle POS print completion and completion API semantics."""
         self.pos_print_job = None
+        conn = self.get_connection_by_id(connection_id)
 
         if success:
             self.last_successful_pos_print_at = datetime.now()
-            complete_ok = self._complete_pos_request(request_id)
+            complete_ok = conn is not None and self._complete_pos_request(conn, request_id)
             if not complete_ok:
-                self.pos_completion_retry_ids.add(request_id)
+                if conn:
+                    conn.pos_completion_retry_ids.add(request_id)
                 self.status_bar.showMessage(
                     f"POS slip #{request_id} printed; completion retry scheduled"
                 )
@@ -2162,43 +2553,34 @@ class VulaPrintApp(QMainWindow):
         else:
             self.status_bar.showMessage(f"POS slip #{request_id} failed: {message}")
 
-        self.pos_in_flight_ids.discard(request_id)
+        if conn:
+            conn.pos_in_flight_ids.discard(request_id)
 
-    def _start_pos_eod_print(self, request_id: int):
-        """Fetch EOD report payload and start receipt print job."""
-        try:
-            response = requests.get(
-                f"{self.api_base_url}/admin/api/pos-eod-reports/request/{request_id}",
-                headers=self._pos_headers(),
-                timeout=10,
-            )
-        except Exception as e:
-            self.pos_eod_in_flight_ids.discard(request_id)
-            self.status_bar.showMessage(f"POS EOD detail error #{request_id}: {e}")
+    def _on_poll_eod_slip_ready(self, connection_id: str, request_id: int, detail: dict):
+        """EOD report detail fetched off-thread; start print job on main thread."""
+        conn = self.get_connection_by_id(connection_id)
+        if not conn:
             return
-
-        if response.status_code == 404:
-            self.pos_eod_in_flight_ids.discard(request_id)
-            return
-        if response.status_code != 200:
-            self.pos_eod_in_flight_ids.discard(request_id)
-            self.status_bar.showMessage(f"POS EOD detail failed #{request_id}: {response.status_code}")
-            return
-
-        detail = response.json()
+        conn.pos_eod_in_flight_ids.add(request_id)
+        self.last_successful_pos_poll_at = datetime.now()
+        self._update_pos_worker_status(f"Printing EOD via {conn.name}")
         self.pos_eod_print_job = POSEODReportPrintJob(self.pos_selected_printer, detail)
-        self.pos_eod_print_job.finished.connect(lambda s, m: self._on_pos_eod_print_finished(s, m, request_id))
+        self.pos_eod_print_job.finished.connect(
+            lambda s, m: self._on_pos_eod_print_finished(s, m, request_id, connection_id)
+        )
         self.pos_eod_print_job.start()
-        self.status_bar.showMessage(f"Printing POS EOD report #{request_id}...")
+        self.status_bar.showMessage(f"Printing POS EOD report #{request_id} ({conn.name})...")
 
-    def _on_pos_eod_print_finished(self, success: bool, message: str, request_id: int):
+    def _on_pos_eod_print_finished(self, success: bool, message: str, request_id: int, connection_id: str):
         """Handle POS EOD receipt print completion semantics."""
         self.pos_eod_print_job = None
+        conn = self.get_connection_by_id(connection_id)
 
         if success:
-            complete_ok = self._complete_pos_eod_request(request_id)
+            complete_ok = conn is not None and self._complete_pos_eod_request(conn, request_id)
             if not complete_ok:
-                self.pos_eod_completion_retry_ids.add(request_id)
+                if conn:
+                    conn.pos_eod_completion_retry_ids.add(request_id)
                 self.status_bar.showMessage(
                     f"POS EOD report #{request_id} printed; completion retry scheduled"
                 )
@@ -2207,53 +2589,42 @@ class VulaPrintApp(QMainWindow):
         else:
             self.status_bar.showMessage(f"POS EOD report #{request_id} failed: {message}")
 
-        self.pos_eod_in_flight_ids.discard(request_id)
+        if conn:
+            conn.pos_eod_in_flight_ids.discard(request_id)
 
-    # ── POSPollWorker signal handlers ──────────────────────────────────────
-
-    def _on_poll_slip_ready(self, request_id: int, detail: dict):
-        """POS slip detail fetched off-thread; start print job on main thread."""
-        self.pos_in_flight_ids.add(request_id)
+    def _on_poll_all_clear(self, connection_id: str):
+        """Nothing pending for this connection — update poll timestamp and reset its backoff."""
+        conn = self.get_connection_by_id(connection_id)
         self.last_successful_pos_poll_at = datetime.now()
-        self.pos_backoff_seconds = 1
-        self.pos_backoff_until = 0.0
-        self._update_pos_worker_status("POS API connected")
-        self.pos_print_job = POSSlipPrintJob(self.pos_selected_printer, detail)
-        self.pos_print_job.finished.connect(
-            lambda s, m: self._on_pos_print_finished(s, m, request_id)
-        )
-        self.pos_print_job.start()
-        self.status_bar.showMessage(f"Printing POS slip #{request_id}...")
-
-    def _on_poll_eod_slip_ready(self, request_id: int, detail: dict):
-        """EOD report detail fetched off-thread; start print job on main thread."""
-        self.pos_eod_in_flight_ids.add(request_id)
-        self.last_successful_pos_poll_at = datetime.now()
-        self._update_pos_worker_status("POS API connected")
-        self.pos_eod_print_job = POSEODReportPrintJob(self.pos_selected_printer, detail)
-        self.pos_eod_print_job.finished.connect(
-            lambda s, m: self._on_pos_eod_print_finished(s, m, request_id)
-        )
-        self.pos_eod_print_job.start()
-        self.status_bar.showMessage(f"Printing POS EOD report #{request_id}...")
-
-    def _on_poll_all_clear(self):
-        """Nothing pending — update poll timestamp and reset backoff."""
-        self.last_successful_pos_poll_at = datetime.now()
-        self.pos_backoff_seconds = 1
-        self.pos_backoff_until = 0.0
+        if conn:
+            conn.pos_backoff_seconds = 1
+            conn.pos_backoff_until = 0.0
         self._update_pos_worker_status("POS API connected")
 
-    def _on_poll_error(self, message: str, status_code: int):
-        """Transient poll error — apply exponential backoff."""
-        self._register_pos_backoff()
-        self._update_pos_worker_status("POS API network retry")
-        self.status_bar.showMessage(f"POS poll error: {message}")
+    def _on_poll_error(self, connection_id: str, message: str, status_code: int):
+        """Transient poll error for one connection — apply backoff to THAT connection only."""
+        conn = self.get_connection_by_id(connection_id)
+        if conn:
+            self._register_pos_backoff(conn)
+            name = conn.name
+        else:
+            name = connection_id
+        self._update_pos_worker_status(f"{name}: network retry")
+        self.status_bar.showMessage(f"POS poll error ({name}): {message}")
 
-    def _on_poll_fatal(self, message: str, status_code: int):
-        """Unrecoverable auth/config error — log and let operator fix config."""
-        self._update_pos_worker_status(f"POS API error {status_code}")
-        self.status_bar.showMessage(f"POS worker stopped: {message}")
+    def _on_poll_fatal(self, connection_id: str, message: str, status_code: int):
+        """Unrecoverable auth/config error for one connection — back it off hard and
+        let the operator fix its config; other connections keep polling normally."""
+        conn = self.get_connection_by_id(connection_id)
+        if conn:
+            # Push a long backoff so we don't hammer a mis-configured store,
+            # without stopping polling of the other connection entirely.
+            conn.pos_backoff_until = time.time() + 30
+            name = conn.name
+        else:
+            name = connection_id
+        self._update_pos_worker_status(f"{name}: error {status_code}")
+        self.status_bar.showMessage(f"POS worker stopped for {name}: {message}")
 
     def calibrate_printer(self):
         """Calibrate printer and print test label."""
@@ -2313,7 +2684,6 @@ class VulaPrintApp(QMainWindow):
 
         self.status_bar.showMessage("Calibrating printer…")
 
-    
     def on_test_print_finished(self, success: bool, message: str):
         """Handle test print completion."""
         self.calibration_job = None
@@ -2350,225 +2720,7 @@ class VulaPrintApp(QMainWindow):
                 )
         else:
             QMessageBox.critical(self, "Test Print Failed", message)
-    
-    def test_api_connection(self):
-        """Test connection to backend API."""
-        self.fetch_printer_config(show_dialogs=True)
-    
-    def on_api_url_changed(self, text: str):
-        """Handle API URL change."""
-        self.api_base_url = text.strip()
-        self.save_settings()
-    
-    def fetch_pending_requests(self):
-        """Fetch pending print requests from API."""
-        try:
-            headers = self._headers()
-            response = requests.get(
-                f"{self.api_base_url}/admin/api/label-printing/pending",
-                headers=headers,
-                timeout=10
-            )
-            
-            if response.status_code == 200:
-                self.pending_requests = response.json()
-                self.update_requests_table()
-                self.status_bar.showMessage(f"Loaded {len(self.pending_requests)} pending request(s)")
-            else:
-                self.status_bar.showMessage(f"Failed to fetch requests: {response.status_code}")
-                
-        except Exception as e:
-            self.status_bar.showMessage(f"Error fetching requests: {e}")
-    
-    def update_requests_table(self):
-        """Update the requests table with pending requests."""
-        self.requests_table.setRowCount(len(self.pending_requests))
 
-        for row, request in enumerate(self.pending_requests):
-            def _cell(text: str, align=Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft) -> QTableWidgetItem:
-                item = QTableWidgetItem(text)
-                item.setTextAlignment(align)
-                return item
-
-            self.requests_table.setItem(row, 0, _cell(
-                str(request.get("id", "")),
-                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter
-            ))
-            source = request.get("source", "").replace("_", " ").title()
-            self.requests_table.setItem(row, 1, _cell(source))
-            self.requests_table.setItem(row, 2, _cell(request.get("created_by_username", "")))
-            self.requests_table.setItem(row, 3, _cell(
-                str(request.get("total_labels", 0)),
-                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter
-            ))
-
-            created_at = request.get("created_at", "")
-            if created_at:
-                try:
-                    dt_obj = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-                    created_at = dt_obj.strftime("%d %b %Y  %H:%M")
-                except Exception:
-                    pass
-            self.requests_table.setItem(row, 4, _cell(created_at))
-
-            print_btn = QPushButton("Print")
-            print_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            print_btn.setStyleSheet(self._btn_primary())
-            print_btn.clicked.connect(lambda checked, r=request: self.print_request(r))
-            # Wrap in a widget so padding looks right
-            btn_wrap = QWidget()
-            btn_wrap.setStyleSheet(f"background:{self.C_SURFACE};")
-            bw_layout = QHBoxLayout(btn_wrap)
-            bw_layout.setContentsMargins(8, 5, 8, 5)
-            bw_layout.addWidget(print_btn)
-            self.requests_table.setCellWidget(row, 5, btn_wrap)
-
-        if self.pending_requests:
-            self.requests_table.selectRow(0)
-            self.show_request_details(self.pending_requests[0])
-    
-    def show_request_details(self, request: Dict[str, Any]):
-        """Show details of selected request."""
-        try:
-            headers = self._headers()
-            response = requests.get(
-                f"{self.api_base_url}/admin/api/label-printing/request/{request['id']}",
-                headers=headers,
-                timeout=10
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                items = data.get("items", [])
-                
-                details = f"Request ID: {request['id']}\n"
-                details += f"Source: {request.get('source', '')}\n"
-                details += f"Note: {request.get('note', '')}\n"
-                details += f"Total Labels: {request.get('total_labels', 0)}\n\n"
-                details += "Items:\n"
-                details += "-" * 50 + "\n"
-                
-                for item in items:
-                    details += f"• {item.get('title', '')} - {item.get('variant_label', '')}\n"
-                    details += f"  SKU: {item.get('sku', '')} | Qty: {item.get('qty_to_print', 0)}\n"
-                
-                self.details_text.setText(details)
-            
-        except Exception as e:
-            self.details_text.setText(f"Error loading details: {e}")
-    
-    def print_request(self, request: Dict[str, Any]):
-        """Print labels for a specific request."""
-        if not self.selected_printer:
-            QMessageBox.warning(self, "No Printer", "Please select a printer first.")
-            return
-        
-        if not self.printer_calibrated:
-            reply = QMessageBox.question(
-                self,
-                "Printer Not Calibrated",
-                "Printer has not been calibrated. Print anyway?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            )
-            if reply == QMessageBox.StandardButton.No:
-                return
-        
-        try:
-            # Fetch request details
-            headers = self._headers()
-            response = requests.get(
-                f"{self.api_base_url}/admin/api/label-printing/request/{request['id']}",
-                headers=headers,
-                timeout=10
-            )
-            
-            if response.status_code != 200:
-                QMessageBox.critical(self, "Error", "Failed to fetch print job details")
-                return
-            
-            data = response.json()
-            items = data.get("items", [])
-            
-            if not items:
-                QMessageBox.warning(self, "No Items", "This request has no items to print.")
-                return
-            
-            # Track for history saving
-            self._current_print_request = request
-
-            # Start print job
-            self.progress_bar.setVisible(True)
-            self.progress_bar.setValue(0)
-
-            self.print_job = PrintJob(self.selected_printer, items)
-            self.print_job.progress.connect(self.on_print_progress)
-            self.print_job.finished.connect(lambda s, m: self.on_print_finished(s, m, request['id']))
-            self.print_job.start()
-            
-            self.status_bar.showMessage(f"Printing request #{request['id']}...")
-            
-        except Exception as e:
-            QMessageBox.critical(self, "Print Error", f"Failed to start print job: {e}")
-            self.progress_bar.setVisible(False)
-    
-    def on_print_progress(self, current: int, total: int):
-        """Update progress bar."""
-        if total > 0:
-            percentage = int((current / total) * 100)
-            self.progress_bar.setValue(percentage)
-            self.status_bar.showMessage(f"Printing: {current}/{total} labels")
-    
-    def on_print_finished(self, success: bool, message: str, request_id: int):
-        """Handle print job completion."""
-        self.progress_bar.setVisible(False)
-        
-        if success:
-            # Mark as completed on server
-            try:
-                headers = self._headers(include_json=True)
-                response = requests.post(
-                    f"{self.api_base_url}/admin/api/label-printing/complete",
-                    headers=headers,
-                    json={"request_id": request_id},
-                    timeout=10
-                )
-                
-                if response.status_code == 200:
-                    self._save_to_history(self._current_print_request)
-                    QMessageBox.information(self, "Success", message)
-                    self.fetch_pending_requests()  # Refresh list
-                else:
-                    QMessageBox.warning(
-                        self,
-                        "Print Complete",
-                        f"{message}\n\nWarning: Failed to mark as completed on server."
-                    )
-            except Exception as e:
-                QMessageBox.warning(
-                    self,
-                    "Print Complete",
-                    f"{message}\n\nWarning: Failed to communicate with server: {e}"
-                )
-        else:
-            QMessageBox.critical(self, "Print Failed", message)
-        
-        self.status_bar.showMessage("Ready")
-
-    # ─────────────────────────────────────────────────────────────
-    # Selection tracking
-    # ─────────────────────────────────────────────────────────────
-    def _on_request_selection_changed(self):
-        """Track the currently selected row so Preview TSPL knows which request to show."""
-        row = self.requests_table.currentRow()
-        if 0 <= row < len(self.pending_requests):
-            self._selected_request = self.pending_requests[row]
-            self.show_request_details(self._selected_request)
-        else:
-            self._selected_request = None
-
-    # ─────────────────────────────────────────────────────────────
-    # TSPL Visualizer
-    # ─────────────────────────────────────────────────────────────
     def show_tspl_preview(self):
         """Open a dialog showing the raw TSPL commands for the selected print request."""
         request = self._selected_request
@@ -2580,10 +2732,15 @@ class VulaPrintApp(QMainWindow):
                     "Select a request from the queue first, or refresh to load requests.")
                 return
 
+        conn = self._connection_for_request(request)
+        if not conn:
+            QMessageBox.critical(self, "Error", "Could not determine store connection for this request.")
+            return
+
         try:
-            headers = self._headers()
+            headers = self._headers_for(conn)
             response = requests.get(
-                f"{self.api_base_url}/admin/api/label-printing/request/{request['id']}",
+                f"{conn.api_base_url}/admin/api/label-printing/request/{request['id']}",
                 headers=headers, timeout=10
             )
             if response.status_code != 200:
@@ -2601,7 +2758,7 @@ class VulaPrintApp(QMainWindow):
         # Build a temporary PrintJob just to use _generate_label_tspl
         preview_job = PrintJob("", items)
         lines = []
-        lines.append(f"=== TSPL PREVIEW: Request #{request['id']} ===")
+        lines.append(f"=== TSPL PREVIEW: Request #{request['id']} ({conn.name}) ===")
         lines.append(f"Total items: {len(items)}  |  Total labels: "
                      f"{sum(i.get('qty_to_print', 0) for i in items)}")
         lines.append("")
@@ -2617,7 +2774,7 @@ class VulaPrintApp(QMainWindow):
 
         dialog = _TextDialog(
             parent=self,
-            title=f"TSPL Preview — Request #{request['id']}",
+            title=f"TSPL Preview — Request #{request['id']} ({conn.name})",
             content="\n".join(lines),
             color_bg=self.C_BG,
             color_text=self.C_TEXT,
@@ -2627,9 +2784,6 @@ class VulaPrintApp(QMainWindow):
         )
         dialog.exec()
 
-    # ─────────────────────────────────────────────────────────────
-    # Visual QPainter label preview
-    # ─────────────────────────────────────────────────────────────
     def show_visual_preview(self):
         """Open a rendered visual preview of how labels will look when printed."""
         request = self._selected_request
@@ -2643,10 +2797,15 @@ class VulaPrintApp(QMainWindow):
                 )
                 return
 
+        conn = self._connection_for_request(request)
+        if not conn:
+            QMessageBox.critical(self, "Error", "Could not determine store connection for this request.")
+            return
+
         try:
-            headers  = {"X-API-Key": self.api_key}
+            headers  = self._headers_for(conn)
             response = requests.get(
-                f"{self.api_base_url}/admin/api/label-printing/request/{request['id']}",
+                f"{conn.api_base_url}/admin/api/label-printing/request/{request['id']}",
                 headers=headers, timeout=10,
             )
             if response.status_code != 200:
@@ -2676,6 +2835,18 @@ class VulaPrintApp(QMainWindow):
             color_orange   = self.C_ORANGE,
         )
         dialog.exec()
+
+    # ─────────────────────────────────────────────────────────────
+    # Selection tracking
+    # ─────────────────────────────────────────────────────────────
+    def _on_request_selection_changed(self):
+        """Track the currently selected row so Preview TSPL knows which request to show."""
+        row = self.requests_table.currentRow()
+        if 0 <= row < len(self.pending_requests):
+            self._selected_request = self.pending_requests[row]
+            self.show_request_details(self._selected_request)
+        else:
+            self._selected_request = None
 
     # ─────────────────────────────────────────────────────────────
     # Standalone Test Label (not coupled to calibration)
@@ -2844,6 +3015,8 @@ class VulaPrintApp(QMainWindow):
                 "created_by": request.get("created_by_username", ""),
                 "total_labels": request.get("total_labels", 0),
                 "note": request.get("note", ""),
+                "connection_id": request.get("_connection_id", ""),
+                "connection_name": request.get("_connection_name", ""),
                 "printed_at": datetime.now().isoformat(timespec="seconds"),
             }
             history.insert(0, entry)      # newest first
@@ -2883,7 +3056,9 @@ class VulaPrintApp(QMainWindow):
         dialog.exec()
 
     def _reprint_history_entry(self, entry: Dict[str, Any]):
-        """Re-fetch a previously printed request by ID and print it again."""
+        """Re-fetch a previously printed request by ID and print it again, using the
+        SAME connection it was originally printed from (falls back to the first
+        active connection if that store was removed)."""
         if not self.selected_printer:
             QMessageBox.warning(self, "No Printer", "Please select a printer first.")
             return
@@ -2893,10 +3068,25 @@ class VulaPrintApp(QMainWindow):
             QMessageBox.warning(self, "Missing ID", "This history entry has no request ID.")
             return
 
+        conn = self.get_connection_by_id(entry.get("connection_id", ""))
+        if not conn:
+            # Store connection may have been removed/renamed since — fall back
+            # to the first active connection and tell the operator.
+            active = self.active_connections
+            if not active:
+                QMessageBox.critical(self, "Reprint Failed", "No store connections are configured.")
+                return
+            conn = active[0]
+            QMessageBox.information(
+                self, "Store Connection Changed",
+                f"Original store '{entry.get('connection_name', 'unknown')}' is no longer "
+                f"configured. Using '{conn.name}' instead."
+            )
+
         try:
-            headers = self._headers()
+            headers = self._headers_for(conn)
             response = requests.get(
-                f"{self.api_base_url}/admin/api/label-printing/request/{request_id}",
+                f"{conn.api_base_url}/admin/api/label-printing/request/{request_id}",
                 headers=headers, timeout=10
             )
             if response.status_code != 200:
@@ -2917,7 +3107,7 @@ class VulaPrintApp(QMainWindow):
 
         confirm = QMessageBox.question(
             self, "Confirm Reprint",
-            f"Reprint request #{request_id}?\n"
+            f"Reprint request #{request_id} ({conn.name})?\n"
             f"Originally printed: {entry.get('printed_at', 'unknown')}\n"
             f"Total labels: {entry.get('total_labels', 0)}",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
@@ -3029,6 +3219,247 @@ class VulaPrintApp(QMainWindow):
 # ─────────────────────────────────────────────────────────────────
 # Helper dialogs
 # ─────────────────────────────────────────────────────────────────
+
+class _ConnectionsDialog(QDialog):
+    """Add / edit / remove store connections.
+
+    Mutates parent.store_connections directly (list of StoreConnection).
+    Kept intentionally simple: a list on the left, a small edit form on the
+    right. Built primarily around the 2-store case but works for more, up to
+    MAX_STORE_CONNECTIONS.
+    """
+
+    def __init__(self, parent: "VulaPrintApp"):
+        super().__init__(parent)
+        self._app = parent
+        self.setWindowTitle("Store Connections")
+        if hasattr(parent, "_dialog_size"):
+            size = parent._dialog_size(0.62, 0.62, 620, 420, 900, 700)
+            self.resize(size)
+            self.setMinimumSize(620, 420)
+        else:
+            self.resize(720, 500)
+
+        C = parent
+        self.setStyleSheet(f"background:{C.C_BG}; color:{C.C_TEXT};")
+
+        self._editing_index: Optional[int] = None
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 12)
+        root.setSpacing(10)
+
+        heading = QLabel("Store Connections")
+        heading.setStyleSheet(f"color:{C.C_TEXT}; font-size:14px; font-weight:700;")
+        root.addWidget(heading)
+
+        body = QHBoxLayout()
+        body.setSpacing(14)
+        root.addLayout(body, stretch=1)
+
+        # ── Left: list of connections ──────────────────────────
+        left = QVBoxLayout()
+        left.setSpacing(8)
+        body.addLayout(left, stretch=1)
+
+        self._list = QListWidget()
+        self._list.setStyleSheet(
+            f"QListWidget {{ background:{C.C_SURFACE}; color:{C.C_TEXT};"
+            f" border:1px solid {C.C_BORDER}; border-radius:8px; padding:4px; }}"
+            f"QListWidget::item {{ padding:8px; border-radius:6px; }}"
+            f"QListWidget::item:selected {{ background:{C.C_SURFACE2}; color:{C.C_ORANGE}; }}"
+        )
+        self._list.currentRowChanged.connect(self._on_row_changed)
+        left.addWidget(self._list, stretch=1)
+
+        list_btn_row = QHBoxLayout()
+        add_btn = QPushButton("+ Add Store")
+        add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_btn.setStyleSheet(C._btn_primary())
+        add_btn.clicked.connect(self._add_connection)
+        remove_btn = QPushButton("Remove")
+        remove_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        remove_btn.setStyleSheet(C._btn_secondary())
+        remove_btn.clicked.connect(self._remove_selected)
+        list_btn_row.addWidget(add_btn)
+        list_btn_row.addWidget(remove_btn)
+        left.addLayout(list_btn_row)
+
+        # ── Right: edit form ────────────────────────────────────
+        right = QVBoxLayout()
+        right.setSpacing(8)
+        body.addLayout(right, stretch=1)
+
+        form_card = QWidget()
+        form_card.setStyleSheet(C._card_style(8))
+        form_layout = QVBoxLayout(form_card)
+        form_layout.setContentsMargins(14, 14, 14, 14)
+        form_layout.setSpacing(8)
+
+        def _field_label(text: str) -> QLabel:
+            lbl = QLabel(text)
+            lbl.setStyleSheet(C._label_style(small=True))
+            return lbl
+
+        form_layout.addWidget(_field_label("NAME"))
+        self._name_input = QLineEdit()
+        self._name_input.setStyleSheet(C._input_style())
+        form_layout.addWidget(self._name_input)
+
+        form_layout.addWidget(_field_label("SERVER URL"))
+        self._url_input = QLineEdit()
+        self._url_input.setPlaceholderText("https://example.com")
+        self._url_input.setStyleSheet(C._input_style())
+        form_layout.addWidget(self._url_input)
+
+        form_layout.addWidget(_field_label("API KEY"))
+        self._key_input = QLineEdit()
+        self._key_input.setStyleSheet(C._input_style())
+        form_layout.addWidget(self._key_input)
+
+        form_layout.addWidget(_field_label("PRINTER USER ID"))
+        self._user_id_input = QLineEdit()
+        self._user_id_input.setPlaceholderText("Fetched automatically after saving")
+        self._user_id_input.setReadOnly(True)
+        self._user_id_input.setStyleSheet(C._input_style())
+        form_layout.addWidget(self._user_id_input)
+
+        self._status_lbl = QLabel("Not tested")
+        self._status_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._status_lbl.setStyleSheet(
+            f"background:#2a1a1a; color:{C.C_RED}; border:1px solid #5a2a2a;"
+            f"border-radius:12px; font-size:11px; font-weight:600; padding:4px 10px;"
+        )
+        form_layout.addWidget(self._status_lbl)
+
+        save_btn = QPushButton("Save Store")
+        save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_btn.setStyleSheet(C._btn_primary())
+        save_btn.clicked.connect(self._save_current)
+        form_layout.addWidget(save_btn)
+
+        form_layout.addStretch()
+        right.addWidget(form_card, stretch=1)
+
+        # ── Close button ────────────────────────────────────────
+        close_row = QHBoxLayout()
+        close_row.addStretch()
+        close_btn = QPushButton("Done")
+        close_btn.setMinimumHeight(34)
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setStyleSheet(C._btn_primary())
+        close_btn.clicked.connect(self.accept)
+        close_row.addWidget(close_btn)
+        root.addLayout(close_row)
+
+        self._refresh_list()
+        if self._app.store_connections:
+            self._list.setCurrentRow(0)
+
+    def _refresh_list(self):
+        self._list.clear()
+        for conn in self._app.store_connections:
+            label = conn.name
+            if conn.is_configured():
+                mark = "✓" if conn.last_connected else "○"
+                label = f"{mark}  {conn.name}"
+            else:
+                label = f"—  {conn.name} (not configured)"
+            self._list.addItem(QListWidgetItem(label))
+
+    def _on_row_changed(self, row: int):
+        self._editing_index = row if row is not None and row >= 0 else None
+        if self._editing_index is None or self._editing_index >= len(self._app.store_connections):
+            self._name_input.setText("")
+            self._url_input.setText("")
+            self._key_input.setText("")
+            self._user_id_input.setText("")
+            self._status_lbl.setText("Not tested")
+            return
+
+        conn = self._app.store_connections[self._editing_index]
+        self._name_input.setText(conn.name)
+        self._url_input.setText(conn.api_base_url)
+        self._key_input.setText(conn.api_key)
+        self._user_id_input.setText("" if conn.printer_user_id is None else str(conn.printer_user_id))
+        self._set_status_label(conn)
+
+    def _set_status_label(self, conn: StoreConnection):
+        C = self._app
+        if conn.last_connected:
+            self._status_lbl.setText(conn.last_status or "Connected")
+            self._status_lbl.setStyleSheet(
+                f"background:#0f2a1a; color:{C.C_GREEN}; border:1px solid #1a5a2a;"
+                f"border-radius:12px; font-size:11px; font-weight:600; padding:4px 10px;"
+            )
+        else:
+            self._status_lbl.setText(conn.last_status or "Not tested")
+            self._status_lbl.setStyleSheet(
+                f"background:#2a1a1a; color:{C.C_RED}; border:1px solid #5a2a2a;"
+                f"border-radius:12px; font-size:11px; font-weight:600; padding:4px 10px;"
+            )
+
+    def _add_connection(self):
+        if len(self._app.store_connections) >= MAX_STORE_CONNECTIONS:
+            QMessageBox.information(
+                self, "Limit Reached",
+                f"A maximum of {MAX_STORE_CONNECTIONS} store connections is supported."
+            )
+            return
+        idx = len(self._app.store_connections) + 1
+        new_conn = StoreConnection(
+            connection_id=self._app._new_connection_id(),
+            name=f"Store {idx}",
+        )
+        self._app.store_connections.append(new_conn)
+        self._refresh_list()
+        self._list.setCurrentRow(len(self._app.store_connections) - 1)
+
+    def _remove_selected(self):
+        if self._editing_index is None or self._editing_index >= len(self._app.store_connections):
+            return
+        conn = self._app.store_connections[self._editing_index]
+        confirm = QMessageBox.question(
+            self, "Remove Connection",
+            f"Remove store connection '{conn.name}'?\n\n"
+            "Pending requests already loaded from this store will disappear on next refresh.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        del self._app.store_connections[self._editing_index]
+        self._refresh_list()
+        if self._app.store_connections:
+            self._list.setCurrentRow(0)
+        else:
+            self._on_row_changed(-1)
+
+    def _save_current(self):
+        if self._editing_index is None or self._editing_index >= len(self._app.store_connections):
+            QMessageBox.information(self, "No Selection", "Add or select a store connection first.")
+            return
+
+        conn = self._app.store_connections[self._editing_index]
+        conn.name = self._name_input.text().strip() or conn.name
+        conn.api_base_url = self._url_input.text().strip()
+        conn.api_key = self._key_input.text().strip()
+
+        self._refresh_list()
+        self._list.setCurrentRow(self._editing_index)
+
+        if conn.is_configured():
+            ok = self._app._fetch_config_for_connection(conn, show_dialogs=False)
+            self._user_id_input.setText("" if conn.printer_user_id is None else str(conn.printer_user_id))
+            self._set_status_label(conn)
+            self._refresh_list()
+            self._list.setCurrentRow(self._editing_index)
+            if not ok:
+                QMessageBox.warning(self, "Connection Failed", f"{conn.name}: {conn.last_status}")
+        else:
+            conn.last_connected = False
+            conn.last_status = "Not configured"
+            self._set_status_label(conn)
+
 
 class _VisualPreviewDialog(QDialog):
     """QPainter-rendered visual label preview with item navigation."""
@@ -3200,7 +3631,7 @@ class _TextDialog(QDialog):
         text_area = QTextEdit()
         text_area.setReadOnly(True)
         text_area.setPlainText(content)
-        text_area.setFont(__import__('PyQt6.QtGui', fromlist=['QFont']).QFont("Courier New", 10))
+        text_area.setFont(QFont("Courier New", 10))
         text_area.setStyleSheet(
             f"background:{color_surface}; color:{color_text};"
             f"border:1px solid {color_border}; border-radius:6px; padding:8px;"
@@ -3209,7 +3640,7 @@ class _TextDialog(QDialog):
 
         close_btn = QPushButton("Close")
         close_btn.setMinimumHeight(34)
-        close_btn.setCursor(__import__('PyQt6.QtCore', fromlist=['Qt']).Qt.CursorShape.PointingHandCursor)
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         close_btn.setStyleSheet(
             f"QPushButton {{ background:{color_orange}; color:#000; border:none;"
             f" border-radius:6px; padding:6px 20px; font-weight:700; }}"
@@ -3252,7 +3683,7 @@ class _HistoryDialog(QDialog):
         if not history:
             empty = QLabel("No print history yet. Print a job first.")
             empty.setStyleSheet(f"color:{color_text_dim}; font-size:12px; padding:20px;")
-            empty.setAlignment(__import__('PyQt6.QtCore', fromlist=['Qt']).Qt.AlignmentFlag.AlignCenter)
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
             layout.addWidget(empty)
         else:
             scroll = QScrollArea()
@@ -3289,10 +3720,14 @@ class _HistoryDialog(QDialog):
                 info_layout = QVBoxLayout()
                 info_layout.setSpacing(2)
 
+                store_suffix = ""
+                if entry.get("connection_name"):
+                    store_suffix = f"  •  {entry['connection_name']}"
+
                 top_text = (
                     f"#{entry.get('id', '?')}  •  "
                     f"{entry.get('source', '').replace('_', ' ').title()}  —  "
-                    f"{entry.get('total_labels', 0)} label(s)"
+                    f"{entry.get('total_labels', 0)} label(s){store_suffix}"
                 )
                 top_lbl = QLabel(top_text)
                 top_lbl.setStyleSheet(
@@ -3317,9 +3752,7 @@ class _HistoryDialog(QDialog):
 
                 reprint_btn = QPushButton("Reprint")
                 reprint_btn.setMinimumSize(88, 32)
-                reprint_btn.setCursor(
-                    __import__('PyQt6.QtCore', fromlist=['Qt']).Qt.CursorShape.PointingHandCursor
-                )
+                reprint_btn.setCursor(Qt.CursorShape.PointingHandCursor)
                 reprint_btn.setStyleSheet(btn_style)
                 reprint_btn.clicked.connect(
                     lambda checked, e=entry: self._do_reprint(e)
@@ -3334,7 +3767,7 @@ class _HistoryDialog(QDialog):
 
         close_btn = QPushButton("Close")
         close_btn.setMinimumHeight(34)
-        close_btn.setCursor(__import__('PyQt6.QtCore', fromlist=['Qt']).Qt.CursorShape.PointingHandCursor)
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         close_btn.setStyleSheet(
             f"QPushButton {{ background:{color_orange}; color:#000; border:none;"
             f" border-radius:6px; padding:6px 20px; font-weight:700; }}"
@@ -3382,7 +3815,7 @@ class _UpdateDialog(QDialog):
 
         self._output = QTextEdit()
         self._output.setReadOnly(True)
-        self._output.setFont(__import__('PyQt6.QtGui', fromlist=['QFont']).QFont("Courier New", 10))
+        self._output.setFont(QFont("Courier New", 10))
         self._output.setStyleSheet(
             f"background:{color_surface}; color:{color_text};"
             f"border:1px solid {color_border}; border-radius:6px; padding:8px;"
@@ -3425,9 +3858,9 @@ class _UpdateDialog(QDialog):
             return
         raw = bytes(self._process.readAllStandardOutput())
         text = raw.decode("utf-8", errors="replace")
-        self._output.moveCursor(__import__('PyQt6.QtGui', fromlist=['QTextCursor']).QTextCursor.MoveOperation.End)
+        self._output.moveCursor(self._output.textCursor().MoveOperation.End)
         self._output.insertPlainText(text)
-        self._output.moveCursor(__import__('PyQt6.QtGui', fromlist=['QTextCursor']).QTextCursor.MoveOperation.End)
+        self._output.moveCursor(self._output.textCursor().MoveOperation.End)
 
     def _on_finished(self, exit_code: int, _exit_status):
         self._finished = True
