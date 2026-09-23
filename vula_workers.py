@@ -18,21 +18,49 @@ from vula_device_io import write_to_device
 
 
 class PrinterScanner(QThread):
-    """Background thread to scan for USB printers."""
+    """Background thread to scan for printer devices.
+
+    Detects:
+      * USB printer-class devices under /dev/usb/  (lp0, lp1, ...)
+      * USB-serial adapters: /dev/ttyUSB*, /dev/ttyACM*
+      * Stable udev symlinks under /dev/serial/by-id/*
+
+    Both raw serial device paths and their by-id symlinks may appear in the
+    results. If a device is present via both, prefer the by-id symlink when
+    assigning roles — it is stable across reboots and re-plugs.
+    """
 
     printers_found = pyqtSignal(list)
 
     def run(self):
-        """Scan for available USB printers."""
-        printers = []
+        devices = []
         try:
-            usb_path = Path("/dev/usb")
-            if usb_path.exists():
-                printers = sorted([str(p) for p in usb_path.glob("lp*")])
+            usb_dir = Path("/dev/usb")
+            if usb_dir.exists():
+                devices.extend(str(p) for p in usb_dir.glob("lp*"))
+
+            dev_dir = Path("/dev")
+            if dev_dir.exists():
+                devices.extend(str(p) for p in dev_dir.glob("ttyUSB*"))
+                devices.extend(str(p) for p in dev_dir.glob("ttyACM*"))
+
+            serial_by_id = Path("/dev/serial/by-id")
+            if serial_by_id.exists():
+                devices.extend(
+                    str(p) for p in serial_by_id.iterdir() if p.is_symlink()
+                )
+
+            seen = set()
+            unique = []
+            for d in devices:
+                if d not in seen:
+                    seen.add(d)
+                    unique.append(d)
+            devices = sorted(unique)
         except Exception as e:
             print(f"Error scanning for printers: {e}")
 
-        self.printers_found.emit(printers)
+        self.printers_found.emit(devices)
 
 
 class PrintJob(QThread):

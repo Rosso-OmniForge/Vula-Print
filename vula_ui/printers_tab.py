@@ -15,9 +15,9 @@ from typing import Dict
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
-    QDialog, QDialogButtonBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
-    QListWidget, QListWidgetItem, QMessageBox, QPushButton, QVBoxLayout,
-    QWidget,
+    QComboBox, QDialog, QDialogButtonBox, QFormLayout, QFrame, QGridLayout,
+    QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMessageBox,
+    QPushButton, QVBoxLayout, QWidget,
 )
 
 
@@ -183,6 +183,22 @@ class PrintersTabMixin:
             cal_btn.clicked.connect(self.calibrate_printer)
             actions.addWidget(cal_btn)
 
+        # Settings button — enabled only for serial devices. State is
+        # refreshed by _update_card_status() on every probe tick.
+        settings_btn = QPushButton("Settings")
+        settings_btn.setMinimumHeight(32)
+        settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        settings_btn.setStyleSheet(self._btn_secondary())
+        settings_btn.clicked.connect(
+            lambda _, rk=role_key, rn=role_name, sa=state_attr:
+            self._open_serial_settings_for_role(rk, rn, sa)
+        )
+        settings_btn.setEnabled(False)
+        settings_btn.setToolTip(
+            "Serial device settings (available only for /dev/tty* devices)"
+        )
+        actions.addWidget(settings_btn)
+
         actions.addStretch()
 
         test_btn = QPushButton("Test")
@@ -199,6 +215,7 @@ class PrintersTabMixin:
             "dot": status_dot,
             "path": path_lbl,
             "status": status_lbl,
+            "settings_btn": settings_btn,
         }
         return card
 
@@ -228,6 +245,20 @@ class PrintersTabMixin:
         if not refs:
             return
         dot, path_lbl, status_lbl = refs["dot"], refs["path"], refs["status"]
+
+        settings_btn = refs.get("settings_btn")
+        if settings_btn is not None:
+            from vula_device_io import is_serial_device
+            serial = bool(path) and is_serial_device(path)
+            settings_btn.setEnabled(serial)
+            if serial:
+                settings_btn.setToolTip(
+                    "Configure baud rate, parity, stop bits, flow control"
+                )
+            else:
+                settings_btn.setToolTip(
+                    "No configurable settings for this device (USB printer-class)"
+                )
 
         if not path:
             dot.setStyleSheet(f"color:{self.C_TEXT_DIM}; font-size:15px;")
@@ -378,3 +409,122 @@ class PrintersTabMixin:
                 "A4 full-page printing is not yet implemented.\n\n"
                 "This role is reserved for a future release.",
             )
+    # ── Serial settings ─────────────────────────────────────────
+
+    def _open_serial_settings_for_role(self, role_key: str, role_name: str, state_attr: str) -> None:
+        path = getattr(self, state_attr, None)
+        if not path:
+            QMessageBox.information(
+                self, "No Printer",
+                f"No printer assigned to the {role_name} role."
+            )
+            return
+
+        from vula_device_io import is_serial_device
+        if not is_serial_device(path):
+            QMessageBox.information(
+                self, "Not a Serial Device",
+                f"{path} is a USB printer-class device — it has no serial "
+                "settings. Only /dev/tty* and /dev/serial/* devices have "
+                "configurable baud / parity / flow control."
+            )
+            return
+
+        self._open_serial_settings_dialog(path, role_name)
+
+    def _open_serial_settings_dialog(self, path: str, role_name: str) -> None:
+        from vula_device_io import (
+            BAUD_RATES, PARITIES, STOPBITS, FLOW_MODES, get_serial_config,
+        )
+        cfg = get_serial_config(path)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Serial Settings — {role_name}")
+        dlg.setMinimumSize(440, 380)
+        dlg.setStyleSheet(f"background:{self.C_BG}; color:{self.C_TEXT};")
+
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(18, 18, 18, 14)
+        layout.setSpacing(10)
+
+        heading = QLabel(f"Serial port settings for {role_name}")
+        heading.setStyleSheet(
+            f"color:{self.C_TEXT}; font-size:13px; font-weight:700;"
+        )
+        layout.addWidget(heading)
+
+        path_lbl = QLabel(path)
+        path_lbl.setStyleSheet(
+            f"color:{self.C_TEXT_DIM}; font-size:11px; "
+            f"font-family:'Courier New',monospace;"
+        )
+        layout.addWidget(path_lbl)
+
+        form = QFormLayout()
+        form.setSpacing(8)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        def _combo(items, current):
+            cb = QComboBox()
+            cb.setStyleSheet(self._input_style())
+            for value, label in items:
+                cb.addItem(str(label), value)
+            for i in range(cb.count()):
+                if cb.itemData(i) == current:
+                    cb.setCurrentIndex(i)
+                    break
+            return cb
+
+        baud_combo = _combo([(b, str(b)) for b in BAUD_RATES], cfg["baud"])
+        parity_combo = _combo(list(PARITIES.items()), cfg["parity"])
+        stop_combo = _combo(list(STOPBITS.items()), cfg["stopbits"])
+        flow_combo = _combo(list(FLOW_MODES.items()), cfg["flow"])
+
+        form.addRow("Baud rate:", baud_combo)
+        form.addRow("Parity:", parity_combo)
+        form.addRow("Stop bits:", stop_combo)
+        form.addRow("Flow control:", flow_combo)
+        layout.addLayout(form)
+
+        help_lbl = QLabel(
+            "Most old POS printers use 9600 8N1 with no flow control. "
+            "Change these only if the printer produces garbage output."
+        )
+        help_lbl.setWordWrap(True)
+        help_lbl.setStyleSheet(f"color:{self.C_TEXT_DIM}; font-size:11px;")
+        layout.addWidget(help_lbl)
+
+        layout.addStretch()
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        ok_btn = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        ok_btn.setText("Save")
+        ok_btn.setStyleSheet(self._btn_primary())
+        cancel_btn = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        cancel_btn.setStyleSheet(self._btn_secondary())
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        new_cfg = {
+            "baud": baud_combo.currentData(),
+            "parity": parity_combo.currentData(),
+            "stopbits": stop_combo.currentData(),
+            "flow": flow_combo.currentData(),
+        }
+        if not hasattr(self, "serial_config") or self.serial_config is None:
+            self.serial_config = {}
+        self.serial_config[path] = new_cfg
+        self.save_settings()
+        self._refresh_printer_status()
+        self.status_bar.showMessage(
+            f"{role_name}: saved serial settings "
+            f"({new_cfg['baud']}, {new_cfg['parity']}{new_cfg['stopbits']}, "
+            f"flow={new_cfg['flow']})"
+        )
