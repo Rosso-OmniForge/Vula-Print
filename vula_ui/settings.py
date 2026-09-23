@@ -102,6 +102,7 @@ class SettingsMixin:
             self.pos_width_chars = int(data.get("pos_width_chars", 32) or 32)
             self.pos_qr_mode = str(data.get("pos_qr_mode", "raster") or "raster")
             self.pos_qr_module_px = int(data.get("pos_qr_module_px", 4) or 4)
+            self.serial_config = data.get("serial_config") or {}
         except Exception as e:
             print(f"Warning: failed to load settings: {e}")
 
@@ -135,6 +136,7 @@ class SettingsMixin:
                 "pos_width_chars": int(self.pos_width_chars),
                 "pos_qr_mode": str(self.pos_qr_mode),
                 "pos_qr_module_px": int(self.pos_qr_module_px),
+                "serial_config": dict(getattr(self, "serial_config", {}) or {}),
                 "printer_roles": {
                     "label": self.last_selected_printer,
                     "pos_slip": self.last_selected_pos_printer,
@@ -142,5 +144,12 @@ class SettingsMixin:
             }
             with open(APP_CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
+            # Push the new serial configs into the device-io registry
+            # so the next print job picks up any changes immediately.
+            try:
+                from vula_device_io import set_serial_configs
+                set_serial_configs(getattr(self, "serial_config", {}) or {})
+            except Exception:
+                pass
         except Exception as e:
             print(f"Warning: failed to save settings: {e}")

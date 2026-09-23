@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 from PyQt6.QtCore import QThread, pyqtSignal
+from vula_device_io import write_to_device
 
 
 class PrinterScanner(QThread):
@@ -174,8 +175,7 @@ class PrintJob(QThread):
 
                     # Send to printer
                     try:
-                        with open(self.printer_device, 'wb') as printer:
-                            printer.write(tspl.encode('utf-8'))
+                        write_to_device(self.printer_device, tspl.encode('utf-8'))
                     except PermissionError:
                         self.finished.emit(
                             False,
@@ -526,8 +526,7 @@ class POSSlipPrintJob(QThread):
         try:
             payload = self._build_receipt_bytes()
             try:
-                with open(self.printer_device, "wb") as printer:
-                    printer.write(payload)
+                write_to_device(self.printer_device, payload)
             except PermissionError:
                 self.finished.emit(
                     False,
@@ -636,8 +635,7 @@ class POSEODReportPrintJob(QThread):
         try:
             payload = self._build_receipt_bytes()
             try:
-                with open(self.printer_device, "wb") as printer:
-                    printer.write(payload)
+                write_to_device(self.printer_device, payload)
             except PermissionError:
                 self.finished.emit(
                     False,

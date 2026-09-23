@@ -4,7 +4,7 @@
 # NOTE: PyQt6 and PyQt6-Qt6 are intentionally NOT listed here.
 # They are installed as system packages (python3-pyqt6) via apt in
 # install_printer_app.sh and inherited by the venv through
-# --system-site-packages.  Listing them here would cause pip to
+# --system-site-packages. Listing them here would cause pip to
 # re-download 80+ MB of Qt6 binaries unnecessarily.
 
 # HTTP Client
@@ -20,3 +20,9 @@ qrcode>=7.4.2
 
 # Image manipulation for QR raster + logo raster generation.
 pillow>=10.0.0
+
+# Serial port communication for POS printers connected via USB-serial
+# adapters (CH340, FTDI, PL2303, etc.). Needed because raw open() writes
+# leave the port at an unconfigured baud rate, producing garbage output
+# on the printer. pyserial negotiates termios correctly.
+pyserial>=3.5

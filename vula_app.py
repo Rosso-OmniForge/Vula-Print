@@ -67,6 +67,7 @@ class VulaPrintApp(
         self.pos_width_chars: int = 32
         self.pos_qr_mode: str = "raster"
         self.pos_qr_module_px: int = 4
+        self.serial_config: Dict[str, Dict[str, Any]] = {}
 
         self.selected_printer = None
         self.pos_selected_printer = None
@@ -109,6 +110,8 @@ class VulaPrintApp(
         self.brand_logo_path = str(Path(__file__).parent / "assets" / "Vula_Logo.png")
 
         self.load_settings()
+        from vula_device_io import set_serial_configs as _set_serial_cfgs
+        _set_serial_cfgs(self.serial_config)
         self.apply_brand_theme_from_css()
 
         self.init_ui()
