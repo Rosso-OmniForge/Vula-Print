@@ -19,6 +19,7 @@ from vula_workers import (
 )
 from vula_ui.theme import ThemeMixin
 from vula_ui.sidebar import SidebarMixin
+from vula_ui.tabs import TabsMixin
 from vula_ui.content import ContentMixin
 from vula_ui.settings import SettingsMixin
 from vula_ui.config import ConfigMixin
@@ -41,6 +42,7 @@ class VulaPrintApp(
     PrinterScanMixin,
     ConfigMixin,
     SettingsMixin,
+    TabsMixin,
     ContentMixin,
     SidebarMixin,
     ThemeMixin,

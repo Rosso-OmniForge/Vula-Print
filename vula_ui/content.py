@@ -99,72 +99,24 @@ class ContentMixin:
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("Ready")
 
+
     def _build_content(self) -> QWidget:
+        """Tabbed main content area."""
         content = QWidget()
         content.setStyleSheet(f"background:{self.C_BG};")
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(24, 20, 24, 12)
-        layout.setSpacing(14)
+        layout.setContentsMargins(20, 16, 20, 12)
+        layout.setSpacing(12)
 
-        # ── Top bar ──────────────────────────────────────────────
-        top_bar = self._build_top_bar()
-        layout.addWidget(top_bar)
+        header = QLabel("Vula! Print")
+        header.setStyleSheet(
+            f"color:{self.C_TEXT}; font-size:18px; font-weight:700;"
+        )
+        layout.addWidget(header)
 
-        # thin divider
-        div = QFrame()
-        div.setFrameShape(QFrame.Shape.HLine)
-        div.setFixedHeight(1)
-        div.setStyleSheet(f"background:{self.C_BORDER}; border:none;")
-        layout.addWidget(div)
-
-        # ── Queue panel ──────────────────────────────────────────
-        layout.addWidget(self._build_queue_panel(), stretch=1)
-
+        layout.addWidget(self._build_tabs(), stretch=1)
         return content
 
-    def _build_top_bar(self) -> QWidget:
-        bar = QWidget()
-        bar.setStyleSheet("background:transparent;")
-        bar_layout = QHBoxLayout(bar)
-        bar_layout.setContentsMargins(0, 0, 0, 0)
-        bar_layout.setSpacing(10)
-
-        title = QLabel("Print Queue")
-        title.setStyleSheet(
-            f"color:{self.C_TEXT}; font-size:20px; font-weight:700; background:transparent;"
-        )
-        bar_layout.addWidget(title)
-        bar_layout.addStretch()
-
-        refresh_btn = QPushButton("↻   Refresh")
-        refresh_btn.setMinimumSize(110, 36)
-        refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        refresh_btn.setStyleSheet(self._btn_secondary())
-        refresh_btn.clicked.connect(self.fetch_pending_requests)
-        bar_layout.addWidget(refresh_btn)
-
-        preview_btn = QPushButton("Preview TSPL")
-        preview_btn.setMinimumHeight(36)
-        preview_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        preview_btn.setStyleSheet(self._btn_secondary())
-        preview_btn.clicked.connect(self.show_tspl_preview)
-        bar_layout.addWidget(preview_btn)
-
-        visual_btn = QPushButton("⬜ Visual Preview")
-        visual_btn.setMinimumHeight(36)
-        visual_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        visual_btn.setStyleSheet(self._btn_primary())
-        visual_btn.clicked.connect(self.show_visual_preview)
-        bar_layout.addWidget(visual_btn)
-
-        history_btn = QPushButton("History / Reprint")
-        history_btn.setMinimumHeight(36)
-        history_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        history_btn.setStyleSheet(self._btn_secondary())
-        history_btn.clicked.connect(self.show_print_history)
-        bar_layout.addWidget(history_btn)
-
-        return bar
 
     def _build_queue_panel(self) -> QWidget:
         """Build the print queue panel (right / main content area)."""
