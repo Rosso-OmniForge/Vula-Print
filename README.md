@@ -1,273 +1,146 @@
-# Vula! Print Label Printer
+# Vula! Print — Print Manager
+
+Desktop printing application for Vula! Print. Manages label, POS slip,
+and end-of-day report printing across one or more store backends.
+
+## Features
+
+- 🖨️ **Multi-printer roles** — Label, POS Slip, and A4 assigned independently
+- 🎯 **Live printer health** — every assigned device probed every 5 seconds
+- 🔄 **Multi-store connections** — up to 4 backends, each with its own
+  printer user id
+- 🧾 **POS slip printing** — automatic polling, raster QR codes that work
+  on old serial printers, cash-drawer pulse on cash payments
+- 📊 **EOD report printing** — automatic at end of day
+- 🏷️ **Label printing** — TSPL with Code 39 barcodes, per-request control
+- 📋 **Unified queue** — labels, POS slips, and EOD reports in one table
+- 🔌 **Serial printer support** — `/dev/ttyUSB*`, `/dev/ttyACM*`,
+  `/dev/serial/by-id/*`, with configurable baud/parity/flow
+- 🚀 **Auto-start** via systemd user service
+- 🔒 **Singleton** — one process per desktop session, always
+
+## Installation
+
+Quick install on Debian 13 (Trixie):
+
+    cd /path/to/Vula-Print
+    bash install_printer_app.sh
+
+The installer:
+1. Installs system dependencies (Python 3, PyQt6, pyserial, CUPS, git)
+2. Creates a venv
+3. Installs Python packages from `requirements_app.txt`
+4. Sets up the `udev` rule for printer device permissions
+5. Installs a systemd user service (`vula-print.service`)
+6. Configures first-run backend credentials via the GUI
+
+### Updating
+
+    bash update.sh
+
+### Removing
+
+    bash uninstall.sh
 
-## Desktop Printing Application
+## Architecture
 
-A modern, branded desktop application for printing product labels directly from the Vula! Print inventory system.
+    vula_print_app.py       Entry point (50 lines)
+    vula_app.py             VulaPrintApp composer — assembles all mixins
+    vula_config.py          Paths, env, StoreConnection dataclass
+    vula_http.py            Off-thread HTTP worker (QThread)
+    vula_workers.py         Print jobs, poll workers, printer scanner
+    vula_device_io.py       Unified serial/USB device I/O (pyserial)
+    vula_rendering_qr.py    Raster QR code generator for old POS printers
+    vula_tspl.py            TSPL renderer (visual preview only)
+    vula_dialogs.py         Connection / preview / history dialogs
 
-### Features
+    vula_ui/
+      theme.py              Colours, styles, sizing helpers
+      sidebar.py            Left sidebar
+      content.py            Main area (composes tabs)
+      tabs.py               QTabWidget with Queue / Printers / History
+      settings.py           Settings persistence
+      config.py             Backend config fetch (async)
+      printer_scan.py       Device discovery
+      printers_tab.py       Role cards + serial settings dialog
+      label_queue.py        Unified queue table + filter chips
+      pos.py                POS slip / EOD polling
+      actions.py            Print actions, calibration
+      preview.py            TSPL / visual preview
+      history.py            Print history + reprint
+      responsive.py         Breakpoints, column hiding, emoji fallback
+      misc.py               Close event, in-app updater
 
-- 🖨️ **Auto-Discovery**: Automatically scans for USB label printers
-- 🎯 **Calibration**: Built-in printer calibration with test labels
-- 🔄 **Auto-Sync**: Automatically fetches print requests from the server every 30 seconds
-- 🚀 **Auto-Start + Auto-Connect**: Starts at login and reconnects to saved API URL
-- ✅ **Modern UI**: Clean, branded PyQt6 interface
-- 🔒 **Secure**: API key authentication
-- 🧾 **POS Slip Printing**: Auto-polls POS queue and prints slips with cutter support
-- 🧪 **Test POS Printer**: Prints a 6-item sample receipt for roll-change and update checks
-- 📊 **Real-time Progress**: Live printing progress with status updates
+    verify_serial_setup.py  Standalone diagnostic for serial printers
 
-### Installation
+## UI Overview
 
-#### System Requirements
+Three tabs in the main area:
 
-- **OS**: Debian 13 Trixie (or compatible Linux distro)
-- **Printer**: USB-connected TSC/TSPL label printer (40mm x 30mm labels)
-- **Python**: 3.10 or higher
-- **Network**: Connection to Vula! Print backend server
+- **Queue** — unified table of labels, POS slips, and EOD reports with
+  type icons, status, and filter chips.
+- **Printers** — role cards for Label / POS / A4. Each shows the assigned
+  device, live status (green = online, amber = permission, red = missing),
+  and buttons: Change, Calibrate (Label only), Settings, Test.
+- **History** — previously printed requests with reprint buttons.
 
-#### Quick Install
+The sidebar shows store connection status, POS worker health, and app
+version / updater.
 
-```bash
-cd /path/to/printer
-chmod +x install_printer_app.sh
-./install_printer_app.sh
-```
+## Serial Printer Setup
 
-This will:
-1. Install system dependencies (Python, PyQt6, USB libraries)
-2. Create a Python virtual environment
-3. Install all required Python packages
-4. Prompt for Vula API Base URL and API Key
-5. Write secure runtime config to `.env` (permissions `600`)
-6. Install and start the systemd user service
+Old POS printers with USB-serial adapters need extra care because a
+raw `open()` on `/dev/ttyUSB0` writes at whatever baud the previous
+process used. This app uses pyserial and configures the port on every
+write.
 
-### Running the Application
+### First-time setup on a client machine
 
-#### Option 1: Using the Launcher (Recommended)
+1. Plug in the printer via the USB-serial adapter.
+2. Run the diagnostic to check the port:
 
-```bash
-./launch_printer.sh
-```
+       python3 verify_serial_setup.py
 
-#### Option 2: Manual Launch
+3. In the app, open the **Printers** tab.
+4. On the POS card, click **Change…** and assign the serial device.
+   Prefer `/dev/serial/by-id/...` over `/dev/ttyUSB0` — the by-id path
+   is stable across reboots and re-plugs.
+5. Click **Settings** on the POS card. Defaults are 9600 8N1, no flow
+   control — correct for most old POS printers. Change only if you see
+   garbage output.
+6. Click **Test** to fire a sample slip. If it prints and cuts, you're
+   done.
 
-```bash
-source venv/bin/activate
-python3 vula_print_app.py
-```
+### If the test print produces garbage
 
-### Startup on Boot (systemd user service)
+- Try a lower baud rate (4800, 2400, 1200) via the Settings dialog.
+- Try `RTS/CTS` flow control if the adapter supports it.
+- Run `verify_serial_setup.py --print /dev/ttyUSB0 --baud 9600` to
+  isolate whether the problem is the app or the device.
 
-The installer creates and enables this user service:
+### If the port is busy
 
-```bash
-~/.config/systemd/user/vula-print.service
-```
+Only one process may hold a serial port. If `verify_serial_setup.py`
+reports "Port may be busy", stop any other app that might be holding
+it. The Vula app does not hold serial ports open — it opens, writes,
+and closes on each print.
 
-Useful commands:
+## Operations
 
-```bash
-systemctl --user status vula-print
-systemctl --user restart vula-print
-systemctl --user stop vula-print
-```
+Service commands:
 
-### Configuration
+    systemctl --user status vula-print
+    systemctl --user restart vula-print
+    systemctl --user stop vula-print
+    journalctl --user -u vula-print -f
 
-The app reads backend configuration from `.env` in the project root.
+The window's X button minimizes the app rather than closing it. To
+stop the service entirely, use `systemctl --user stop vula-print`.
 
-On install, you are prompted for:
-- `PRINTER_API_BASE_URL`
-- `PRINTER_API_KEY`
+## Support
 
-The installer writes these values into `.env` before starting the service.
+For issues or questions, contact OmniForge.
 
-Manual setup (optional):
+## License
 
-```bash
-cp .env.example .env
-```
-
-1. Set required values in `.env`:
-   - `PRINTER_API_BASE_URL`
-   - `PRINTER_API_KEY`
-   - `PRINTER_USER_ID` (required for POS queue routing)
-
-2. In the app UI:
-   - Select the **Label printer** and **POS slip printer** separately.
-   - Verify **PRINTER USER ID** is set correctly.
-   - Use **Test Connection** to validate backend connectivity.
-   - Use **Test POS Printer** to print/cut a 6-item sample slip.
-
-### Usage Guide
-
-#### First-Time Setup
-
-1. **Launch the Application**
-   ```bash
-   ./launch_printer.sh
-   ```
-
-2. **Connect Printer**
-   - Connect your USB label printer
-   - Click "Scan for Printers"
-   - Select your printer from the dropdown
-
-3. **Configure API + POS Routing**
-   - Ensure `.env` has API URL/key and `PRINTER_USER_ID`
-   - In app, select POS slip printer device
-   - Click "Test Connection"
-   - Verify connection is successful (green indicator)
-
-4. **Calibrate Printer**
-   - Click "Calibrate & Test Print"
-   - Verify the test label prints correctly
-   - Confirm calibration when prompted
-
-#### Printing Labels
-
-1. **Refresh Queue**
-   - Click "🔄 Refresh Queue" or wait for auto-refresh (30s)
-   - Pending print requests will appear in the table
-
-2. **Review Request**
-   - Click on a request to see details
-   - Review items, quantities, and source
-
-3. **Print**
-   - Click the "🖨️ Print" button for the desired request
-   - Monitor progress in the progress bar
-   - Request will be marked as completed automatically
-
-#### Printing POS Slips
-
-1. **Auto Mode**
-   - POS worker polls every 5 seconds.
-   - When pending slips exist for `PRINTER_USER_ID`, they are printed automatically.
-   - Slip is completed on backend only after successful print write.
-
-2. **Test Mode**
-   - Click **Test POS Printer**.
-   - App prints sample slip with 6 items and performs cut.
-   - Use this after paper roll changes or app updates.
-
-### UI Design
-
-The application features a modern dark theme with Vula! Print branding:
-
-- **Color Scheme**: Dark background (#1a1a1a) with orange accents (#ff6b35)
-- **Header**: Displays the Primary Text Logo scaled to 60px height with real-time status indicators
-  - Connection Status: Green (●) when connected, Red (●) when disconnected
-  - Printer Status: Shows current printer state
-- **Styled Components**:
-  - Orange gradient buttons with hover effects
-  - Dark-themed tables with orange selection highlights
-  - Bordered panels with orange accents
-  - Monospace details display with orange text
-- **Professional Appearance**: Consistent branding throughout the interface matching Vula! Print's visual identity
-
-### Auto-Generated Print Requests
-
-Print requests are automatically created when:
-
-#### From Procurement
-
-- **Price Unchanged**: When stock is added, prints labels for only the new items
-- **Price Changed**: When stock is added AND price changes, prints labels for ALL items (existing + new)
-
-#### Manual Requests
-
-- Staff can manually create print requests via the admin panel
-- Useful for replacing damaged labels
-
-### Troublesoting
-
-#### Printer Not Found
-
-```bash
-# Check USB connection
-ls -la /dev/usb/lp*
-
-# Check USB devices
-lsusb
-
-# Ensure permissions
-sudo usermod -a -G lp $USER
-```
-
-#### Connection Failed
-
-- Verify backend server is running
-- Check firewall settings
-- Confirm API key matches backend configuration
-- Test with: `curl -H "X-API-Key: YOUR_KEY" http://your-server:8000/admin/api/label-printing/pending`
-
-#### Label Alignment Issues
-
-1. Verify label size is exactly 40mm x 30mm
-2. Adjust gap setting in printer (should be 2mm)
-3. Run calibration again
-4. Check `horizontal_shift_dots` in code if needed (line ~273 in `vula_print_app.py`)
-
-#### PyQt6 Installation Issues
-
-```bash
-# On Debian 13, you may need:
-sudo apt-get install python3-pyqt6 python3-pyqt6.qtcore python3-pyqt6.qtwidgets
-
-# If pip install fails, use system packages:
-pip install --no-deps PyQt6
-```
-
-### API Endpoints Used
-
-- `GET /admin/api/label-printing/pending` - Fetch pending requests
-- `GET /admin/api/label-printing/request/{id}` - Get request details
-- `POST /admin/api/label-printing/complete` - Mark request as completed
-- `GET /admin/api/pos-slips/pending` - Fetch pending POS slips
-- `GET /admin/api/pos-slips/request/{id}` - Fetch POS slip detail payload
-- `POST /admin/api/pos-slips/complete` - Mark POS slip as completed
-
-### Security Notes
-
-⚠️ **Important**: Never commit production API keys.
-
-1. Generate a secure random key:
-   ```bash
-   openssl rand -base64 32
-   ```
-
-2. Set it in `.env` as `PRINTER_API_KEY`.
-
-3. Keep backend key and app key aligned.
-
-### Development
-
-#### Running in Development Mode
-
-```bash
-# Activate virtual environment
-source venv/bin/activate
-
-# Run with debug output
-python3 vula_print_app.py
-
-# Or with verbose logging
-python3 -v vula_print_app.py
-```
-
-#### Customizing Labels
-
-Edit the `_generate_label_tspl()` method in `vula_print_app.py` to customize:
-- Font sizes and positions
-- Barcode settings (type, size, position)
-- Label layout and content
-
-### Support
-
-For issues or questions, contact the OmniForge.
-
-### License
-
-Proprietary - OmniForge © 2026
-# vulaprint
+Proprietary — OmniForge © 2026

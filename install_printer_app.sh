@@ -280,11 +280,26 @@ Wants=graphical-session.target
 [Service]
 Type=simple
 WorkingDirectory=${SCRIPT_DIR}
+# Brief grace period so graphical-session.target is fully settled before
+# Qt tries to open a display connection. Prevents a login-time race that
+# would otherwise cause a restart storm.
+ExecStartPre=/bin/sleep 2
 ExecStart=${SCRIPT_DIR}/launch_printer.sh
-Restart=always
-RestartSec=5
-StartLimitIntervalSec=120
-StartLimitBurst=5
+
+# Restart only on abnormal exit. A clean exit (operator stop, or the
+# singleton guard politely refusing a second launch) must NOT trigger
+# a respawn — that is what was stacking instances.
+Restart=on-failure
+RestartSec=15
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+# Give the app a chance to release its lock and printer devices before
+# systemd forgets about it. Without this, a quick restart can leave two
+# live PIDs briefly competing for /dev/usb/lp*.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=10
 
 [Install]
 WantedBy=graphical-session.target
