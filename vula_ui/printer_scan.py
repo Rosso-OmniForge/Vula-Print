@@ -97,6 +97,7 @@ class PrinterScanMixin:
                 if pos_index >= 0:
                     self.pos_printer_combo.setCurrentIndex(pos_index)
 
+            self._refresh_discovered_list()
             self.upload_discovered_printers_if_ready()
 
     def on_printer_selected(self, index: int):

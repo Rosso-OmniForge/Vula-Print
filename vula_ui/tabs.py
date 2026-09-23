@@ -98,29 +98,7 @@ class TabsMixin:
     # ── Printers tab (placeholder for 4.2) ──────────────────────
 
     def _build_printers_tab(self) -> QWidget:
-        tab = QWidget()
-        tab.setStyleSheet("background: transparent;")
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(24, 24, 24, 24)
-        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        title = QLabel("Printer Manager")
-        title.setStyleSheet(
-            f"color: {self.C_TEXT}; font-size: 18px; font-weight: 700;"
-        )
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        sub = QLabel(
-            "Live printer status, role assignment, and per-printer settings\n"
-            "will appear here in the next update."
-        )
-        sub.setStyleSheet(f"color: {self.C_TEXT_DIM}; font-size: 12px;")
-        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        layout.addWidget(title)
-        layout.addSpacing(8)
-        layout.addWidget(sub)
-        return tab
+        return self._build_printers_tab_content()
 
     # ── History tab (placeholder, still uses dialog) ────────────
 
