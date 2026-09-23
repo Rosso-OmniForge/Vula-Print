@@ -99,6 +99,9 @@ class ContentMixin:
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("Ready")
 
+        # Schedule one responsive pass after the window is shown.
+        QTimer.singleShot(0, self._apply_responsive_layout)
+
 
     def _build_content(self) -> QWidget:
         """Tabbed main content area."""
@@ -198,9 +201,9 @@ class ContentMixin:
 
         for key, label in [
             ("all", "All"),
-            ("label", "🏷️  Labels"),
-            ("pos_slip", "🧾  POS Slips"),
-            ("pos_eod", "📊  EOD"),
+            ("label", f"{self._icon_for_type('label')}  Labels"),
+            ("pos_slip", f"{self._icon_for_type('pos_slip')}  POS Slips"),
+            ("pos_eod", f"{self._icon_for_type('pos_eod')}  EOD"),
         ]:
             chip = QPushButton(label)
             chip.setMinimumHeight(28)

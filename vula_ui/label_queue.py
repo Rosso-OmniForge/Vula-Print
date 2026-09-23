@@ -230,7 +230,7 @@ class LabelQueueMixin:
             rows.append({
                 "type": "label",
                 "type_label": "Label",
-                "icon": "🏷️",
+                "icon": self._icon_for_type("label"),
                 "id": req.get("id"),
                 "store_name": req.get("_connection_name", ""),
                 "connection_id": req.get("_connection_id", ""),
@@ -249,7 +249,7 @@ class LabelQueueMixin:
                 rows.append({
                     "type": "pos_slip",
                     "type_label": "POS Slip",
-                    "icon": "🧾",
+                    "icon": self._icon_for_type("pos_slip"),
                     "id": item.get("id"),
                     "store_name": store_name,
                     "connection_id": conn_id,
@@ -269,7 +269,7 @@ class LabelQueueMixin:
             rows.append({
                 "type": "pos_eod",
                 "type_label": "EOD Report",
-                "icon": "📊",
+                "icon": self._icon_for_type("pos_eod"),
                 "id": item.get("id"),
                 "store_name": store_name,
                 "connection_id": conn_id,

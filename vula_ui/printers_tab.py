@@ -60,17 +60,20 @@ class PrintersTabMixin:
         sub.setStyleSheet(f"color:{self.C_TEXT_DIM}; font-size:11px;")
         layout.addWidget(sub)
 
-        # Role cards — 2 per row
-        grid = QGridLayout()
-        grid.setSpacing(12)
-        grid.setContentsMargins(0, 0, 0, 0)
+        # Role cards — 2 per row by default; reflowed on narrow widths
+        # by ResponsiveMixin._reflow_printer_cards().
+        self._printer_card_grid = QGridLayout()
+        self._printer_card_grid.setSpacing(12)
+        self._printer_card_grid.setContentsMargins(0, 0, 0, 0)
 
         self._printer_card_labels: Dict[str, Dict[str, QLabel]] = {}
+        self._printer_card_widgets: Dict[str, QWidget] = {}
         for i, (role_key, role_name, state_attr) in enumerate(_ROLES):
             card = self._build_printer_card(role_key, role_name, state_attr)
-            grid.addWidget(card, i // 2, i % 2)
+            self._printer_card_widgets[role_key] = card
+            self._printer_card_grid.addWidget(card, i // 2, i % 2)
 
-        layout.addLayout(grid)
+        layout.addLayout(self._printer_card_grid)
 
         # Discovered devices
         disc_heading = QLabel("Discovered Devices")
