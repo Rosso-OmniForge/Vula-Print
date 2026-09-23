@@ -201,18 +201,14 @@ class ActionsMixin:
             )
             if reply == QMessageBox.StandardButton.Yes:
                 self.printer_calibrated = True
-                self.calibration_status.setText("Calibrated")
-                self.calibration_status.setStyleSheet(
-                    f"background:#0f2a1a; color:{self.C_GREEN}; border:1px solid #1a5a2a;"
-                    f"border-radius:12px; font-size:11px; font-weight:600; padding:4px 10px;"
-                )
+                # calibration_status no longer lives in the sidebar; guard for it.
+                if hasattr(self, "calibration_status"):
+                    self.calibration_status.setText("Calibrated")
+                    self.calibration_status.setStyleSheet(
+                        f"background:#0f2a1a; color:{self.C_GREEN}; border:1px solid #1a5a2a;"
+                        f"border-radius:12px; font-size:11px; font-weight:600; padding:4px 10px;"
+                    )
                 self.status_bar.showMessage("Printer calibrated successfully")
-                self.header_printer_status.setText(
-                    f"✓  {self.selected_printer.split('/')[-1].upper()}"
-                )
-                self.header_printer_status.setStyleSheet(
-                    f"color:{self.C_GREEN}; font-size:10px;"
-                )
             else:
                 QMessageBox.information(
                     self,

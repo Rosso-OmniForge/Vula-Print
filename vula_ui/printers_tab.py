@@ -172,6 +172,19 @@ class PrintersTabMixin:
             self._change_role_printer(rk, rn, sa)
         )
 
+        actions.addWidget(change_btn)
+
+        # Label-only: Calibrate button (moved from sidebar in 4.5).
+        if role_key == "label":
+            cal_btn = QPushButton("Calibrate")
+            cal_btn.setMinimumHeight(32)
+            cal_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            cal_btn.setStyleSheet(self._btn_secondary())
+            cal_btn.clicked.connect(self.calibrate_printer)
+            actions.addWidget(cal_btn)
+
+        actions.addStretch()
+
         test_btn = QPushButton("Test")
         test_btn.setMinimumHeight(32)
         test_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -179,9 +192,6 @@ class PrintersTabMixin:
         test_btn.clicked.connect(
             lambda _, rk=role_key: self._test_role_printer(rk)
         )
-
-        actions.addWidget(change_btn)
-        actions.addStretch()
         actions.addWidget(test_btn)
         layout.addLayout(actions)
 
