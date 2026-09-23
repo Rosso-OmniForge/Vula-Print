@@ -130,19 +130,20 @@ class ContentMixin:
         # Column 1 is now "Store" so operators can see which connection
         # a request came from at a glance.
         self.requests_table = QTableWidget()
-        self.requests_table.setColumnCount(7)
+        self.requests_table.setColumnCount(8)
         self.requests_table.setHorizontalHeaderLabels(
-            ["ID", "Store", "Source", "Created By", "Labels", "Created At", ""]
+            ["Type", "ID", "Store", "Source", "Summary", "Status", "Created At", ""]
         )
         hdr = self.requests_table.horizontalHeader()
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
-        self.requests_table.setColumnWidth(6, 118)
+        hdr.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(7, QHeaderView.ResizeMode.Fixed)
+        self.requests_table.setColumnWidth(7, 118)
         self.requests_table.verticalHeader().setVisible(False)
         self.requests_table.setShowGrid(False)
         self.requests_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -185,6 +186,32 @@ class ContentMixin:
                 background:{self.C_BORDER}; border-radius:3px;
             }}
         """)
+        # ── Filter chips ─────────────────────────────────────────
+        self._queue_filter = "all"
+        self._filter_chips: dict = {}
+
+        chips_row = QWidget()
+        chips_row.setStyleSheet("background: transparent;")
+        chips_layout = QHBoxLayout(chips_row)
+        chips_layout.setContentsMargins(0, 0, 0, 0)
+        chips_layout.setSpacing(6)
+
+        for key, label in [
+            ("all", "All"),
+            ("label", "🏷️  Labels"),
+            ("pos_slip", "🧾  POS Slips"),
+            ("pos_eod", "📊  EOD"),
+        ]:
+            chip = QPushButton(label)
+            chip.setMinimumHeight(28)
+            chip.setCursor(Qt.CursorShape.PointingHandCursor)
+            chip.clicked.connect(lambda checked, k=key: self._set_queue_filter(k))
+            self._filter_chips[key] = chip
+            chips_layout.addWidget(chip)
+        chips_layout.addStretch()
+        layout.addWidget(chips_row)
+        self._refresh_filter_chips()
+
         layout.addWidget(self.requests_table, stretch=1)
 
         # ── Detail card ──────────────────────────────────────────
@@ -233,3 +260,32 @@ class ContentMixin:
         layout.addWidget(self.progress_bar)
 
         return panel
+
+    # ── Queue filtering ────────────────────────────────────────────
+
+    def _set_queue_filter(self, key: str):
+        self._queue_filter = key
+        self._refresh_filter_chips()
+        self.update_requests_table()
+
+    def _refresh_filter_chips(self):
+        if not hasattr(self, "_filter_chips"):
+            return
+        for key, chip in self._filter_chips.items():
+            active = key == self._queue_filter
+            if active:
+                chip.setStyleSheet(
+                    f"QPushButton {{"
+                    f"  background:{self.C_ORANGE}; color:#000; border:none;"
+                    f"  border-radius:14px; padding:4px 14px; font-size:11px; font-weight:700;"
+                    f"}}"
+                )
+            else:
+                chip.setStyleSheet(
+                    f"QPushButton {{"
+                    f"  background:{self.C_SURFACE}; color:{self.C_TEXT_DIM};"
+                    f"  border:1px solid {self.C_BORDER};"
+                    f"  border-radius:14px; padding:4px 14px; font-size:11px; font-weight:600;"
+                    f"}}"
+                    f"QPushButton:hover {{ color:{self.C_TEXT}; border-color:{self.C_ORANGE}; }}"
+                )

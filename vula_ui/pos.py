@@ -138,6 +138,8 @@ class POSMixin:
             )
             self._pos_poll_worker.slip_ready.connect(self._on_poll_slip_ready)
             self._pos_poll_worker.eod_slip_ready.connect(self._on_poll_eod_slip_ready)
+            self._pos_poll_worker.pending_list_ready.connect(self._on_pos_pending_list)
+            self._pos_poll_worker.eod_pending_ready.connect(self._on_eod_pending_list)
             self._pos_poll_worker.all_clear.connect(self._on_poll_all_clear)
             self._pos_poll_worker.poll_error.connect(self._on_poll_error)
             self._pos_poll_worker.poll_fatal.connect(self._on_poll_fatal)
@@ -334,3 +336,21 @@ class POSMixin:
             name = connection_id
         self._update_pos_worker_status(f"{name}: error {status_code}")
         self.status_bar.showMessage(f"POS worker stopped for {name}: {message}")
+
+    # ── Pending list handlers (queue display) ───────────────────────
+
+    def _on_pos_pending_list(self, connection_id: str, items: list):
+        """Store the newest snapshot of pending POS slips for this connection."""
+        if not hasattr(self, "_pos_pending_by_conn"):
+            self._pos_pending_by_conn: dict = {}
+        self._pos_pending_by_conn[connection_id] = list(items or [])
+        # Refresh the queue table so the POS rows reflect the new snapshot.
+        self.update_requests_table()
+
+    def _on_eod_pending_list(self, connection_id: str, items: list):
+        """Store the newest snapshot of pending EOD reports for this connection."""
+        if not hasattr(self, "_eod_pending_by_conn"):
+            self._eod_pending_by_conn: dict = {}
+        # EOD is only ever one report at a time; keep just the first item.
+        self._eod_pending_by_conn[connection_id] = items[0] if items else None
+        self.update_requests_table()

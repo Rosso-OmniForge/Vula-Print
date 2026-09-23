@@ -669,8 +669,10 @@ class POSPollWorker(QThread):
     StoreConnection the result belongs to.
     """
 
-    slip_ready     = pyqtSignal(str, int, dict)   # (connection_id, request_id, detail_payload)
-    eod_slip_ready = pyqtSignal(str, int, dict)   # (connection_id, request_id, detail_payload)
+    slip_ready        = pyqtSignal(str, int, dict)   # (connection_id, request_id, detail_payload)
+    eod_slip_ready    = pyqtSignal(str, int, dict)   # (connection_id, request_id, detail_payload)
+    pending_list_ready = pyqtSignal(str, list)       # (connection_id, [pending_summary_dicts])
+    eod_pending_ready  = pyqtSignal(str, list)       # (connection_id, [pending_summary_dicts])
     all_clear      = pyqtSignal(str)              # (connection_id)
     poll_error     = pyqtSignal(str, str, int)     # (connection_id, message, http_status) 0=network
     poll_fatal     = pyqtSignal(str, str, int)     # (connection_id, message, http_status) auth/config
@@ -724,6 +726,9 @@ class POSPollWorker(QThread):
             (r.json() if isinstance(r.json(), list) else []),
             key=lambda x: str(x.get("created_at", "")),
         )
+        # Surface the whole list to the UI for display, then continue with
+        # the existing "grab the first one to print" behaviour.
+        self.pending_list_ready.emit(cid, list(pending))
         for item in pending:
             req_id = int(item.get("id", 0) or 0)
             if req_id <= 0 or req_id in self._in_flight_ids:
@@ -747,6 +752,7 @@ class POSPollWorker(QThread):
             return
 
         # ── 2. No POS slips — check EOD reports ───────────────────────────
+        self.pending_list_ready.emit(cid, [])
         try:
             requests.post(
                 f"{self._api_base}/admin/api/pos-eod-reports/ensure-latest",
@@ -775,6 +781,7 @@ class POSPollWorker(QThread):
             (eod_r.json() if isinstance(eod_r.json(), list) else []),
             key=lambda x: str(x.get("created_at", "")),
         )
+        self.eod_pending_ready.emit(cid, list(eod_pending))
         for item in eod_pending:
             req_id = int(item.get("id", 0) or 0)
             if req_id <= 0 or req_id in self._eod_in_flight_ids:
@@ -789,11 +796,13 @@ class POSPollWorker(QThread):
                 self.all_clear.emit(cid)
                 return
             if dr.status_code != 200:
+                self.eod_pending_ready.emit(cid, [])
                 self.all_clear.emit(cid)
                 return
             self.eod_slip_ready.emit(cid, req_id, dr.json())
             return
 
+        self.eod_pending_ready.emit(cid, [])
         self.all_clear.emit(cid)
 
 
