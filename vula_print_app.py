@@ -35,6 +35,7 @@ from PyQt6.QtGui import QFont, QIcon, QPalette, QColor, QPixmap, QPainter, QPen,
 import requests
 
 from vula_singleton import acquire_singleton_lock
+from vula_http import HttpWorker, HttpResult
 
 
 def _load_env_file(env_file: Path) -> None:
@@ -1100,6 +1101,17 @@ class VulaPrintApp(QMainWindow):
         self.pos_eod_print_job: Optional[POSEODReportPrintJob] = None
         self._pos_poll_worker: Optional[POSPollWorker] = None
         self._pos_retry_worker: Optional[_RetryFlushWorker] = None
+        # Keep references to in-flight HttpWorker threads so Python doesn't GC
+        # them before they finish. Finished workers remove themselves.
+        self._http_workers: List[HttpWorker] = []
+        # Config-fetch cycle state (see fetch_all_printer_configs).
+        self._config_fetch_pending: int = 0
+        self._config_fetch_show_dialogs: bool = False
+        # Label-queue fetch cycle state (see fetch_pending_requests).
+        self._pending_fetch_pending: int = 0
+        self._pending_fetch_accum: List[Dict[str, Any]] = []
+        self._pending_fetch_errors: List[str] = []
+        self._pending_fetch_any_ok: bool = False
         # Round-robin cursor over store_connections for the POS poll cycle.
         # Only one worker / one physical POS print job runs at a time; each
         # timer tick advances to the next connection so both stores get
@@ -1303,21 +1315,177 @@ class VulaPrintApp(QMainWindow):
         return headers
 
     def fetch_all_printer_configs(self, show_dialogs: bool = False) -> None:
-        """Fetch backend config for every configured connection."""
+        """Dispatch config fetch for every active connection, off-thread."""
         if not self.active_connections:
             self._set_connection_status(False)
             self._update_pos_worker_status("Add a store connection first")
             return
 
-        any_ok = False
-        for conn in self.active_connections:
-            ok = self._fetch_config_for_connection(conn, show_dialogs)
-            any_ok = any_ok or ok
+        self._config_fetch_pending = len(self.active_connections)
+        self._config_fetch_show_dialogs = show_dialogs
 
-        self._refresh_connection_status_summary()
-        if any_ok:
+        for conn in self.active_connections:
+            w = HttpWorker(
+                tag=f"config:{conn.connection_id}",
+                method="GET",
+                url=f"{conn.api_base_url.rstrip('/')}/admin/api/printer-app/config",
+                headers={"X-Printer-API-Key": conn.api_key},
+                timeout=8.0,
+            )
+            w.done.connect(self._on_config_fetch_done)
+            w.finished.connect(lambda w=w: self._forget_http_worker(w))
+            self._http_workers.append(w)
+            w.start()
+
+    def _forget_http_worker(self, w):
+        """Remove a finished worker from the keep-alive list."""
+        try:
+            self._http_workers.remove(w)
+        except ValueError:
+            pass
+
+    def _on_config_fetch_done(self, result: HttpResult):
+        """Handle one connection's config-fetch response (main thread)."""
+        if not result.tag.startswith("config:"):
+            return
+        connection_id = result.tag.split(":", 1)[1]
+        conn = self.get_connection_by_id(connection_id)
+        if conn is None:
+            self._config_fetch_pending = max(0, self._config_fetch_pending - 1)
+            return
+
+        if result.ok and result.status == 200 and isinstance(result.data, dict):
+            cfg = result.data
+            conn.printer_user_id = int(cfg.get("user_id") or 0) or None
+            conn.config_version = int(cfg.get("config_version") or 0)
+            conn.synced_config_version = int(cfg.get("synced_config_version") or 0)
+            conn.last_connected = True
+            conn.last_status = "Connected"
+
+            # Branding is global: first successful fetch wins.
+            if not self.logo_dark_url and not self.logo_light_url:
+                self.logo_dark_url = cfg.get("logo_dark_url", "")
+                self.logo_light_url = cfg.get("logo_light_url", "")
+                self._fetch_brand_css_async(conn)
+                self._download_brand_logo_async(conn)
+
+            self.save_settings()
+
+            if conn.config_version > conn.synced_config_version:
+                self._ack_printer_config_async(conn, conn.config_version)
+
+            if self._config_fetch_show_dialogs:
+                QMessageBox.information(
+                    self, "Connection Success",
+                    f"{conn.name}: connected (user_id={conn.printer_user_id})."
+                )
+        else:
+            conn.last_connected = False
+            if not result.ok:
+                conn.last_status = "Connection failed"
+            elif result.status == 401:
+                conn.last_status = "Invalid API key"
+            else:
+                conn.last_status = f"HTTP {result.status}"
+
+            if self._config_fetch_show_dialogs:
+                QMessageBox.warning(
+                    self, "Printer Config Error",
+                    f"{conn.name}: {conn.last_status}",
+                )
+
+        self._config_fetch_pending = max(0, self._config_fetch_pending - 1)
+        if self._config_fetch_pending == 0:
+            self._refresh_connection_status_summary()
             self.fetch_pending_requests()
-        self.upload_discovered_printers_if_ready()
+            self.upload_discovered_printers_if_ready()
+
+    # ── Small async HTTP helpers (all run on HttpWorker threads) ─────────
+
+    def _fetch_brand_css_async(self, conn: StoreConnection):
+        w = HttpWorker(
+            tag=f"css:{conn.connection_id}",
+            method="GET",
+            url=f"{conn.api_base_url.rstrip('/')}/admin/api/printer-app/brand-css",
+            headers={"X-Printer-API-Key": conn.api_key},
+            timeout=8.0,
+        )
+        w.done.connect(self._on_brand_css_done)
+        w.finished.connect(lambda w=w: self._forget_http_worker(w))
+        self._http_workers.append(w)
+        w.start()
+
+    def _on_brand_css_done(self, result: HttpResult):
+        if not result.ok or result.status != 200:
+            return
+        try:
+            css_file = Path.home() / ".config" / "vula_print" / "brand.css"
+            css_file.parent.mkdir(parents=True, exist_ok=True)
+            css_file.write_text(
+                result.content.decode("utf-8", errors="replace"),
+                encoding="utf-8",
+            )
+            self.apply_brand_theme_from_css()
+        except Exception:
+            pass
+
+    def _download_brand_logo_async(self, conn: StoreConnection):
+        relative = self.logo_dark_url or self.logo_light_url
+        if not relative or not conn.api_base_url:
+            return
+        relative = relative.lstrip("/")
+        url = urljoin(conn.api_base_url.rstrip("/") + "/", relative)
+        w = HttpWorker(
+            tag=f"logo:{conn.connection_id}",
+            method="GET",
+            url=url,
+            headers={},
+            timeout=8.0,
+        )
+        w.done.connect(self._on_brand_logo_done)
+        w.finished.connect(lambda w=w: self._forget_http_worker(w))
+        self._http_workers.append(w)
+        w.start()
+
+    def _on_brand_logo_done(self, result: HttpResult):
+        if not result.ok or result.status != 200 or not result.content:
+            return
+        try:
+            logo_file = Path.home() / ".config" / "vula_print" / "brand_logo.png"
+            logo_file.parent.mkdir(parents=True, exist_ok=True)
+            logo_file.write_bytes(result.content)
+            self.brand_logo_path = str(logo_file)
+            self.save_settings()
+            if hasattr(self, "logo_label"):
+                pixmap = QPixmap(self.brand_logo_path)
+                if not pixmap.isNull():
+                    self.logo_label.setPixmap(
+                        pixmap.scaledToWidth(
+                            max(120, self.SIDEBAR_W - 36),
+                            Qt.TransformationMode.SmoothTransformation,
+                        )
+                    )
+        except Exception:
+            pass
+
+    def _ack_printer_config_async(self, conn: StoreConnection, config_version: int):
+        w = HttpWorker(
+            tag=f"ack:{conn.connection_id}",
+            method="POST",
+            url=f"{conn.api_base_url.rstrip('/')}/admin/api/printer-app/config/ack",
+            headers=self._headers_for(conn, include_json=True),
+            json_body={"config_version": int(config_version)},
+            timeout=8.0,
+        )
+        w.done.connect(lambda r, c=conn, v=config_version:
+                       self._on_ack_done(r, c, v))
+        w.finished.connect(lambda w=w: self._forget_http_worker(w))
+        self._http_workers.append(w)
+        w.start()
+
+    def _on_ack_done(self, result: HttpResult, conn: StoreConnection, config_version: int):
+        if result.ok and result.status == 200:
+            conn.synced_config_version = int(config_version)
 
     def _fetch_config_for_connection(self, conn: StoreConnection, show_dialogs: bool = False) -> bool:
         """Fetch a single connection's printer-app config (user id, roles, branding, version)."""
@@ -2216,20 +2384,31 @@ class VulaPrintApp(QMainWindow):
     # ─────────────────────────────────────────────────────────────
     # Label queue — fetch from ALL connections, merge, tag connection_id
     # ─────────────────────────────────────────────────────────────
-    def _complete_label_request(self, conn: StoreConnection, request_id: int) -> bool:
-        try:
-            response = requests.post(
-                f"{conn.api_base_url}/admin/api/label-printing/complete",
-                headers=self._headers_for(conn, include_json=True),
-                json={"request_id": request_id},
-                timeout=10,
+    def _complete_label_request_async(self, conn: StoreConnection, request_id: int):
+        """Dispatch label-request completion off-thread."""
+        w = HttpWorker(
+            tag=f"labelcomplete:{conn.connection_id}:{request_id}",
+            method="POST",
+            url=f"{conn.api_base_url.rstrip('/')}/admin/api/label-printing/complete",
+            headers=self._headers_for(conn, include_json=True),
+            json_body={"request_id": request_id},
+            timeout=10.0,
+        )
+        w.done.connect(lambda r, c=conn, rid=request_id:
+                       self._on_label_complete_done(r, c, rid))
+        w.finished.connect(lambda w=w: self._forget_http_worker(w))
+        self._http_workers.append(w)
+        w.start()
+
+    def _on_label_complete_done(self, result: HttpResult, conn: StoreConnection, request_id: int):
+        if not (result.ok and result.status == 200):
+            self.status_bar.showMessage(
+                f"Warning: request #{request_id} printed but server completion "
+                f"failed (status {result.status or 'network error'})."
             )
-            return response.status_code == 200
-        except Exception:
-            return False
 
     def fetch_pending_requests(self):
-        """Fetch pending label print requests from every active connection and merge them."""
+        """Dispatch pending-label fetch for every active connection, off-thread."""
         active = self.active_connections
         if not active:
             self.pending_requests = []
@@ -2237,45 +2416,60 @@ class VulaPrintApp(QMainWindow):
             self.status_bar.showMessage("No store connections configured")
             return
 
-        merged: List[Dict[str, Any]] = []
-        any_ok = False
-        errors = []
+        self._pending_fetch_pending = len(active)
+        self._pending_fetch_accum = []
+        self._pending_fetch_errors = []
+        self._pending_fetch_any_ok = False
 
         for conn in active:
-            try:
-                headers = self._headers_for(conn)
-                response = requests.get(
-                    f"{conn.api_base_url}/admin/api/label-printing/pending",
-                    headers=headers,
-                    timeout=10,
-                )
-                if response.status_code == 200:
-                    any_ok = True
-                    items = response.json()
-                    for item in items:
-                        # Tag with a plain string id only — never store the
-                        # StoreConnection object itself in a dict that may be
-                        # JSON-serialised (history) or passed around widely.
-                        item["_connection_id"] = conn.connection_id
-                        item["_connection_name"] = conn.name
-                        merged.append(item)
-                else:
-                    errors.append(f"{conn.name}: HTTP {response.status_code}")
-            except Exception as e:
-                errors.append(f"{conn.name}: {e}")
+            w = HttpWorker(
+                tag=f"labelq:{conn.connection_id}",
+                method="GET",
+                url=f"{conn.api_base_url.rstrip('/')}/admin/api/label-printing/pending",
+                headers=self._headers_for(conn),
+                timeout=10.0,
+            )
+            w.done.connect(self._on_pending_fetch_done)
+            w.finished.connect(lambda w=w: self._forget_http_worker(w))
+            self._http_workers.append(w)
+            w.start()
 
-        # Newest first across all stores
-        merged.sort(key=lambda x: str(x.get("created_at", "")), reverse=True)
-        self.pending_requests = merged
-        self.update_requests_table()
+    def _on_pending_fetch_done(self, result: HttpResult):
+        if not result.tag.startswith("labelq:"):
+            return
+        connection_id = result.tag.split(":", 1)[1]
+        conn = self.get_connection_by_id(connection_id)
 
-        if any_ok:
-            msg = f"Loaded {len(self.pending_requests)} pending request(s) across {len(active)} store(s)"
-            if errors:
-                msg += f" — {len(errors)} store(s) failed"
-            self.status_bar.showMessage(msg)
+        if result.ok and result.status == 200 and isinstance(result.data, list):
+            self._pending_fetch_any_ok = True
+            for item in result.data:
+                item["_connection_id"] = connection_id
+                item["_connection_name"] = conn.name if conn else connection_id
+                self._pending_fetch_accum.append(item)
         else:
-            self.status_bar.showMessage(f"Failed to fetch requests: {'; '.join(errors) if errors else 'unknown error'}")
+            name = conn.name if conn else connection_id
+            if not result.ok:
+                self._pending_fetch_errors.append(f"{name}: {result.error}")
+            else:
+                self._pending_fetch_errors.append(f"{name}: HTTP {result.status}")
+
+        self._pending_fetch_pending = max(0, self._pending_fetch_pending - 1)
+        if self._pending_fetch_pending == 0:
+            self._pending_fetch_accum.sort(
+                key=lambda x: str(x.get("created_at", "")), reverse=True,
+            )
+            self.pending_requests = self._pending_fetch_accum
+            self.update_requests_table()
+
+            if self._pending_fetch_any_ok:
+                msg = (f"Loaded {len(self.pending_requests)} pending request(s) "
+                       f"across {len(self.active_connections)} store(s)")
+                if self._pending_fetch_errors:
+                    msg += f" — {len(self._pending_fetch_errors)} store(s) failed"
+                self.status_bar.showMessage(msg)
+            else:
+                errs = "; ".join(self._pending_fetch_errors) or "unknown error"
+                self.status_bar.showMessage(f"Failed to fetch requests: {errs}")
 
     def update_requests_table(self):
         """Update the requests table with pending requests (now including a Store column)."""
@@ -2437,16 +2631,12 @@ class VulaPrintApp(QMainWindow):
         conn = self.get_connection_by_id(connection_id)
 
         if success:
-            if conn and self._complete_label_request(conn, request_id):
-                self._save_to_history(self._current_print_request)
-                QMessageBox.information(self, "Success", message)
-                self.fetch_pending_requests()  # Refresh list
-            else:
-                QMessageBox.warning(
-                    self,
-                    "Print Complete",
-                    f"{message}\n\nWarning: Failed to mark as completed on server."
-                )
+            # History is optimistic — saved the moment the print succeeds.
+            self._save_to_history(self._current_print_request)
+            QMessageBox.information(self, "Success", message)
+            if conn:
+                self._complete_label_request_async(conn, request_id)
+            self.fetch_pending_requests()
         else:
             QMessageBox.critical(self, "Print Failed", message)
 
@@ -2611,20 +2801,49 @@ class VulaPrintApp(QMainWindow):
 
         if success:
             self.last_successful_pos_print_at = datetime.now()
-            complete_ok = conn is not None and self._complete_pos_request(conn, request_id)
-            if not complete_ok:
-                if conn:
-                    conn.pos_completion_retry_ids.add(request_id)
+            if conn is not None:
+                self._dispatch_pos_complete(conn, request_id)
                 self.status_bar.showMessage(
-                    f"POS slip #{request_id} printed; completion retry scheduled"
+                    f"POS slip #{request_id} printed; completing…"
                 )
             else:
-                self.status_bar.showMessage(f"POS slip #{request_id} printed and completed")
+                self.status_bar.showMessage(
+                    f"POS slip #{request_id} printed (no connection to complete)"
+                )
         else:
             self.status_bar.showMessage(f"POS slip #{request_id} failed: {message}")
 
         if conn:
             conn.pos_in_flight_ids.discard(request_id)
+
+    def _dispatch_pos_complete(self, conn: StoreConnection, request_id: int):
+        """Fire-and-forget POST to mark a POS slip complete. Adds to retry set on failure."""
+        w = HttpWorker(
+            tag=f"poscomplete:{conn.connection_id}:{request_id}",
+            method="POST",
+            url=f"{conn.api_base_url.rstrip('/')}/admin/api/pos-slips/complete",
+            headers=self._headers_for(conn, include_json=True),
+            json_body={"request_id": request_id},
+            timeout=10.0,
+        )
+        w.done.connect(lambda r, c=conn, rid=request_id:
+                       self._on_pos_complete_done(r, c, rid))
+        w.finished.connect(lambda w=w: self._forget_http_worker(w))
+        self._http_workers.append(w)
+        w.start()
+
+    def _on_pos_complete_done(self, result: HttpResult, conn: StoreConnection, request_id: int):
+        # 200, 400, 404 all mean "resolved" per the API contract.
+        if result.ok and result.status in (200, 400, 404):
+            conn.pos_completion_retry_ids.discard(request_id)
+            self.status_bar.showMessage(
+                f"POS slip #{request_id} printed and completed"
+            )
+        else:
+            conn.pos_completion_retry_ids.add(request_id)
+            self.status_bar.showMessage(
+                f"POS slip #{request_id} printed; completion retry scheduled"
+            )
 
     def _on_poll_eod_slip_ready(self, connection_id: str, request_id: int, detail: dict):
         """EOD report detail fetched off-thread; start print job on main thread."""
@@ -2647,20 +2866,47 @@ class VulaPrintApp(QMainWindow):
         conn = self.get_connection_by_id(connection_id)
 
         if success:
-            complete_ok = conn is not None and self._complete_pos_eod_request(conn, request_id)
-            if not complete_ok:
-                if conn:
-                    conn.pos_eod_completion_retry_ids.add(request_id)
+            if conn is not None:
+                self._dispatch_eod_complete(conn, request_id)
                 self.status_bar.showMessage(
-                    f"POS EOD report #{request_id} printed; completion retry scheduled"
+                    f"POS EOD report #{request_id} printed; completing…"
                 )
             else:
-                self.status_bar.showMessage(f"POS EOD report #{request_id} printed and completed")
+                self.status_bar.showMessage(
+                    f"POS EOD report #{request_id} printed (no connection to complete)"
+                )
         else:
             self.status_bar.showMessage(f"POS EOD report #{request_id} failed: {message}")
 
         if conn:
             conn.pos_eod_in_flight_ids.discard(request_id)
+
+    def _dispatch_eod_complete(self, conn: StoreConnection, request_id: int):
+        w = HttpWorker(
+            tag=f"eodcomplete:{conn.connection_id}:{request_id}",
+            method="POST",
+            url=f"{conn.api_base_url.rstrip('/')}/admin/api/pos-eod-reports/complete",
+            headers=self._headers_for(conn, include_json=True),
+            json_body={"request_id": request_id},
+            timeout=10.0,
+        )
+        w.done.connect(lambda r, c=conn, rid=request_id:
+                       self._on_eod_complete_done(r, c, rid))
+        w.finished.connect(lambda w=w: self._forget_http_worker(w))
+        self._http_workers.append(w)
+        w.start()
+
+    def _on_eod_complete_done(self, result: HttpResult, conn: StoreConnection, request_id: int):
+        if result.ok and result.status in (200, 400, 404):
+            conn.pos_eod_completion_retry_ids.discard(request_id)
+            self.status_bar.showMessage(
+                f"POS EOD report #{request_id} printed and completed"
+            )
+        else:
+            conn.pos_eod_completion_retry_ids.add(request_id)
+            self.status_bar.showMessage(
+                f"POS EOD report #{request_id} printed; completion retry scheduled"
+            )
 
     def _on_poll_all_clear(self, connection_id: str):
         """Nothing pending for this connection — update poll timestamp and reset its backoff."""
