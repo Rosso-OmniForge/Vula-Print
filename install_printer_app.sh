@@ -185,7 +185,7 @@ UDEV"
     echo "   ✓ udev rule written: $UDEV_RULE"
 fi
 
-# b) Add real user to 'lp' group
+# b) Add real user to 'lp' group (USB printer-class devices: /dev/usb/lp*)
 if id -nG "$REAL_USER" | grep -qw lp; then
     echo "   ✓ $REAL_USER is already in the 'lp' group"
 else
@@ -197,6 +197,22 @@ else
     echo "   ✓ Added $REAL_USER to the 'lp' group"
     echo "   ⚠  Group change takes effect on next login / reboot."
     echo "      For this session, run:  newgrp lp"
+fi
+
+# c) Add real user to 'dialout' group (USB-serial adapters: /dev/ttyUSB*,
+#    /dev/ttyACM*, /dev/ttyS*). Serial ports are root:dialout mode 0660;
+#    without this the app cannot open them and POS printing silently fails.
+if id -nG "$REAL_USER" | grep -qw dialout; then
+    echo "   ✓ $REAL_USER is already in the 'dialout' group"
+else
+    if [ "$EUID" -eq 0 ]; then
+        usermod -aG dialout "$REAL_USER"
+    else
+        sudo usermod -aG dialout "$REAL_USER"
+    fi
+    echo "   ✓ Added $REAL_USER to the 'dialout' group"
+    echo "   ⚠  Group change takes effect on next login / reboot."
+    echo "      For this session, run:  newgrp dialout"
 fi
 
 
