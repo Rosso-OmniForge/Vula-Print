@@ -777,6 +777,349 @@ class POSSlipPrintJob(QThread):
             self.finished.emit(False, f"POS slip print failed: {e}")
 
 
+class POSSlipPrintJob(QThread):
+    """Background thread for printing POS slips (ESC/POS).
+
+    Printer-width and QR behaviour are driven by instance attributes so the
+    same class works across 58 mm / 80 mm printers and across old firmware
+    that does not understand native QR commands.
+
+    Attributes:
+        width_chars:     Receipt line width in characters. 32 for 58 mm,
+                         48 for 80 mm.
+        qr_mode:         "raster" (default — host-rendered GS v 0),
+                         "native" (Epson GS ( k — only for known-good
+                         printers), or "off".
+        qr_module_px:    Pixels per QR module for raster mode.
+    """
+
+    finished = pyqtSignal(bool, str)
+
+    def __init__(
+        self,
+        printer_device: str,
+        detail_payload: Dict[str, Any],
+        *,
+        width_chars: int = 48,
+        qr_mode: str = "raster",
+        qr_module_px: int = 4,
+    ):
+        super().__init__()
+        self.printer_device = printer_device
+        self.detail_payload = detail_payload
+        self.width_chars = int(width_chars)
+        self.qr_mode = str(qr_mode).lower()
+        self.qr_module_px = int(qr_module_px)
+
+    # ── Formatting helpers ─────────────────────────────────────────────
+
+    @staticmethod
+    def _cents_to_amount(cents: int) -> str:
+        value = Decimal(int(cents)) / Decimal(100)
+        value = value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return f"{value:.2f}"
+
+    @staticmethod
+    def _vat_percent_from_bps(vat_bps: int) -> str:
+        value = Decimal(int(vat_bps)) / Decimal(100)
+        value = value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return f"{value:.2f}%"
+
+    @staticmethod
+    def _esc(*values: int) -> bytes:
+        return bytes(values)
+
+    def _line_sep(self, ch: str = "-") -> str:
+        return ch * self.width_chars
+
+    def _col2(self, left: str, right: str) -> str:
+        l = str(left or "")
+        r = str(right or "")
+        space = max(1, self.width_chars - len(l) - len(r))
+        return f"{l}{' ' * space}{r}"
+
+    def _txt(self, text: str = "") -> bytes:
+        # Truncate over-wide lines instead of letting the printer wrap them.
+        # This is the single most important fix for the "extra new lines"
+        # symptom on 58 mm printers.
+        if len(text) > self.width_chars:
+            text = text[: self.width_chars]
+        return (text + "\n").encode("ascii", errors="replace")
+
+    # ── QR / logo raster ───────────────────────────────────────────────
+
+    def _qr_bytes(self, data: str) -> bytes:
+        """Return ESC/POS bytes for the QR, honoring qr_mode."""
+        if not data or self.qr_mode == "off":
+            return b""
+
+        if self.qr_mode == "raster":
+            try:
+                from vula_rendering_qr import render_qr_gs_v0
+                return render_qr_gs_v0(
+                    data,
+                    module_px=self.qr_module_px,
+                    ec_level="M",
+                    border_modules=2,
+                )
+            except Exception:
+                return b""
+
+        if self.qr_mode == "native":
+            return self._qr_code_escpos_native(data)
+
+        return b""
+
+    @staticmethod
+    def _qr_code_escpos_native(data: str, module_size: int = 4, ec_level: int = 49) -> bytes:
+        """Native Epson GS ( k QR — only works on printers that support it.
+
+        Kept as an escape hatch for known-good hardware. Do NOT use this
+        by default — most cheap thermal printers silently ignore it.
+        """
+        if not data:
+            return b""
+        data_bytes = data.encode("utf-8")
+        if len(data_bytes) > 7089:
+            return b""
+
+        GS, k = 0x1D, 0x6B
+        out = bytearray()
+        out += bytes([GS, k, 4, 0, 2, 0, 0])                     # model 2
+        out += bytes([GS, k, 3, 0, 5, module_size])              # module size
+        out += bytes([GS, k, 3, 0, 6, ec_level])                 # EC level
+        store_len = 3 + len(data_bytes)
+        out += bytes([GS, k, store_len & 0xFF, (store_len >> 8) & 0xFF, 49, 80, 48])
+        out += data_bytes
+        out += bytes([GS, k, 3, 0, 49, 81, 48])                  # print
+        return bytes(out)
+
+    def _logo_bytes(self, logo_url: str, max_width_dots: int) -> bytes:
+        """Download + rasterise the receipt logo as GS v 0 bytes.
+
+        Returns b"" if the URL is missing, the download fails, or the
+        image can't be parsed — the receipt prints fine without a logo.
+        """
+        if not logo_url:
+            return b""
+        try:
+            if logo_url.startswith("/"):
+                # Relative URL — caller should have made it absolute.
+                return b""
+
+            resp = requests.get(logo_url, timeout=8)
+            if resp.status_code != 200 or not resp.content:
+                return b""
+
+            from io import BytesIO
+            from PIL import Image
+            from vula_rendering_qr import render_pil_image_gs_v0
+
+            img = Image.open(BytesIO(resp.content))
+            return render_pil_image_gs_v0(img, max_width_dots=max_width_dots)
+        except Exception:
+            return b""
+
+    # ── Receipt body ───────────────────────────────────────────────────
+
+    def _build_receipt_bytes(self) -> bytes:
+        req = self.detail_payload.get("request", {})
+        business = self.detail_payload.get("business", {})
+        store = self.detail_payload.get("store", {})
+        totals = self.detail_payload.get("totals", {})
+        items = self.detail_payload.get("items", [])
+
+        currency = totals.get("currency", "ZAR")
+        cur = "R" if currency == "ZAR" else currency
+
+        # Print area in dots. 58 mm → 384 dots, 80 mm → 576 dots.
+        # Derived from width_chars: Font A is 12 dots per char.
+        max_width_dots = self.width_chars * 12
+
+        out = bytearray()
+        ESC, GS, LF = 0x1B, 0x1D, 0x0A
+
+        out += self._esc(ESC, 0x40)                  # INIT
+
+        # Cash drawer kick for cash payments only.
+        payment_type = str(req.get("payment_type", "")).lower()
+        if payment_type == "cash":
+            out += bytes([ESC, 0x70, 0x00, 0x19, 0xFA])
+
+        # ── Logo (GS v 0 raster, if we have one) ─────────────────────
+        logo_url = self.detail_payload.get("logo_url", "")
+        logo_bytes = self._logo_bytes(logo_url, max_width_dots)
+        if logo_bytes:
+            out += self._esc(ESC, 0x61, 0x01)         # center
+            out += logo_bytes
+            out += b"\n"
+        else:
+            out += self._esc(ESC, 0x61, 0x01)
+
+        # ── Business header ─────────────────────────────────────────
+        out += self._esc(ESC, 0x45, 0x01)             # bold on
+        out += self._txt(business.get("brand_name", "POS RECEIPT"))
+        out += self._esc(ESC, 0x45, 0x00)             # bold off
+
+        if business.get("phone"):
+            out += self._txt(f"Tel: {business['phone']}")
+        if business.get("email"):
+            out += self._txt(str(business.get("email", "")))
+        if business.get("vat_number"):
+            out += self._txt(f"VAT: {business['vat_number']}")
+
+        addr_parts = [
+            business.get("address_line1", ""),
+            business.get("address_line2", ""),
+            business.get("city", ""),
+            business.get("province", ""),
+            business.get("postal_code", ""),
+            business.get("country", ""),
+        ]
+        for line in [p for p in addr_parts if p]:
+            out += self._txt(str(line))
+
+        # ── Transaction meta ────────────────────────────────────────
+        out += self._esc(ESC, 0x61, 0x00)             # left
+        out += self._txt(self._line_sep())
+        out += self._txt(self._col2("Invoice:", str(req.get("invoice_number", ""))))
+        out += self._txt(self._col2("Created:", str(req.get("created_at", ""))))
+        out += self._txt(self._col2("Cashier:", str(self.detail_payload.get("cashier_username", ""))))
+        out += self._txt(self._col2("Payment:", str(req.get("payment_type", ""))))
+
+        customer_email = str(self.detail_payload.get("customer_email", "") or "").strip()
+        if customer_email:
+            out += self._txt(self._col2("Customer:", customer_email))
+
+        if store.get("name"):
+            out += self._txt(self._line_sep())
+            out += self._txt(str(store.get("name", "")))
+            for store_line in str(store.get("address", "")).splitlines():
+                if store_line.strip():
+                    out += self._txt(store_line.strip())
+            if store.get("phone"):
+                out += self._txt(f"Store Tel: {store['phone']}")
+            if store.get("email"):
+                out += self._txt(f"Store Email: {store['email']}")
+
+        # ── Items ───────────────────────────────────────────────────
+        out += self._txt(self._line_sep())
+        out += self._esc(ESC, 0x45, 0x01)
+        out += self._txt(self._col2("QTY ITEM", "TOTAL"))
+        out += self._esc(ESC, 0x45, 0x00)
+        out += self._txt(self._line_sep())
+
+        # Per-item description budget: total width minus qty prefix (4) and
+        # price column (14). Clamped to at least 8 chars.
+        desc_budget = max(8, self.width_chars - 4 - 14)
+
+        for item in items:
+            qty = int(item.get("qty", 0) or 0)
+            title = str(item.get("title", ""))
+            variant = str(item.get("variant_label", ""))
+            sku = str(item.get("sku", ""))
+            unit_price = f"{cur} {self._cents_to_amount(item.get('unit_price_cents', 0) or 0)}"
+            line_total = f"{cur} {self._cents_to_amount(item.get('line_total_cents', 0) or 0)}"
+
+            out += self._txt(self._col2(f"{qty} x {title[:desc_budget]}", line_total))
+            if variant:
+                out += self._txt(f"  {variant[: self.width_chars - 2]}")
+            if sku:
+                out += self._txt(f"  SKU: {sku[: self.width_chars - 7]}")
+            out += self._txt(f"  @ {unit_price}")
+
+        # ── Totals ──────────────────────────────────────────────────
+        out += self._txt(self._line_sep())
+        out += self._txt(self._col2(
+            "Subtotal before disc:",
+            f"{cur} {self._cents_to_amount(totals.get('subtotal_before_discount_cents', 0) or 0)}",
+        ))
+        out += self._txt(self._col2(
+            "Manual discount:",
+            f"{cur} {self._cents_to_amount(totals.get('manual_discount_cents', 0) or 0)}",
+        ))
+        out += self._txt(self._col2(
+            "Voucher discount:",
+            f"{cur} {self._cents_to_amount(totals.get('voucher_discount_cents', 0) or 0)}",
+        ))
+        out += self._txt(self._col2(
+            "Subtotal:",
+            f"{cur} {self._cents_to_amount(totals.get('subtotal_cents', 0) or 0)}",
+        ))
+
+        vat_label = f"VAT ({self._vat_percent_from_bps(totals.get('vat_bps', 0) or 0)}):"
+        out += self._txt(self._col2(
+            vat_label,
+            f"{cur} {self._cents_to_amount(totals.get('tax_cents', 0) or 0)}",
+        ))
+        out += self._txt(self._line_sep())
+        out += self._esc(ESC, 0x45, 0x01)
+        out += self._txt(self._col2(
+            "TOTAL:",
+            f"{cur} {self._cents_to_amount(totals.get('total_cents', 0) or 0)}",
+        ))
+        out += self._esc(ESC, 0x45, 0x00)
+
+        # ── Footer note ─────────────────────────────────────────────
+        footer_note = str(self.detail_payload.get("footer_note", "") or "").strip()
+        if footer_note:
+            out += self._txt(self._line_sep())
+            out += self._esc(ESC, 0x61, 0x01)
+            for chunk_start in range(0, len(footer_note), self.width_chars):
+                out += self._txt(footer_note[chunk_start : chunk_start + self.width_chars])
+            out += self._esc(ESC, 0x61, 0x00)
+
+        # ── QR code ─────────────────────────────────────────────────
+        website_url = str(self.detail_payload.get("website_url", "") or "").strip()
+        qr_data = str(self.detail_payload.get("qr_data", "") or "").strip()
+        if qr_data:
+            qr_bytes = self._qr_bytes(qr_data)
+            if qr_bytes:
+                out += self._txt(self._line_sep())
+                out += self._esc(ESC, 0x61, 0x01)     # center
+                out += qr_bytes
+                out += b"\n"
+                if website_url:
+                    out += self._txt(website_url[: self.width_chars])
+                out += self._esc(ESC, 0x61, 0x00)     # left
+
+        # ── Loyalty note ────────────────────────────────────────────
+        out += self._txt(self._line_sep())
+        out += self._esc(ESC, 0x61, 0x01)
+        for line in (
+            "If you have an online account,",
+            "you can keep track of all online",
+            "or instore orders on your account.",
+        ):
+            out += self._txt(line[: self.width_chars])
+        out += self._esc(ESC, 0x61, 0x00)
+
+        out += bytes([LF, LF, LF])
+        out += self._esc(GS, 0x56, 0x41, 0x00)        # full cut
+        return bytes(out)
+
+    def run(self):
+        try:
+            payload = self._build_receipt_bytes()
+            try:
+                with open(self.printer_device, "wb") as printer:
+                    printer.write(payload)
+            except PermissionError:
+                self.finished.emit(
+                    False,
+                    f"Permission denied: cannot write to {self.printer_device}.\n\n"
+                    f"Add the user to the 'lp' group:\n"
+                    f"  sudo usermod -aG lp $USER  (then log out and back in)",
+                )
+                return
+            except Exception as e:
+                self.finished.emit(False, f"POS printer error: {e}")
+                return
+
+            self.finished.emit(True, "POS slip printed successfully")
+        except Exception as e:
+            self.finished.emit(False, f"POS slip print failed: {e}")
+
 class POSEODReportPrintJob(QThread):
     """Background thread for printing receipt-width POS EOD reports (ESC/POS)."""
 
@@ -1087,6 +1430,11 @@ class VulaPrintApp(QMainWindow):
         # first connection on load (see load_settings).
         self.store_connections: List[StoreConnection] = []
 
+        # POS printer compatibility defaults — overwritten by load_settings().
+        self.pos_width_chars: int = 32
+        self.pos_qr_mode: str = "raster"
+        self.pos_qr_module_px: int = 4
+
         self.selected_printer = None
         self.pos_selected_printer = None
         self.printer_calibrated = False
@@ -1196,6 +1544,11 @@ class VulaPrintApp(QMainWindow):
             self.last_selected_pos_printer = roles.get("pos_slip") or data.get("pos_slip_printer_device") or None
             self.auto_connect_on_startup = bool(data.get("auto_connect_on_startup", True))
             self.pos_poll_interval_seconds = int(data.get("pos_poll_interval_seconds", 5) or 5)
+            # POS printer compatibility settings — see POSSlipPrintJob.
+            # Defaults match the common "58mm receipt clone" hardware.
+            self.pos_width_chars = int(data.get("pos_width_chars", 32) or 32)
+            self.pos_qr_mode = str(data.get("pos_qr_mode", "raster") or "raster")
+            self.pos_qr_module_px = int(data.get("pos_qr_module_px", 4) or 4)
         except Exception as e:
             print(f"Warning: failed to load settings: {e}")
 
@@ -1226,6 +1579,9 @@ class VulaPrintApp(QMainWindow):
                 "pos_slip_printer_device": self.last_selected_pos_printer,
                 "auto_connect_on_startup": self.auto_connect_on_startup,
                 "pos_poll_interval_seconds": self.pos_poll_interval_seconds,
+                "pos_width_chars": int(self.pos_width_chars),
+                "pos_qr_mode": str(self.pos_qr_mode),
+                "pos_qr_module_px": int(self.pos_qr_module_px),
                 "printer_roles": {
                     "label": self.last_selected_printer,
                     "pos_slip": self.last_selected_pos_printer,
@@ -2787,7 +3143,13 @@ class VulaPrintApp(QMainWindow):
         conn.pos_backoff_seconds = 1
         conn.pos_backoff_until = 0.0
         self._update_pos_worker_status(f"Printing via {conn.name}")
-        self.pos_print_job = POSSlipPrintJob(self.pos_selected_printer, detail)
+        self.pos_print_job = POSSlipPrintJob(
+            self.pos_selected_printer,
+            detail,
+            width_chars=self.pos_width_chars,
+            qr_mode=self.pos_qr_mode,
+            qr_module_px=self.pos_qr_module_px,
+        )
         self.pos_print_job.finished.connect(
             lambda s, m: self._on_pos_print_finished(s, m, request_id, connection_id)
         )
@@ -3290,7 +3652,13 @@ class VulaPrintApp(QMainWindow):
             return
 
         sample_payload = self._build_sample_pos_payload()
-        self.pos_print_job = POSSlipPrintJob(self.pos_selected_printer, sample_payload)
+        self.pos_print_job = POSSlipPrintJob(
+            self.pos_selected_printer,
+            sample_payload,
+            width_chars=self.pos_width_chars,
+            qr_mode=self.pos_qr_mode,
+            qr_module_px=self.pos_qr_module_px,
+        )
         self.pos_print_job.finished.connect(self._on_test_pos_finished)
         self.pos_print_job.start()
         self.status_bar.showMessage("Printing sample POS slip...")

@@ -12,3 +12,11 @@ requests>=2.31.0
 
 # Optional: better SSL certificate handling
 certifi>=2023.0.0
+
+# QR code generation for POS receipts.
+# Required because old ESC/POS printers do not support the native GS ( k
+# 2D-barcode command; we render QR codes as 1-bit raster images instead.
+qrcode>=7.4.2
+
+# Image manipulation for QR raster + logo raster generation.
+pillow>=10.0.0
