@@ -34,6 +34,8 @@ from PyQt6.QtGui import QFont, QIcon, QPalette, QColor, QPixmap, QPainter, QPen,
 
 import requests
 
+from vula_singleton import acquire_singleton_lock
+
 
 def _load_env_file(env_file: Path) -> None:
     """Load simple KEY=VALUE pairs from .env into process environment."""
@@ -1027,6 +1029,51 @@ class POSPollWorker(QThread):
         self.all_clear.emit(cid)
 
 
+class _RetryFlushWorker(QThread):
+    """Off-thread completion-retry flush.
+
+    The snapshot of pending retries is taken on the main thread (so we never
+    mutate the shared sets from a worker). Each successful completion is
+    reported back via ``succeeded`` so the main thread can discard ids safely.
+    """
+
+    succeeded = pyqtSignal(list)   # list of (connection_id, kind, request_id)
+
+    def __init__(self, tasks, parent=None):
+        # tasks: iterable of
+        #   (connection_id, api_base, api_key, user_id, kind, request_id)
+        super().__init__(parent)
+        self._tasks = list(tasks)
+
+    def run(self):
+        done = []
+        for cid, base, key, uid, kind, req_id in self._tasks:
+            path = (
+                "/admin/api/pos-slips/complete"
+                if kind == "pos"
+                else "/admin/api/pos-eod-reports/complete"
+            )
+            try:
+                r = requests.post(
+                    f"{base.rstrip('/')}{path}",
+                    headers={
+                        "X-Printer-API-Key": key,
+                        "X-Printer-User-Id": str(uid or ""),
+                        "Content-Type": "application/json",
+                    },
+                    json={"request_id": req_id},
+                    timeout=10,
+                )
+                if r.status_code in (200, 400, 404):
+                    done.append((cid, kind, req_id))
+            except Exception:
+                # Network hiccup — leave the id in the retry set for next tick.
+                pass
+
+        if done:
+            self.succeeded.emit(done)
+
+
 class VulaPrintApp(QMainWindow):
     """Main application window."""
 
@@ -1052,6 +1099,7 @@ class VulaPrintApp(QMainWindow):
         self.pos_print_job: Optional[POSSlipPrintJob] = None
         self.pos_eod_print_job: Optional[POSEODReportPrintJob] = None
         self._pos_poll_worker: Optional[POSPollWorker] = None
+        self._pos_retry_worker: Optional[_RetryFlushWorker] = None
         # Round-robin cursor over store_connections for the POS poll cycle.
         # Only one worker / one physical POS print job runs at a time; each
         # timer tick advances to the next connection so both stores get
@@ -2467,17 +2515,28 @@ class VulaPrintApp(QMainWindow):
             self._update_pos_worker_status()
             return
 
-        # Flush any pending completion retries across ALL eligible connections
-        # (lightweight POSTs; doesn't block picking a connection to poll).
-        for conn in eligible:
-            if conn.pos_completion_retry_ids:
+        # Flush any pending completion retries OFF the main thread.
+        # We snapshot the pending ids here (safe — main thread), then let a
+        # background worker do the HTTP; successful completions come back
+        # via _on_retry_succeeded so the shared sets are only touched on
+        # the main thread.
+        if self._pos_retry_worker is None or not self._pos_retry_worker.isRunning():
+            tasks = []
+            for conn in eligible:
                 for req_id in sorted(conn.pos_completion_retry_ids):
-                    if self._complete_pos_request(conn, req_id):
-                        conn.pos_completion_retry_ids.discard(req_id)
-            if conn.pos_eod_completion_retry_ids:
+                    tasks.append((
+                        conn.connection_id, conn.api_base_url, conn.api_key,
+                        conn.printer_user_id, "pos", req_id,
+                    ))
                 for req_id in sorted(conn.pos_eod_completion_retry_ids):
-                    if self._complete_pos_eod_request(conn, req_id):
-                        conn.pos_eod_completion_retry_ids.discard(req_id)
+                    tasks.append((
+                        conn.connection_id, conn.api_base_url, conn.api_key,
+                        conn.printer_user_id, "eod", req_id,
+                    ))
+            if tasks:
+                self._pos_retry_worker = _RetryFlushWorker(tasks)
+                self._pos_retry_worker.succeeded.connect(self._on_retry_succeeded)
+                self._pos_retry_worker.start()
 
         # Round-robin: find the next eligible connection (by index in
         # store_connections) that isn't currently backed off.
@@ -2514,6 +2573,17 @@ class VulaPrintApp(QMainWindow):
         so one dead store never slows polling of a healthy one."""
         conn.pos_backoff_until = time.time() + min(conn.pos_backoff_seconds, 30)
         conn.pos_backoff_seconds = min(conn.pos_backoff_seconds * 2, 30)
+
+    def _on_retry_succeeded(self, succeeded: list):
+        """Background retry-flush completed — discard the ids that went through."""
+        for cid, kind, req_id in succeeded:
+            conn = self.get_connection_by_id(cid)
+            if not conn:
+                continue
+            if kind == "pos":
+                conn.pos_completion_retry_ids.discard(req_id)
+            else:
+                conn.pos_eod_completion_retry_ids.discard(req_id)
 
     # ── POSPollWorker signal handlers ──────────────────────────────────────
 
@@ -2666,23 +2736,25 @@ class VulaPrintApp(QMainWindow):
             return
 
         # Give the printer time to run the gap-detection feed (~1.5 s typical)
-        time.sleep(1.5)
+        # WITHOUT blocking the Qt event loop. The timer fires on the main
+        # thread, so _print_calibration_test_label runs safely.
+        self.status_bar.showMessage("Calibrating printer…")
+        QTimer.singleShot(1500, self._print_calibration_test_label)
 
-        # ── 2. Print a test label ─────────────────────────────────────
+    def _print_calibration_test_label(self):
+        """Second half of calibration: prints the test label after the feed."""
         test_item = {
             "title": "VULA! PRINT",
             "variant_label": "Calibration Test",
             "sku": "CALIB-TEST",
             "code39": "CALIBTEST",
             "price_cents": 95000,
-            "currency": "ZAR"
+            "currency": "ZAR",
         }
 
         self.calibration_job = PrintJob(self.selected_printer, [test_item])
         self.calibration_job.finished.connect(self.on_test_print_finished)
         self.calibration_job.start()
-
-        self.status_bar.showMessage("Calibrating printer…")
 
     def on_test_print_finished(self, success: bool, message: str):
         """Handle test print completion."""
@@ -3140,29 +3212,22 @@ class VulaPrintApp(QMainWindow):
     # Window close guard
     # ─────────────────────────────────────────────────────────────
     def closeEvent(self, event):
-        """Intercept window close to prevent accidental shutdown.
+        """Always minimize instead of quitting.
 
-        The app is managed as a systemd user service; closing the window
-        would stop the service.  We instead offer to minimize so the app
-        keeps running in the taskbar.  A developer who truly wants to stop
-        it can use ``systemctl --user stop vula-print`` or choose
-        'Force Quit' here.
+        The app runs as a systemd user service; quitting the window would
+        either orphan the service or trigger a restart — both of which have
+        historically caused duplicate processes competing for the same USB
+        printer devices. The only supported way to stop the app is:
+
+            systemctl --user stop vula-print
         """
-        reply = QMessageBox.question(
-            self,
-            "Close Application?",
-            "This app is managed as a system service and should stay running.\n\n"
-            "  ▸  Click \"Minimize\" to keep it in the taskbar (recommended).\n"
-            "  ▸  Click \"Force Quit\" to stop the process entirely.\n\n"
-            "For developers: systemctl --user stop vula-print",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel,
+        event.ignore()
+        self.showMinimized()
+        self.status_bar.showMessage(
+            "Minimized to taskbar. To stop the app entirely: "
+            "systemctl --user stop vula-print",
+            8000,
         )
-        if reply == QMessageBox.StandardButton.Yes:
-            event.accept()   # Force Quit
-        else:
-            event.ignore()
-            self.showMinimized()
 
     # ─────────────────────────────────────────────────────────────
     # In-app updater
@@ -3885,6 +3950,19 @@ class _UpdateDialog(QDialog):
 
 def main():
     """Main entry point."""
+    # ── Singleton guard ──────────────────────────────────────────
+    # Only one instance of the app may run per desktop session. A second
+    # launch exits immediately so systemd / menu-launcher / operator
+    # double-clicks never spawn duplicates that fight over /dev/usb/lp*.
+    lock_fd = acquire_singleton_lock()
+    if lock_fd is None:
+        print(
+            "Vula! Print is already running. "
+            "Stop the existing instance with: systemctl --user stop vula-print",
+            file=sys.stderr,
+        )
+        sys.exit(0)
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 

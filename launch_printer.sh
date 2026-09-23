@@ -48,6 +48,20 @@ if [ ! -d "$SCRIPT_DIR/venv" ]; then
     exit 1
 fi
 
+# ── Singleton check ──────────────────────────────────────────────
+# If the app already holds its lock, refuse to launch a second copy.
+# Uses the same lock file the Python side uses (~/.config/vula_print/app.lock).
+LOCK_FILE="$HOME/.config/vula_print/app.lock"
+if [ -e "$LOCK_FILE" ]; then
+    if command -v flock >/dev/null 2>&1; then
+        # `flock --nonblock` succeeds only if nothing holds the lock.
+        if ! flock --nonblock "$LOCK_FILE" true 2>/dev/null; then
+            echo "Vula! Print already running — exiting." >&2
+            exit 0
+        fi
+    fi
+fi
+
 # ── Launch ───────────────────────────────────────────────────────
 source "$SCRIPT_DIR/venv/bin/activate"
 
