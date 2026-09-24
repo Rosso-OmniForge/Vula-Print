@@ -767,9 +767,18 @@ class POSPollWorker(QThread):
             return
 
         if r.status_code in (401, 503, 400):
+            plog.error("[%s] POS pending -> HTTP %d (auth/config) — backing off",
+                       cid, r.status_code)
+            try:
+                snippet = r.text[:200].replace(chr(10), " ")
+                if snippet:
+                    plog.error("[%s]   response: %s", cid, snippet)
+            except Exception:
+                pass
             self.poll_fatal.emit(cid, f"HTTP {r.status_code}", r.status_code)
             return
         if r.status_code != 200:
+            plog.warning("[%s] POS pending -> HTTP %d (transient)", cid, r.status_code)
             self.poll_error.emit(cid, f"HTTP {r.status_code}", r.status_code)
             return
 
@@ -797,6 +806,7 @@ class POSPollWorker(QThread):
             if dr.status_code == 404:
                 continue  # already gone, try next slip
             if dr.status_code != 200:
+                plog.warning("[%s] detail #%d -> HTTP %d", cid, req_id, dr.status_code)
                 self.poll_error.emit(cid, f"Detail #{req_id}: HTTP {dr.status_code}", dr.status_code)
                 return
             plog.info("[%s] slip #%d fetched -> printing", cid, req_id)
