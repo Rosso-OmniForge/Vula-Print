@@ -7,6 +7,8 @@ primitives only (never shared Python objects across thread boundaries).
 """
 from __future__ import annotations
 
+import logging
+
 import time
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
@@ -60,6 +62,9 @@ class PrinterScanner(QThread):
         except Exception as e:
             print(f"Error scanning for printers: {e}")
 
+        slog = logging.getLogger("vula.scan")
+        slog.info("discovered %d device(s): %s",
+                  len(devices), devices or "(none)")
         self.printers_found.emit(devices)
 
 
@@ -190,9 +195,14 @@ class PrintJob(QThread):
 
     def run(self):
         """Execute print job."""
+        log = logging.getLogger("vula.print")
+        import time as _t
+        _t0 = _t.monotonic()
         try:
             total = sum(item.get("qty_to_print", 0) for item in self.items)
             current = 0
+            log.info("PrintJob start: %d items / %d labels -> %s",
+                     len(self.items), total, self.printer_device)
 
             for item in self.items:
                 qty = item.get("qty_to_print", 0)
@@ -223,6 +233,9 @@ class PrintJob(QThread):
                     # Small delay between labels
                     time.sleep(0.2)
 
+            elapsed = _t.monotonic() - _t0
+            log.info("PrintJob done: %d/%d labels in %.2fs",
+                     current, total, elapsed)
             self.finished.emit(True, f"Successfully printed {total} labels")
 
         except Exception as e:
@@ -551,8 +564,14 @@ class POSSlipPrintJob(QThread):
         return bytes(out)
 
     def run(self):
+        log = logging.getLogger("vula.print")
+        import time as _t
+        _t0 = _t.monotonic()
         try:
             payload = self._build_receipt_bytes()
+            log.info("POSSlip: %db, width=%d, qr=%s -> %s",
+                     len(payload), self.width_chars, self.qr_mode,
+                     self.printer_device)
             try:
                 write_to_device(self.printer_device, payload)
             except PermissionError:
@@ -567,6 +586,8 @@ class POSSlipPrintJob(QThread):
                 self.finished.emit(False, f"POS printer error: {e}")
                 return
 
+            elapsed = _t.monotonic() - _t0
+            log.info("POSSlip done in %.2fs", elapsed)
             self.finished.emit(True, "POS slip printed successfully")
         except Exception as e:
             self.finished.emit(False, f"POS slip print failed: {e}")
@@ -677,6 +698,8 @@ class POSEODReportPrintJob(QThread):
                 self.finished.emit(False, f"POS EOD printer error: {e}")
                 return
 
+            elapsed = _t.monotonic() - _t0
+            log.info("EOD report done in %.2fs", elapsed)
             self.finished.emit(True, "POS EOD report printed successfully")
         except Exception as e:
             self.finished.emit(False, f"POS EOD print failed: {e}")
@@ -729,6 +752,7 @@ class POSPollWorker(QThread):
 
     def run(self):
         cid = self._connection_id
+        plog = logging.getLogger("vula.poll")
 
         # ── 1. Poll POS slips ──────────────────────────────────────────────
         try:
@@ -738,6 +762,7 @@ class POSPollWorker(QThread):
                 timeout=10,
             )
         except Exception as e:
+            plog.warning("[%s] poll network error: %s", cid, e)
             self.poll_error.emit(cid, str(e), 0)
             return
 
@@ -774,6 +799,7 @@ class POSPollWorker(QThread):
             if dr.status_code != 200:
                 self.poll_error.emit(cid, f"Detail #{req_id}: HTTP {dr.status_code}", dr.status_code)
                 return
+            plog.info("[%s] slip #%d fetched -> printing", cid, req_id)
             self.slip_ready.emit(cid, req_id, dr.json())
             return
 
@@ -825,6 +851,7 @@ class POSPollWorker(QThread):
                 self.eod_pending_ready.emit(cid, [])
                 self.all_clear.emit(cid)
                 return
+            plog.info("[%s] EOD #%d fetched -> printing", cid, req_id)
             self.eod_slip_ready.emit(cid, req_id, dr.json())
             return
 

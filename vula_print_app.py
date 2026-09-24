@@ -24,6 +24,26 @@ from vula_app import VulaPrintApp
 
 
 def main():
+    # ── Logging ──────────────────────────────────────────────────
+    from vula_logging import setup_logging
+    setup_logging()
+
+    import logging
+    _log = logging.getLogger("vula.app")
+
+    # ── Global unhandled-exception hook ─────────────────────────
+    # Any exception that escapes a Qt slot lands here. We log it with
+    # full traceback before letting Python print it to stderr as usual.
+    import sys as _sys
+    _orig_hook = _sys.excepthook
+    def _vula_excepthook(exc_type, exc_value, exc_tb):
+        _log.critical(
+            "Unhandled exception",
+            exc_info=(exc_type, exc_value, exc_tb),
+        )
+        _orig_hook(exc_type, exc_value, exc_tb)
+    _sys.excepthook = _vula_excepthook
+
     # Singleton guard — only one instance per desktop session.
     lock_fd = acquire_singleton_lock()
     if lock_fd is None:
@@ -45,7 +65,9 @@ def main():
     window = VulaPrintApp()
     window.show()
 
-    sys.exit(app.exec())
+    rc = app.exec()
+    _log.info("Vula! Print exiting with code %d", rc)
+    sys.exit(rc)
 
 
 if __name__ == "__main__":

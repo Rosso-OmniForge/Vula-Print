@@ -13,6 +13,9 @@ StoreConnection object, to keep thread boundaries simple.
 
 from __future__ import annotations
 
+import logging
+import time
+
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -56,6 +59,12 @@ class HttpWorker(QThread):
         self.timeout = timeout
 
     def run(self) -> None:
+        from vula_logging import redact_url
+
+        log = logging.getLogger("vula.http")
+        t0 = time.monotonic()
+        url_display = redact_url(self.url)
+
         try:
             if self.method == "GET":
                 r = requests.get(self.url, headers=self.headers, timeout=self.timeout)
@@ -65,20 +74,55 @@ class HttpWorker(QThread):
                     json=self.json_body, timeout=self.timeout,
                 )
             else:
-                self.done.emit(HttpResult(
-                    self.tag, False, 0, None, b"",
-                    f"Unsupported method: {self.method}",
-                ))
+                elapsed_ms = (time.monotonic() - t0) * 1000
+                msg = "Unsupported method: " + self.method
+                log.error("[%s] %s %s -> %s (%.0fms)",
+                          self.tag, self.method, url_display, msg, elapsed_ms)
+                self.done.emit(HttpResult(self.tag, False, 0, None, b"", msg))
                 return
         except Exception as e:
+            elapsed_ms = (time.monotonic() - t0) * 1000
+            err = type(e).__name__ + ": " + str(e)
+            log.error("[%s] %s %s -> %s (%.0fms)",
+                      self.tag, self.method, url_display, err, elapsed_ms)
             self.done.emit(HttpResult(self.tag, False, 0, None, b"", str(e)))
             return
+
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        size = len(r.content)
 
         try:
             data = r.json()
         except Exception:
             data = r.text
 
-        self.done.emit(HttpResult(
-            self.tag, True, r.status_code, data, r.content, "",
-        ))
+        # Choose a level based on outcome.
+        if 200 <= r.status_code < 300:
+            log.info("[%s] %s %s -> %d (%.0fms, %db)",
+                     self.tag, self.method, url_display,
+                     r.status_code, elapsed_ms, size)
+        elif 400 <= r.status_code < 500:
+            log.warning("[%s] %s %s -> %d (%.0fms)",
+                        self.tag, self.method, url_display,
+                        r.status_code, elapsed_ms)
+            # 200-char snippet so we can see WHY it 4xx'd.
+            try:
+                snippet = r.text[:200].replace(chr(10), " ")
+                if snippet:
+                    log.warning("[%s]   response: %s", self.tag, snippet)
+            except Exception:
+                pass
+        else:
+            log.error("[%s] %s %s -> %d (%.0fms)",
+                      self.tag, self.method, url_display,
+                      r.status_code, elapsed_ms)
+            try:
+                snippet = r.text[:200].replace(chr(10), " ")
+                if snippet:
+                    log.error("[%s]   response: %s", self.tag, snippet)
+            except Exception:
+                pass
+
+        self.done.emit(HttpResult(self.tag, True, r.status_code, data, r.content, ""))
+
+

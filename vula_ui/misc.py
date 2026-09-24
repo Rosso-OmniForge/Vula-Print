@@ -187,3 +187,95 @@ class MiscMixin:
 
         layout.addLayout(btn_row)
         dlg.exec()
+
+    def _view_logs(self):
+        """Open a read-only dialog showing the app log tail."""
+        from vula_logging import LOG_FILE
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Application Logs")
+        dlg.setMinimumSize(760, 560)
+        dlg.setStyleSheet("background:" + self.C_BG + "; color:" + self.C_TEXT + ";")
+
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(18, 18, 18, 14)
+        layout.setSpacing(10)
+
+        heading = QLabel("Application Logs")
+        heading.setStyleSheet(
+            "color:" + self.C_TEXT + "; font-size:14px; font-weight:700;"
+        )
+        layout.addWidget(heading)
+
+        info_lbl = QLabel()
+        info_lbl.setStyleSheet(
+            "color:" + self.C_TEXT_DIM + "; font-size:11px; "
+            "font-family:'Courier New',monospace;"
+        )
+        info_lbl.setWordWrap(True)
+        layout.addWidget(info_lbl)
+
+        body = QTextEdit()
+        body.setReadOnly(True)
+        body.setFont(QFont("Courier New", 9))
+        body.setStyleSheet(
+            "background:" + self.C_SURFACE + "; color:" + self.C_TEXT + ";"
+            "border:1px solid " + self.C_BORDER + "; border-radius:6px; padding:8px;"
+        )
+        layout.addWidget(body, stretch=1)
+
+        def _refresh():
+            from pathlib import Path as _P
+            lines = 300
+            if not LOG_FILE.exists():
+                info_lbl.setText("No log file yet: " + str(LOG_FILE))
+                body.setPlainText("(log file does not exist)")
+                return
+            try:
+                size_kb = LOG_FILE.stat().st_size / 1024.0
+                with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+                    tail = f.readlines()[-lines:]
+                info_lbl.setText(
+                    str(LOG_FILE) + "  (" + str(round(size_kb, 1)) + " KB, showing last "
+                    + str(len(tail)) + " lines)"
+                )
+                body.setPlainText("".join(tail))
+                sb = body.verticalScrollBar()
+                sb.setValue(sb.maximum())
+            except Exception as e:
+                body.setPlainText("Could not read log: " + str(e))
+
+        _refresh()
+
+        btn_row = QHBoxLayout()
+
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.setMinimumHeight(34)
+        refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        refresh_btn.setStyleSheet(self._btn_secondary())
+        refresh_btn.clicked.connect(_refresh)
+
+        copy_btn = QPushButton("Copy path")
+        copy_btn.setMinimumHeight(34)
+        copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        copy_btn.setStyleSheet(self._btn_secondary())
+
+        def _copy_path():
+            QApplication.clipboard().setText(str(LOG_FILE))
+            copy_btn.setText("Copied")
+
+        copy_btn.clicked.connect(_copy_path)
+
+        btn_row.addWidget(refresh_btn)
+        btn_row.addWidget(copy_btn)
+        btn_row.addStretch()
+
+        close_btn = QPushButton("Close")
+        close_btn.setMinimumHeight(34)
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setStyleSheet(self._btn_primary())
+        close_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(close_btn)
+
+        layout.addLayout(btn_row)
+        dlg.exec()

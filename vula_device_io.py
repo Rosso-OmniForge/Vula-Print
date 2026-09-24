@@ -19,6 +19,8 @@ populated by the app once settings are loaded. See set_serial_configs().
 """
 from __future__ import annotations
 
+import logging
+import time
 from typing import Any, Dict, Optional
 
 # Sensible defaults for old POS printers. 9600 8N1 with no flow control is
@@ -80,14 +82,27 @@ def write_to_device(path: str, data: bytes) -> None:
     """Write raw bytes to a printer device.
 
     Dispatches to serial or file I/O depending on the device path.
+    Logs byte count, elapsed time, and any error under 'vula.device'.
 
-    Raises whatever the underlying I/O layer raises — callers are expected
-    to catch Exception and surface the message to the operator.
+    Raises whatever the underlying I/O layer raises — callers are
+    expected to catch Exception and surface the message to the operator.
     """
-    if is_serial_device(path):
-        _write_serial(path, data)
-    else:
-        _write_file(path, data)
+    log = logging.getLogger("vula.device")
+    kind = "serial" if is_serial_device(path) else "usb"
+    size = len(data)
+    t0 = time.monotonic()
+    try:
+        if kind == "serial":
+            _write_serial(path, data)
+        else:
+            _write_file(path, data)
+    except Exception as e:
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        log.error("%s write %s failed: %db -> %s (%.0fms)",
+                  kind, path, size, type(e).__name__ + ": " + str(e), elapsed_ms)
+        raise
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    log.info("%s write %s ok: %db (%.0fms)", kind, path, size, elapsed_ms)
 
 
 def _write_file(path: str, data: bytes) -> None:

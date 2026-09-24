@@ -157,8 +157,18 @@ class SidebarMixin:
         update_btn.setStyleSheet(self._btn_primary())
         update_btn.clicked.connect(self._do_update)
 
+        logs_btn = QPushButton("View Logs")
+        logs_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        logs_btn.setStyleSheet(self._btn_secondary())
+        logs_btn.clicked.connect(self._view_logs)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+        btn_row.addWidget(update_btn)
+        btn_row.addWidget(logs_btn)
+
         ac.addWidget(self.version_label)
-        ac.addWidget(update_btn)
+        ac.addLayout(btn_row)
         body_layout.addWidget(app_card)
 
         body_layout.addStretch()
