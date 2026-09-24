@@ -37,7 +37,7 @@ from vula_workers import (
 )
 from vula_dialogs import (
     _ConnectionsDialog, _VisualPreviewDialog, _TextDialog,
-    _HistoryDialog, _UpdateDialog,
+    _HistoryDialog,
 )
 
 
@@ -75,37 +75,115 @@ class MiscMixin:
             return "unknown"
 
     def _do_update(self):
-        """Run update.sh in a dialog showing live output, then restart the service."""
-        update_script = Path(__file__).parent / "update.sh"
-        if not update_script.exists():
-            QMessageBox.critical(self, "Update Script Missing",
-                f"Could not find update.sh at:\n{update_script}")
-            return
+        """Show update status — automatic updates run via systemd timer.
 
-        confirm = QMessageBox.question(
-            self, "Update App",
-            "This will:\n"
-            "  1. Pull the latest code from GitHub\n"
-            "  2. Refresh Python dependencies\n"
-            "  3. Restart the systemd service (app will reload)\n\n"
-            "The window will close after the restart is triggered.\n\n"
-            "Continue?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
+        The in-app updater no longer runs a shell script. Updates are
+        handled by vula-print-update.timer running daily at 04:05 as
+        root. This dialog is informational; the manual command can be
+        copied for admins who want to force an update now.
+        """
+        from datetime import datetime as _dt
+        import subprocess as _sp
+
+        current = self._current_version()
+
+        log_path = Path("/var/log/vula/app-update.log")
+        last_run = "never"
+        last_result = "(no log yet)"
+
+        if log_path.exists():
+            try:
+                mtime = log_path.stat().st_mtime
+                last_run = _dt.fromtimestamp(mtime).strftime("%d %b %Y  %H:%M")
+                with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                    tail = f.readlines()[-30:]
+                last_result = "".join(tail).strip() or "(empty log)"
+            except Exception as e:
+                last_result = "(could not read log: " + str(e) + ")"
+
+        timer_status = "unknown"
+        try:
+            r = _sp.run(
+                ["systemctl", "is-active", "vula-print-update.timer"],
+                capture_output=True, text=True, timeout=3,
+            )
+            timer_status = r.stdout.strip() or "unknown"
+        except Exception:
+            pass
+
+        sep = "─" * 60
+        lines = [
+            "Current version:  " + str(current),
+            "",
+            "Automatic updates run daily at 04:05. The systemd timer pulls",
+            "the latest source from GitHub, refreshes Python dependencies,",
+            "and restarts the app — no operator action required.",
+            "",
+            "Timer status:  " + timer_status,
+            "Last update:   " + last_run,
+            "",
+            sep,
+            "Manual update (requires admin):",
+            "  sudo systemctl start vula-print-update.service",
+            "",
+            "View live logs:",
+            "  sudo tail -f /var/log/vula/app-update.log",
+            "  journalctl --user -u vula-print -f",
+            sep,
+            "Recent log tail:",
+            "",
+            last_result,
+        ]
+        body_text = chr(10).join(lines)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("App Updates")
+        dlg.setMinimumSize(640, 540)
+        dlg.setStyleSheet("background:" + self.C_BG + "; color:" + self.C_TEXT + ";")
+
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(18, 18, 18, 14)
+        layout.setSpacing(10)
+
+        heading = QLabel("Vula! Print — Update Status")
+        heading.setStyleSheet(
+            "color:" + self.C_TEXT + "; font-size:14px; font-weight:700;"
         )
-        if confirm != QMessageBox.StandardButton.Yes:
-            return
+        layout.addWidget(heading)
 
-        dialog = _UpdateDialog(
-            parent=self,
-            script_path=str(update_script),
-            color_bg=self.C_BG,
-            color_text=self.C_TEXT,
-            color_border=self.C_BORDER,
-            color_surface=self.C_SURFACE,
-            color_orange=self.C_ORANGE,
+        body = QTextEdit()
+        body.setReadOnly(True)
+        body.setPlainText(body_text)
+        body.setFont(QFont("Courier New", 10))
+        body.setStyleSheet(
+            "background:" + self.C_SURFACE + "; color:" + self.C_TEXT + ";"
+            "border:1px solid " + self.C_BORDER + "; border-radius:6px; padding:10px;"
         )
-        dialog.exec()
+        layout.addWidget(body, stretch=1)
 
-        # Refresh the version label after update
-        self.version_label.setText(self._current_version())
+        btn_row = QHBoxLayout()
+
+        copy_btn = QPushButton("Copy manual command")
+        copy_btn.setMinimumHeight(34)
+        copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        copy_btn.setStyleSheet(self._btn_secondary())
+
+        def _copy_cmd():
+            QApplication.clipboard().setText(
+                "sudo systemctl start vula-print-update.service"
+            )
+            copy_btn.setText("Copied")
+
+        copy_btn.clicked.connect(_copy_cmd)
+        btn_row.addWidget(copy_btn)
+        btn_row.addStretch()
+
+        close_btn = QPushButton("Close")
+        close_btn.setMinimumHeight(34)
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setStyleSheet(self._btn_primary())
+        close_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(close_btn)
+
+        layout.addLayout(btn_row)
+        dlg.exec()
