@@ -100,16 +100,32 @@ class ConfigMixin:
             self._set_connection_status(False)
 
     def ensure_onboarded(self):
-        """Fetch backend config for all connections when settings already exist."""
+        """First-run helper.
+
+        * If connections are configured, kick off config fetch.
+        * Otherwise, open the connections dialog once so the operator can
+          add their first store. Does not auto-reopen on subsequent ticks —
+          uses self._onboarding_offered as a one-shot guard.
+        """
         if self.active_connections:
             self.fetch_all_printer_configs(show_dialogs=False)
             return
 
         self._set_connection_status(False)
         self._update_pos_worker_status("Add a store connection first")
-        self.status_bar.showMessage(
-            "Add at least one store connection (sidebar) to configure backend URL and API key."
-        )
+
+        if getattr(self, "_onboarding_offered", False):
+            self.status_bar.showMessage(
+                "Add at least one store connection to begin."
+            )
+            return
+
+        self._onboarding_offered = True
+        self.status_bar.showMessage("Welcome — configure a store to get started.")
+
+        # Open the connections dialog. It handles its own save + refresh.
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(300, self.show_connections_dialog)
 
     def _headers_for(self, conn: StoreConnection, include_json: bool = False) -> Dict[str, str]:
         headers = {"X-Printer-API-Key": conn.api_key}

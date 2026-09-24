@@ -24,7 +24,7 @@ and end-of-day report printing across one or more store backends.
 Quick install on Debian 13 (Trixie):
 
     cd /path/to/Vula-Print
-    bash install_printer_app.sh
+    sudo bash install.sh
 
 The installer:
 1. Installs system dependencies (Python 3, PyQt6, pyserial, CUPS, git)
@@ -36,7 +36,7 @@ The installer:
 
 ### Updating
 
-    bash update.sh
+    sudo bash install.sh --phase=print_app
 
 ### Removing
 
