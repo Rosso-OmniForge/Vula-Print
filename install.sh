@@ -52,7 +52,12 @@ for arg in "$@"; do
         --apt-on-shutdown)  APT_ON_SHUTDOWN=1 ;;
         --allow-ssh)        ALLOW_SSH=1 ;;
         --help|-h)
-            sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+            # Print everything between the first two '═' header lines,
+            # stripping the leading '# ' from each line.
+            awk '
+                /^# ═{10,}/ { if (seen) exit; seen=1; next }
+                seen { sub(/^# ?/, ""); print }
+            ' "$0"
             exit 0
             ;;
         *)
@@ -68,7 +73,28 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
 
 LOG_FILE="/var/log/vula-install-$(date +%Y%m%d-%H%M%S).log"
 mkdir -p /var/log 2>/dev/null || true
-exec > >(tee -a "$LOG_FILE") 2>&1
+
+# ── Logging via re-exec ────────────────────────────────────────────
+# Do NOT use `exec > >(tee ...) 2>&1` here. That pattern leaves the
+# tee subprocess attached to the invoking shell's job table, so the
+# interactive prompt never returns after the script finishes.
+# Re-exec through a proper pipeline instead — it closes cleanly.
+if [ "${VULA_LOGGED:-0}" != "1" ]; then
+    export VULA_LOGGED=1
+    export VULA_ORIGINAL_LOG_FILE="$LOG_FILE"
+    # Resolve $0 to an absolute path — invoking shell was `sudo bash install.sh`
+    # so $0 is the relative string "install.sh", which is not a command.
+    VULA_SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+    export VULA_SELF
+    "$VULA_SELF" "$@" 2>&1 | tee -a "$LOG_FILE"
+    exit "${PIPESTATUS[0]}"
+fi
+
+# Child process: stdout is already going through the parent's tee.
+# Adopt the parent's LOG_FILE so summary output shows the right path.
+LOG_FILE="${VULA_ORIGINAL_LOG_FILE:-$LOG_FILE}"
+
+trap 'rc=$?; echo; echo "── Log saved to: $LOG_FILE ──"; exit $rc' EXIT
 
 section() { echo; echo -e "${BOLD}${CYAN}══ $* ══${NC}"; }
 info()    { echo -e "${CYAN}[*]${NC} $*"; }
@@ -250,6 +276,16 @@ phase_print_app() {
         return 1
     fi
 
+    _validate_url "$STORE_URL" || return 1
+    if ! echo "$API_KEY" | grep -qE '^vp_'; then
+        warn "API key does not start with 'vp_' — is that correct?"
+        if [ "$ASSUME_YES" != "1" ]; then
+            if ! ask_yn "  Continue anyway?" n; then
+                return 1
+            fi
+        fi
+    fi
+
     # Persist .env
     cat > "$env_file" <<ENV_EOF
 # Vula! Print runtime environment — managed by install.sh
@@ -343,6 +379,11 @@ phase_firefox() {
         fi
         read -rp "${CYAN}[?]${NC} Store URL to set as Firefox homepage: " STORE_URL
         [ -z "$STORE_URL" ] && { warn "Empty URL — skipping."; return 0; }
+    fi
+
+    if ! _validate_url "$STORE_URL"; then
+        warn "Skipping Firefox homepage policy due to invalid URL."
+        return 0
     fi
 
     info "Writing Firefox enterprise policies..."
@@ -760,6 +801,20 @@ APPUPTIMER_EOF
 # ════════════════════════════════════════════════════════════════
 # PHASE RUNNER
 # ════════════════════════════════════════════════════════════════
+_validate_url() {
+    local url="${1:-}"
+    if [ -z "$url" ]; then
+        err "URL is empty."
+        return 1
+    fi
+    if ! echo "$url" | grep -qE '^https?://[^[:space:]]+'; then
+        err "Invalid URL: '$url'"
+        err "  Must start with http:// or https://"
+        return 1
+    fi
+    return 0
+}
+
 run_phase() {
     local key="$1"
     local name="$2"
