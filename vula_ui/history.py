@@ -171,7 +171,7 @@ class HistoryMixin:
         self.progress_bar.setValue(0)
         self.print_job = PrintJob(self.selected_printer, items)
         self.print_job.progress.connect(self.on_print_progress)
-        self.print_job.finished.connect(
+        self.print_job.completed.connect(
             lambda s, m: self._on_reprint_finished(s, m, request_id)
         )
         self.print_job.start()

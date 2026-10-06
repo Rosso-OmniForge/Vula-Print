@@ -300,11 +300,12 @@ class PrintersTabMixin:
             self._discovered_list.addItem(item)
             return
 
+        from vula_device_io import describe_device
         marker = {"online": "●", "permission": "◐", "offline": "○"}
         for dev in devices:
             status = self._probe_device(dev)
             glyph = marker.get(status, "?")
-            item = QListWidgetItem(f"  {glyph}   {dev}")
+            item = QListWidgetItem(f"  {glyph}   {describe_device(dev)}")
             self._discovered_list.addItem(item)
 
     # ── Role assignment dialog ──────────────────────────────────
@@ -353,9 +354,10 @@ class PrintersTabMixin:
                 color:{self.C_ORANGE};
             }}
         """)
+        from vula_device_io import describe_device
         device_list.addItem(QListWidgetItem("—  None (unassign this role)"))
         for dev in (self.discovered_printers or []):
-            device_list.addItem(QListWidgetItem(f"   {dev}"))
+            device_list.addItem(QListWidgetItem(f"   {describe_device(dev)}"))
         layout.addWidget(device_list, stretch=1)
 
         if current and current in (self.discovered_printers or []):
@@ -388,6 +390,18 @@ class PrintersTabMixin:
         elif role_key == "pos_slip":
             self.last_selected_pos_printer = chosen
             self.pos_selected_printer = chosen
+
+        # Record the stable fingerprint so we can re-resolve this role after
+        # a reboot re-enumerates /dev/usb/lpN in a different order.
+        if not getattr(self, "printer_role_fingerprints", None):
+            self.printer_role_fingerprints = {}
+        if chosen:
+            from vula_device_io import fingerprint_for_path
+            fp = fingerprint_for_path(chosen)
+            if fp:
+                self.printer_role_fingerprints[role_key] = fp
+        else:
+            self.printer_role_fingerprints.pop(role_key, None)
 
         self.save_settings()
         self._refresh_printer_status()

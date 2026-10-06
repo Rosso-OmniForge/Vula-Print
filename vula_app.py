@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import QMainWindow
 
 from vula_config import APP_CONFIG_FILE, APP_HISTORY_FILE, API_BASE_URL, API_KEY
 from vula_http import HttpWorker
+from vula_log_uploader import LogUploadCoordinator
 from vula_workers import (
     POSPollWorker, POSEODReportPrintJob, POSSlipPrintJob, PrintJob,
 )
@@ -89,6 +90,8 @@ class VulaPrintApp(
         # Config-fetch cycle state (see fetch_all_printer_configs).
         self._config_fetch_pending: int = 0
         self._config_fetch_show_dialogs: bool = False
+        # Log-upload coordinator — batches log uploads across all stores.
+        self._log_uploader = LogUploadCoordinator(self)
         # Label-queue fetch cycle state (see fetch_pending_requests).
         self._pending_fetch_pending: int = 0
         self._pending_fetch_accum: List[Dict[str, Any]] = []
@@ -120,3 +123,15 @@ class VulaPrintApp(
         # Auto-scan for printers on startup
         self.scan_for_printers()
         QTimer.singleShot(500, self.ensure_onboarded)
+
+        # Log upload cadence:
+        #   * 45 s after startup (let the config fetch settle first)
+        #   * every 6 hours thereafter
+        # Uploads are best-effort; if the backend doesn't have the endpoint
+        # yet, the coordinator suppresses retries for 24 h and logs once.
+        QTimer.singleShot(45_000, lambda: self._log_uploader.upload_async("startup"))
+        self._log_upload_timer = QTimer()
+        self._log_upload_timer.timeout.connect(
+            lambda: self._log_uploader.upload_async("periodic")
+        )
+        self._log_upload_timer.start(6 * 60 * 60 * 1000)

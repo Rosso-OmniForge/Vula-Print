@@ -94,7 +94,7 @@ class ActionsMixin:
 
             self.print_job = PrintJob(self.selected_printer, items)
             self.print_job.progress.connect(self.on_print_progress)
-            self.print_job.finished.connect(
+            self.print_job.completed.connect(
                 lambda s, m: self.on_print_finished(s, m, request['id'], conn.connection_id)
             )
             self.print_job.start()
@@ -186,7 +186,7 @@ class ActionsMixin:
         }
 
         self.calibration_job = PrintJob(self.selected_printer, [test_item])
-        self.calibration_job.finished.connect(self.on_test_print_finished)
+        self.calibration_job.completed.connect(self.on_test_print_finished)
         self.calibration_job.start()
 
     def on_test_print_finished(self, success: bool, message: str):
@@ -249,7 +249,7 @@ class ActionsMixin:
             return
 
         job = PrintJob(self.selected_printer, [test_item])
-        job.finished.connect(self._on_test_label_standalone_finished)
+        job.completed.connect(self._on_test_label_standalone_finished)
         self.status_bar.showMessage("Printing test label…")
         job.start()
         # Keep a reference so it isn't GC'd
@@ -350,7 +350,7 @@ class ActionsMixin:
             qr_mode=self.pos_qr_mode,
             qr_module_px=self.pos_qr_module_px,
         )
-        self.pos_print_job.finished.connect(self._on_test_pos_finished)
+        self.pos_print_job.completed.connect(self._on_test_pos_finished)
         self.pos_print_job.start()
         self.status_bar.showMessage("Printing sample POS slip...")
 

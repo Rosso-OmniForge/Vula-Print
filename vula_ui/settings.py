@@ -103,8 +103,13 @@ class SettingsMixin:
             self.pos_qr_mode = str(data.get("pos_qr_mode", "raster") or "raster")
             self.pos_qr_module_px = int(data.get("pos_qr_module_px", 4) or 4)
             self.serial_config = data.get("serial_config") or {}
+            self.printer_role_fingerprints = data.get("printer_role_fingerprints") or {}
         except Exception as e:
             print(f"Warning: failed to load settings: {e}")
+
+        # Always ensure the fingerprint map exists, even if load failed.
+        if not getattr(self, "printer_role_fingerprints", None):
+            self.printer_role_fingerprints = {}
 
         self._apply_default_connection_if_empty()
 
@@ -141,6 +146,9 @@ class SettingsMixin:
                     "label": self.last_selected_printer,
                     "pos_slip": self.last_selected_pos_printer,
                 },
+                "printer_role_fingerprints": dict(
+                    getattr(self, "printer_role_fingerprints", {}) or {}
+                ),
             }
             with open(APP_CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)

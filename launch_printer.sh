@@ -4,7 +4,7 @@
 #
 # Runs from a terminal or from systemd. Handles:
 #   * .env loading (backend credentials)
-#   * Display environment (X11 / Wayland) when systemd hasn't set it
+#   * Display environment (forces X11; never Wayland)
 #   * DBus session bus propagation (so Qt dialogs work)
 #   * venv sanity check
 #   * Singleton lock check (fast fail before forking Python)
@@ -24,15 +24,16 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
     set +a
 fi
 
-# ── Display environment ──────────────────────────────────────────
-if [ -z "$DISPLAY" ] && [ -z "$WAYLAND_DISPLAY" ]; then
-    WAYLAND_SOCK=$(ls /run/user/"$(id -u)"/wayland-* 2>/dev/null | head -1)
-    if [ -n "$WAYLAND_SOCK" ]; then
-        export WAYLAND_DISPLAY="$(basename "$WAYLAND_SOCK")"
-    else
-        X_DISPLAY=$(ls /tmp/.X11-unix/X* 2>/dev/null | head -1 | sed 's|/tmp/.X11-unix/X|:|')
-        export DISPLAY="${X_DISPLAY:-:0}"
-    fi
+# ── Display environment — X11 ONLY ───────────────────────────────
+# This device is provisioned X11-only. AnyDesk's unattended access is
+# not reliable on Wayland, and the printer UI's Qt backend is best
+# tested on XCB. Do NOT fall back to Wayland even if a socket exists.
+unset WAYLAND_DISPLAY
+export XDG_SESSION_TYPE=x11
+export QT_QPA_PLATFORM=xcb
+if [ -z "$DISPLAY" ]; then
+    X_DISPLAY=$(ls /tmp/.X11-unix/X* 2>/dev/null | head -1 | sed 's|/tmp/.X11-unix/X|:|')
+    export DISPLAY="${X_DISPLAY:-:0}"
 fi
 
 # Propagate session bus so Qt dialogs work correctly

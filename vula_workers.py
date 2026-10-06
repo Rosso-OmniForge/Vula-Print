@@ -71,8 +71,8 @@ class PrinterScanner(QThread):
 class PrintJob(QThread):
     """Background thread for printing labels."""
 
-    progress = pyqtSignal(int, int)  # current, total
-    finished = pyqtSignal(bool, str)  # success, message
+    progress = pyqtSignal(int, int)      # current, total
+    completed = pyqtSignal(bool, str)    # success, message
 
     def __init__(self, printer_device: str, items: List[Dict[str, Any]]):
         super().__init__()
@@ -80,6 +80,11 @@ class PrintJob(QThread):
         self.items = items
         self.label_width_dots = 320
         self.horizontal_shift_dots = 16
+        # Qt-idiomatic teardown. QThread.finished is the built-in 0-arg signal;
+        # deleteLater is scheduled on the main-thread event loop AFTER the
+        # C++ QThread has fully unwound. Without this, Python GC can destroy
+        # the QThread while it's still running → SIGABRT.
+        self.finished.connect(self.deleteLater)
 
     def _tspl_escape(self, s: str) -> str:
         """Escape a string for TSPL commands."""
@@ -194,28 +199,43 @@ class PrintJob(QThread):
         return "\n".join(tspl) + "\n"
 
     def run(self):
-        """Execute print job."""
+        """Execute print job.
+
+        Per-item failures do NOT abort the whole job. Instead they are
+        collected and reported in the final message; the job is marked
+        failed only if at least one label could not be rendered or written.
+        This preserves partial-queue progress when one item has bad data.
+        """
         log = logging.getLogger("vula.print")
         import time as _t
         _t0 = _t.monotonic()
+        failures: List[str] = []
+        printed = 0
+        total = 0
         try:
-            total = sum(item.get("qty_to_print", 0) for item in self.items)
-            current = 0
+            total = sum(int(item.get("qty_to_print", 0) or 0) for item in self.items)
             log.info("PrintJob start: %d items / %d labels -> %s",
                      len(self.items), total, self.printer_device)
 
             for item in self.items:
-                qty = item.get("qty_to_print", 0)
+                qty = int(item.get("qty_to_print", 0) or 0)
 
                 for i in range(qty):
-                    # Generate label
-                    tspl = self._generate_label_tspl(item)
+                    # Render — a bad item must not kill the batch.
+                    try:
+                        tspl = self._generate_label_tspl(item)
+                    except Exception as e:
+                        sku = item.get("sku") or item.get("title") or "?"
+                        failures.append(f"{sku}: render failed ({e})")
+                        log.error("PrintJob render failed for %s: %s", sku, e)
+                        continue
 
-                    # Send to printer
+                    # Write — permission errors abort cleanly; other I/O
+                    # errors are recorded but the batch continues.
                     try:
                         write_to_device(self.printer_device, tspl.encode('utf-8'))
                     except PermissionError:
-                        self.finished.emit(
+                        self.completed.emit(
                             False,
                             f"Permission denied: cannot write to {self.printer_device}.\n\n"
                             f"The printer device requires the user to be in the 'lp' group.\n"
@@ -224,22 +244,34 @@ class PrintJob(QThread):
                         )
                         return
                     except Exception as e:
-                        self.finished.emit(False, f"Printer error: {e}")
-                        return
+                        sku = item.get("sku") or item.get("title") or "?"
+                        failures.append(f"{sku}: write failed ({e})")
+                        log.error("PrintJob write failed for %s: %s", sku, e)
+                        continue
 
-                    current += 1
-                    self.progress.emit(current, total)
+                    printed += 1
+                    self.progress.emit(printed, total)
 
                     # Small delay between labels
                     time.sleep(0.2)
 
             elapsed = _t.monotonic() - _t0
-            log.info("PrintJob done: %d/%d labels in %.2fs",
-                     current, total, elapsed)
-            self.finished.emit(True, f"Successfully printed {total} labels")
+            log.info("PrintJob done: %d/%d labels in %.2fs (failures=%d)",
+                     printed, total, elapsed, len(failures))
+
+            if failures:
+                summary = (f"Printed {printed}/{total} labels. "
+                           f"{len(failures)} item(s) skipped:\n  - " +
+                           "\n  - ".join(failures[:8]))
+                if len(failures) > 8:
+                    summary += f"\n  … and {len(failures) - 8} more."
+                self.completed.emit(False, summary)
+            else:
+                self.completed.emit(True, f"Successfully printed {total} labels")
 
         except Exception as e:
-            self.finished.emit(False, f"Print job failed: {e}")
+            log.exception("PrintJob crashed")
+            self.completed.emit(False, f"Print job failed: {e}")
 
 
 class POSSlipPrintJob(QThread):
@@ -258,7 +290,7 @@ class POSSlipPrintJob(QThread):
         qr_module_px:    Pixels per QR module for raster mode.
     """
 
-    finished = pyqtSignal(bool, str)
+    completed = pyqtSignal(bool, str)
 
     def __init__(
         self,
@@ -275,6 +307,7 @@ class POSSlipPrintJob(QThread):
         self.width_chars = int(width_chars)
         self.qr_mode = str(qr_mode).lower()
         self.qr_module_px = int(qr_module_px)
+        self.finished.connect(self.deleteLater)
 
     # ── Formatting helpers ─────────────────────────────────────────────
 
@@ -575,7 +608,7 @@ class POSSlipPrintJob(QThread):
             try:
                 write_to_device(self.printer_device, payload)
             except PermissionError:
-                self.finished.emit(
+                self.completed.emit(
                     False,
                     f"Permission denied: cannot write to {self.printer_device}.\n\n"
                     f"Add the user to the 'lp' group:\n"
@@ -583,24 +616,27 @@ class POSSlipPrintJob(QThread):
                 )
                 return
             except Exception as e:
-                self.finished.emit(False, f"POS printer error: {e}")
+                self.completed.emit(False, f"POS printer error: {e}")
                 return
 
             elapsed = _t.monotonic() - _t0
             log.info("POSSlip done in %.2fs", elapsed)
-            self.finished.emit(True, "POS slip printed successfully")
+            self.completed.emit(True, "POS slip printed successfully")
         except Exception as e:
-            self.finished.emit(False, f"POS slip print failed: {e}")
+            log.exception("POSSlip crashed")
+            self.completed.emit(False, f"POS slip print failed: {e}")
+
 
 class POSEODReportPrintJob(QThread):
     """Background thread for printing receipt-width POS EOD reports (ESC/POS)."""
 
-    finished = pyqtSignal(bool, str)
+    completed = pyqtSignal(bool, str)
 
     def __init__(self, printer_device: str, detail_payload: Dict[str, Any]):
         super().__init__()
         self.printer_device = printer_device
         self.detail_payload = detail_payload
+        self.finished.connect(self.deleteLater)
 
     @staticmethod
     def _cents_to_amount(cents: int) -> str:
@@ -681,12 +717,21 @@ class POSEODReportPrintJob(QThread):
         return bytes(out)
 
     def run(self):
+        # ── CRITICAL: define log + _t0 here. Their absence was the root
+        # cause of the EOD reprint loop: the NameError on the line after
+        # write_to_device() was caught by the outer except, and the job
+        # always reported failure, so the backend never saw a completion
+        # and the client kept re-fetching the same EOD report.
+        log = logging.getLogger("vula.print")
+        import time as _t
+        _t0 = _t.monotonic()
         try:
             payload = self._build_receipt_bytes()
+            log.info("POSEOD: %db -> %s", len(payload), self.printer_device)
             try:
                 write_to_device(self.printer_device, payload)
             except PermissionError:
-                self.finished.emit(
+                self.completed.emit(
                     False,
                     f"Permission denied: cannot write to {self.printer_device}.\n\n"
                     f"The printer device requires the user to be in the 'lp' group.\n"
@@ -695,14 +740,15 @@ class POSEODReportPrintJob(QThread):
                 )
                 return
             except Exception as e:
-                self.finished.emit(False, f"POS EOD printer error: {e}")
+                self.completed.emit(False, f"POS EOD printer error: {e}")
                 return
 
             elapsed = _t.monotonic() - _t0
             log.info("EOD report done in %.2fs", elapsed)
-            self.finished.emit(True, "POS EOD report printed successfully")
+            self.completed.emit(True, "POS EOD report printed successfully")
         except Exception as e:
-            self.finished.emit(False, f"POS EOD print failed: {e}")
+            log.exception("POSEOD crashed")
+            self.completed.emit(False, f"POS EOD print failed: {e}")
 
 
 class POSPollWorker(QThread):
@@ -743,6 +789,7 @@ class POSPollWorker(QThread):
         self._user_id = user_id
         self._in_flight_ids = in_flight_ids
         self._eod_in_flight_ids = eod_in_flight_ids
+        self.finished.connect(self.deleteLater)
 
     def _headers(self) -> Dict[str, str]:
         headers = {"X-Printer-API-Key": self._api_key}
@@ -884,6 +931,7 @@ class _RetryFlushWorker(QThread):
         #   (connection_id, api_base, api_key, user_id, kind, request_id)
         super().__init__(parent)
         self._tasks = list(tasks)
+        self.finished.connect(self.deleteLater)
 
     def run(self):
         done = []

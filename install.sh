@@ -2,20 +2,26 @@
 # ════════════════════════════════════════════════════════════════
 # Vula! Print — single-command installer
 #
-# Phases:
-#   1. system     — apt update/upgrade, firmware, base tools
-#   2. print_app  — venv, python deps, systemd user service
-#   3. firefox    — homepage policy for the POS store URL
+# Phases (in execution order):
+#   1. preflight  — Debian version, apt keyring, NTP sanity
+#   2. system     — apt update/upgrade, firmware, base tools
+#   3. display    — enforce X11 (required for AnyDesk unattended access)
 #   4. security   — ufw, clamav, quad9 filtered DNS + probe
-#   5. updater    — daily apt upgrade + daily git pull timers
+#   5. print_app  — venv, python deps, systemd user service, device ID
+#   6. anydesk    — install, unattended password, UFW rules, handshake
+#   7. firefox    — homepage policy + default browser
+#   8. updater    — daily apt upgrade + daily git pull timers
 #
 # Usage:
 #   sudo bash install.sh                    # everything, interactive
 #   sudo bash install.sh --dry-run          # show what would happen
-#   sudo bash install.sh --phase=system     # one phase only
+#   sudo bash install.sh --phase=anydesk    # one phase only
 #   sudo bash install.sh --yes              # non-interactive
-#   sudo bash install.sh --store-url=https://... --api-key=vp_...
-#   sudo bash install.sh --no-ufw --no-clamav --no-dns
+#   sudo bash install.sh \
+#       --api-url=https://api.example.co.za \
+#       --api-key=vp_... \
+#       --store-url=https://store.example.co.za
+#   sudo bash install.sh --no-ufw --no-clamav --no-dns --no-anydesk
 #   sudo bash install.sh --apt-on-shutdown  # also upgrade on shutdown
 #
 # Full log: /var/log/vula-install-<timestamp>.log
@@ -28,11 +34,13 @@ DRY_RUN=0
 ASSUME_YES=0
 PHASES_TO_RUN=""
 STORE_URL=""
+API_URL=""
 API_KEY=""
 SKIP_UFW=0
 SKIP_CLAMAV=0
 SKIP_DNS=0
 SKIP_FIREFOX=0
+SKIP_ANYDESK=0
 SKIP_UPDATER=0
 APT_ON_SHUTDOWN=0
 ALLOW_SSH=0
@@ -43,17 +51,17 @@ for arg in "$@"; do
         --yes|-y)           ASSUME_YES=1 ;;
         --phase=*)          PHASES_TO_RUN="${arg#--phase=}" ;;
         --store-url=*)      STORE_URL="${arg#--store-url=}" ;;
+        --api-url=*)        API_URL="${arg#--api-url=}" ;;
         --api-key=*)        API_KEY="${arg#--api-key=}" ;;
         --no-ufw)           SKIP_UFW=1 ;;
         --no-clamav)        SKIP_CLAMAV=1 ;;
         --no-dns)           SKIP_DNS=1 ;;
         --no-firefox)       SKIP_FIREFOX=1 ;;
+        --no-anydesk)       SKIP_ANYDESK=1 ;;
         --no-updater)       SKIP_UPDATER=1 ;;
         --apt-on-shutdown)  APT_ON_SHUTDOWN=1 ;;
         --allow-ssh)        ALLOW_SSH=1 ;;
         --help|-h)
-            # Print everything between the first two '═' header lines,
-            # stripping the leading '# ' from each line.
             awk '
                 /^# ═{10,}/ { if (seen) exit; seen=1; next }
                 seen { sub(/^# ?/, ""); print }
@@ -96,9 +104,10 @@ LOG_FILE="${VULA_ORIGINAL_LOG_FILE:-$LOG_FILE}"
 
 trap 'rc=$?; echo; echo "── Log saved to: $LOG_FILE ──"; exit $rc' EXIT
 
+# ── Helpers ──────────────────────────────────────────────────────
 section() { echo; echo -e "${BOLD}${CYAN}══ $* ══${NC}"; }
 info()    { echo -e "${CYAN}[*]${NC} $*"; }
-ok()      { echo -e "${GREEN}[+]${NC} $*"; }
+ok()      { echo -e "${GREEN}[+ ]${NC} $*"; }
 warn()    { echo -e "${YELLOW}[!]${NC} $*"; }
 err()     { echo -e "${RED}[-]${NC} $*"; }
 dim()     { echo -e "${DIM}    $*${NC}"; }
@@ -124,6 +133,36 @@ ask_yn() {
     [[ "${reply,,}" == "y" ]]
 }
 
+_validate_url() {
+    local url="${1:-}"
+    if [ -z "$url" ]; then
+        err "URL is empty."
+        return 1
+    fi
+    if ! echo "$url" | grep -qE '^https?://[^[:space:]]+'; then
+        err "Invalid URL: '$url'"
+        err "  Must start with http:// or https://"
+        return 1
+    fi
+    return 0
+}
+
+# ── Validate --phase value early (before anything else runs) ─────
+if [ -n "$PHASES_TO_RUN" ]; then
+    _VALID_PHASES=" preflight system display security print_app anydesk firefox updater "
+    IFS=',' read -ra _REQUESTED_PHASES <<< "$PHASES_TO_RUN"
+    for _req in "${_REQUESTED_PHASES[@]}"; do
+        _req="${_req// /}"
+        [ -z "$_req" ] && continue
+        if [[ "$_VALID_PHASES" != *" $_req "* ]]; then
+            echo "Unknown phase in --phase='$PHASES_TO_RUN': '$_req'" >&2
+            echo "Valid phases: preflight system display security print_app anydesk firefox updater" >&2
+            exit 1
+        fi
+    done
+    unset _VALID_PHASES _REQUESTED_PHASES _req
+fi
+
 # ── Root + real-user detection ───────────────────────────────────
 if [ "$EUID" -ne 0 ]; then
     err "Run as root: sudo bash $0"
@@ -133,7 +172,6 @@ fi
 if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
     REAL_USER="$SUDO_USER"
 else
-    # Fall back: ask which user the app should run as
     read -rp "${CYAN}[?]${NC} Username to run Vula Print as: " REAL_USER
 fi
 
@@ -168,14 +206,68 @@ echo "  Dry run    : $([ "$DRY_RUN" = 1 ] && echo yes || echo no)"
 echo
 
 # ════════════════════════════════════════════════════════════════
-# PHASE 1 — SYSTEM
+# PHASE 1 — PREFLIGHT
+# ════════════════════════════════════════════════════════════════
+phase_preflight() {
+    info "Verifying Debian release..."
+    if [ ! -f /etc/debian_version ]; then
+        err "Not a Debian system (/etc/debian_version missing)."
+        return 1
+    fi
+    local codename
+    codename=$(cat /etc/debian_version | cut -d. -f1)
+    case "$codename" in
+        13|trixie) ok "Debian 13 (Trixie) confirmed." ;;
+        *) warn "Expected Trixie, found '$codename' — continuing anyway." ;;
+    esac
+
+    info "Verifying APT archive keyring..."
+    if [ ! -f /usr/share/keyrings/debian-archive-keyring.gpg ]; then
+        DEBIAN_FRONTEND=noninteractive run apt-get update -qq || return 1
+        DEBIAN_FRONTEND=noninteractive run apt-get install -y debian-archive-keyring || return 1
+    fi
+    ok "APT archive keyring present."
+
+    info "Checking for hardware clock / timezone sanity..."
+    if ! timedatectl show --property=NTPSynchronized --value 2>/dev/null | grep -q yes; then
+        warn "Clock is not NTP-synchronised. HTTPS handshakes may fail."
+        warn "  Fix: timedatectl set-ntp true"
+    fi
+
+    ok "Preflight complete."
+    return 0
+}
+
+# ════════════════════════════════════════════════════════════════
+# PHASE 2 — SYSTEM
 # ════════════════════════════════════════════════════════════════
 phase_system() {
     info "Refreshing apt sources..."
 
-    # Rewrite sources.list only if it looks like stock Debian 12 or older
-    if grep -qE '^deb .* bookworm|^deb .* bullseye|^deb .* buster' /etc/apt/sources.list 2>/dev/null; then
-        info "Old release detected in sources.list — rewriting for Trixie."
+    # Trixie can be expressed in two layouts:
+    #   * legacy  /etc/apt/sources.list         (one-liner format)
+    #   * deb822  /etc/apt/sources.list.d/*.sources
+    # A clean Debian 13 netinst ships deb822. An upgraded box may still
+    # have the legacy file. Handle both.
+    if [ -f /etc/apt/sources.list.d/debian.sources ]; then
+        info "deb822 layout detected — rewriting debian.sources for Trixie."
+        cat > /etc/apt/sources.list.d/debian.sources <<'DEB822_EOF'
+Types: deb deb-src
+URIs: http://deb.debian.org/debian/
+Suites: trixie trixie-updates
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+
+Types: deb deb-src
+URIs: http://security.debian.org/debian-security/
+Suites: trixie-security
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+DEB822_EOF
+        : > /etc/apt/sources.list
+        ok "debian.sources rewritten (legacy sources.list blanked)."
+    elif grep -qE '^deb .* (bookworm|bullseye|buster)' /etc/apt/sources.list 2>/dev/null; then
+        info "Legacy layout, old release — rewriting sources.list for Trixie."
         cat > /etc/apt/sources.list <<'SRCLIST_EOF'
 # Debian 13 Trixie — managed by vula install.sh
 deb     http://deb.debian.org/debian/            trixie          main contrib non-free non-free-firmware
@@ -186,8 +278,15 @@ deb     http://deb.debian.org/debian/            trixie-updates  main contrib no
 deb-src http://deb.debian.org/debian/            trixie-updates  main contrib non-free non-free-firmware
 SRCLIST_EOF
         ok "sources.list rewritten."
+    elif grep -qE '^deb .* trixie' /etc/apt/sources.list 2>/dev/null; then
+        ok "sources.list already on Trixie — leaving untouched."
     else
-        ok "sources.list already correct — leaving untouched."
+        warn "Could not identify apt sources layout — leaving untouched."
+        warn "  Verify manually: cat /etc/apt/sources.list /etc/apt/sources.list.d/*"
+    fi
+
+    if [ ! -f /usr/share/keyrings/debian-archive-keyring.gpg ]; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y debian-archive-keyring || return 1
     fi
 
     run apt-get update -qq || return 1
@@ -243,177 +342,84 @@ UDEV_EOF
 }
 
 # ════════════════════════════════════════════════════════════════
-# PHASE 2 — PRINT APP
+# PHASE 3 — X11 ENFORCEMENT
 # ════════════════════════════════════════════════════════════════
-phase_print_app() {
-    # ── Collect credentials ─────────────────────────────────────
-    local env_file="$SCRIPT_DIR/.env"
+phase_display() {
+    section "Display — enforce X11"
 
-    if [ -z "$API_KEY" ] && [ -f "$env_file" ]; then
-        API_KEY=$(grep -E '^PRINTER_API_KEY=' "$env_file" | tail -1 | cut -d= -f2-)
-        [ -n "$API_KEY" ] && info "Using existing API key from .env"
+    # 1. Move Wayland session files aside. This is the DM-agnostic way:
+    #    GDM3, SDDM, and LightDM all read /usr/share/wayland-sessions/.
+    if [ -d /usr/share/wayland-sessions ] && \
+       ls /usr/share/wayland-sessions/*.desktop &>/dev/null; then
+        info "Disabling Wayland session files..."
+        mkdir -p /var/lib/vula/disabled-wayland-sessions
+        mv /usr/share/wayland-sessions/*.desktop \
+           /var/lib/vula/disabled-wayland-sessions/ 2>/dev/null || true
+        ok "Wayland sessions disabled."
+    else
+        dim "  No Wayland sessions found (already disabled or not installed)."
     fi
 
-    if [ -z "$STORE_URL" ]; then
-        if [ "$ASSUME_YES" = "1" ]; then
-            err "No --store-url provided and --yes was set."
-            return 1
-        fi
-        read -rp "${CYAN}[?]${NC} Vula backend URL (e.g. https://shop.example.co.za): " STORE_URL
+    # 2. SDDM does not have a "force X11" config key. Its session list is
+    #    built purely from /usr/share/xsessions/ + /usr/share/wayland-sessions/.
+    #    Removing the Wayland session files above is sufficient.
+    if command -v sddm >/dev/null 2>&1; then
+        ok "SDDM detected — X11-only enforced via removed Wayland sessions."
     fi
 
-    if [ -z "$API_KEY" ]; then
-        if [ "$ASSUME_YES" = "1" ]; then
-            err "No --api-key provided and --yes was set."
-            return 1
-        fi
-        read -rsp "${CYAN}[?]${NC} Printer API key (vp_...): " API_KEY
-        echo
-    fi
-
-    if [ -z "$STORE_URL" ] || [ -z "$API_KEY" ]; then
-        err "Both STORE_URL and API_KEY are required."
-        return 1
-    fi
-
-    _validate_url "$STORE_URL" || return 1
-    if ! echo "$API_KEY" | grep -qE '^vp_'; then
-        warn "API key does not start with 'vp_' — is that correct?"
-        if [ "$ASSUME_YES" != "1" ]; then
-            if ! ask_yn "  Continue anyway?" n; then
-                return 1
+    # 3. GDM3
+    if [ -d /etc/gdm3 ]; then
+        for f in /etc/gdm3/daemon.conf /etc/gdm3/custom.conf; do
+            [ -f "$f" ] || continue
+            if grep -qE '^#?\s*WaylandEnable' "$f"; then
+                sed -i 's/^#\?\s*WaylandEnable=.*/WaylandEnable=false/' "$f"
+            elif grep -q '^\[daemon\]' "$f"; then
+                sed -i '/^\[daemon\]/a WaylandEnable=false' "$f"
+            else
+                printf '\n[daemon]\nWaylandEnable=false\n' >> "$f"
             fi
-        fi
+        done
+        ok "GDM3 pinned to X11."
     fi
 
-    # Persist .env
-    cat > "$env_file" <<ENV_EOF
-# Vula! Print runtime environment — managed by install.sh
-PRINTER_API_BASE_URL=$STORE_URL
-PRINTER_API_KEY=$API_KEY
-ENV_EOF
-    chmod 600 "$env_file"
-    chown "$REAL_USER":"$REAL_USER" "$env_file"
-    ok "Credentials saved to $env_file"
+    # 4. LightDM
+    if [ -f /etc/lightdm/lightdm.conf ]; then
+        if grep -q '^\[Seat:\*\]' /etc/lightdm/lightdm.conf; then
+            grep -q 'xserver-command' /etc/lightdm/lightdm.conf || \
+                sed -i '/^\[Seat:\*\]/a xserver-command=X -core' /etc/lightdm/lightdm.conf
+        fi
+        ok "LightDM pinned to X11."
+    fi
 
-    # ── venv ────────────────────────────────────────────────────
-    if [ -d "$SCRIPT_DIR/venv" ]; then
-        info "Existing venv found — reusing."
+    # 5. Belt-and-braces: strip a stray WAYLAND_DISPLAY from login shells.
+    #
+    # NOTE: we deliberately do NOT export XDG_SESSION_TYPE=x11 here.
+    # That variable is set by the display manager; overriding it in a
+    # login shell (which includes SSH sessions with no X server) causes
+    # more confusion than it prevents. The DM-level enforcement above is
+    # the real fix; this profile.d file only removes the Wayland pointer
+    # if someone lands in a shell that somehow inherited one.
+    cat > /etc/profile.d/90-vula-x11.sh <<'PROFILE_EOF'
+# Vula — this device is provisioned X11-only for AnyDesk unattended
+# access. If a stray Wayland socket is present, ignore it.
+if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -z "${DISPLAY:-}" ]; then
+    unset WAYLAND_DISPLAY
+fi
+PROFILE_EOF
+    chmod 644 /etc/profile.d/90-vula-x11.sh
+
+    # 6. Report whether a reboot is pending.
+    local cur="" sid
+    sid=$(loginctl --no-legend list-sessions 2>/dev/null | awk '/seat/{print $1; exit}')
+    [ -n "$sid" ] && cur=$(loginctl show-session "$sid" -p Type --value 2>/dev/null || echo "")
+    if [ "$cur" = "wayland" ]; then
+        warn "Active session is STILL Wayland — a reboot is REQUIRED"
+        warn "before AnyDesk will work. Rebooting now is recommended."
+        mkdir -p /var/lib
+        touch /var/lib/vula-needs-reboot
     else
-        info "Creating venv..."
-        run as_user python3 -m venv --system-site-packages "$SCRIPT_DIR/venv" || return 1
-        ok "venv created."
+        ok "Active session type: ${cur:-unknown} (X11 enforcement in place)."
     fi
-
-    info "Installing Python dependencies..."
-    run as_user "$SCRIPT_DIR/venv/bin/pip" install --quiet -r "$SCRIPT_DIR/requirements_app.txt" || return 1
-    ok "Python packages installed."
-
-    # ── systemd user service ────────────────────────────────────
-    local svc_file="$REAL_HOME/.config/systemd/user/vula-print.service"
-    as_user mkdir -p "$REAL_HOME/.config/systemd/user"
-
-    cat > "$svc_file" <<SVC_EOF
-[Unit]
-Description=Vula! Print Label Printer
-After=graphical-session.target network-online.target
-Wants=graphical-session.target
-
-[Service]
-Type=simple
-WorkingDirectory=$SCRIPT_DIR
-ExecStartPre=/bin/sleep 2
-ExecStart=$SCRIPT_DIR/launch_printer.sh
-Restart=on-failure
-RestartSec=15
-StartLimitIntervalSec=300
-StartLimitBurst=3
-KillMode=mixed
-KillSignal=SIGTERM
-TimeoutStopSec=10
-
-[Install]
-WantedBy=graphical-session.target
-SVC_EOF
-    chown "$REAL_USER":"$REAL_USER" "$svc_file"
-    ok "Service file written."
-
-    run loginctl enable-linger "$REAL_USER" >/dev/null 2>&1 || \
-        warn "Could not enable linger (systemd too old?)"
-
-    as_user systemctl --user daemon-reload
-    as_user systemctl --user enable vula-print.service >/dev/null 2>&1
-    as_user systemctl --user restart vula-print.service >/dev/null 2>&1 || true
-
-    sleep 2
-    if as_user systemctl --user is-active --quiet vula-print.service; then
-        ok "vula-print.service is running."
-    else
-        warn "vula-print.service is not yet active — will start on next login."
-    fi
-
-    return 0
-}
-
-# ════════════════════════════════════════════════════════════════
-# PHASE 3 — FIREFOX
-# ════════════════════════════════════════════════════════════════
-phase_firefox() {
-    if [ "$SKIP_FIREFOX" = "1" ]; then
-        info "Firefox phase skipped (--no-firefox)."
-        return 0
-    fi
-
-    if [ -z "$STORE_URL" ]; then
-        if [ -n "${PRINTER_API_BASE_URL:-}" ]; then
-            STORE_URL="$PRINTER_API_BASE_URL"
-        elif [ -f "$SCRIPT_DIR/.env" ]; then
-            STORE_URL=$(grep -E '^PRINTER_API_BASE_URL=' "$SCRIPT_DIR/.env" | tail -1 | cut -d= -f2-)
-        fi
-    fi
-
-    if [ -z "$STORE_URL" ]; then
-        if [ "$ASSUME_YES" = "1" ]; then
-            warn "No store URL available — skipping Firefox homepage policy."
-            return 0
-        fi
-        read -rp "${CYAN}[?]${NC} Store URL to set as Firefox homepage: " STORE_URL
-        [ -z "$STORE_URL" ] && { warn "Empty URL — skipping."; return 0; }
-    fi
-
-    if ! _validate_url "$STORE_URL"; then
-        warn "Skipping Firefox homepage policy due to invalid URL."
-        return 0
-    fi
-
-    info "Writing Firefox enterprise policies..."
-    mkdir -p /etc/firefox/policies
-    cat > /etc/firefox/policies/policies.json <<FIREFOX_EOF
-{
-  "policies": {
-    "Homepage": {
-      "URL": "$STORE_URL",
-      "StartPage": "homepage",
-      "Locked": true
-    },
-    "OverrideFirstRunPage": "",
-    "OverridePostUpdatePage": "",
-    "DontCheckDefaultBrowser": true,
-    "DisplayBookmarksToolbar": "never",
-    "OfferToSaveLogins": false,
-    "PasswordManagerEnabled": false,
-    "DisableTelemetry": true,
-    "DisableFirefoxStudies": true,
-    "DisablePocket": true,
-    "DisableFeedbackCommands": true,
-    "SearchSuggestEnabled": false,
-    "Extensions": {
-      "Install": []
-    }
-  }
-}
-FIREFOX_EOF
-    ok "Firefox homepage policy installed (locked to $STORE_URL)."
     return 0
 }
 
@@ -428,7 +434,6 @@ phase_security() {
         section "UFW firewall"
         info "Configuring UFW (deny incoming, allow outgoing)."
 
-        # Interactive: ask about SSH unless auto-yes or explicit flag
         if [ "$ASSUME_YES" != "1" ] && [ "$ALLOW_SSH" != "1" ]; then
             if ask_yn "  Allow SSH access on port 22 for remote support?" n; then
                 ALLOW_SSH=1
@@ -461,10 +466,8 @@ DNS_EOF
         run systemctl restart systemd-resolved >/dev/null 2>&1 || \
             warn "systemd-resolved not running — DNS changes will apply on next boot."
 
-        # Allow resolved to settle
         sleep 1
 
-        # ── Probe the store URL through the new DNS ────────
         local probe_url="${STORE_URL:-}"
         if [ -n "$probe_url" ]; then
             local host
@@ -511,8 +514,7 @@ DNS_EOF
         cat > /usr/local/bin/vula-clamscan.sh <<'CLAM_SCRIPT_EOF'
 #!/bin/bash
 # Daily ClamAV scan of the Vula POS user's home directory.
-# Excludes caches, browser profiles, venvs, and the printer app's config
-# (which we control and don't need to scan).
+# Excludes caches, browser profiles, venvs, and the printer app's config.
 set -u
 LOG=/var/log/vula/clamscan.log
 mkdir -p /var/log/vula
@@ -589,7 +591,503 @@ CLAM_TIMER_EOF
 }
 
 # ════════════════════════════════════════════════════════════════
-# PHASE 5 — AUTO-UPDATER
+# PHASE 5 — PRINT APP
+# ════════════════════════════════════════════════════════════════
+phase_print_app() {
+    local env_file="$SCRIPT_DIR/.env"
+
+    if [ -z "$API_KEY" ] && [ -f "$env_file" ]; then
+        API_KEY=$(grep -E '^PRINTER_API_KEY=' "$env_file" | tail -1 | cut -d= -f2-)
+        [ -n "$API_KEY" ] && info "Using existing API key from .env"
+    fi
+
+    # Fall back: if --api-url wasn't given, allow --store-url to double
+    # as the API base for backwards compatibility, with a warning.
+    if [ -z "$API_URL" ]; then
+        if [ -n "$STORE_URL" ]; then
+            warn "--api-url not supplied; falling back to --store-url for the API base."
+            API_URL="$STORE_URL"
+        fi
+    fi
+    if [ -z "$API_URL" ]; then
+        if [ "$ASSUME_YES" = "1" ]; then
+            err "No --api-url (and no --store-url fallback) provided and --yes was set."
+            return 1
+        fi
+        read -rp "${CYAN}[?]${NC} Vula backend API URL (e.g. https://api.example.co.za): " API_URL
+    fi
+
+    if [ -z "$API_KEY" ]; then
+        if [ "$ASSUME_YES" = "1" ]; then
+            err "No --api-key provided and --yes was set."
+            return 1
+        fi
+        read -rsp "${CYAN}[?]${NC} Printer API key (vp_...): " API_KEY
+        echo
+    fi
+
+    if [ -z "$API_URL" ] || [ -z "$API_KEY" ]; then
+        err "Both API_URL and API_KEY are required."
+        return 1
+    fi
+
+    _validate_url "$API_URL" || return 1
+    if ! echo "$API_KEY" | grep -qE '^vp_'; then
+        warn "API key does not start with 'vp_' — is that correct?"
+        if [ "$ASSUME_YES" != "1" ]; then
+            if ! ask_yn "  Continue anyway?" n; then
+                return 1
+            fi
+        fi
+    fi
+
+    # Persist per-user .env — API base, NOT the storefront. The storefront
+    # URL only feeds the Firefox homepage policy in phase_firefox.
+    cat > "$env_file" <<ENV_EOF
+# Vula! Print runtime environment — managed by install.sh
+PRINTER_API_BASE_URL=$API_URL
+PRINTER_API_KEY=$API_KEY
+ENV_EOF
+    chmod 600 "$env_file"
+    chown "$REAL_USER":"$REAL_USER" "$env_file"
+    ok "Credentials saved to $env_file"
+
+    # Root-only copy for system services (AnyDesk handshake, updaters).
+    # Not owned by the desktop user — the app reads .env, system services
+    # read this. Same values, different ACLs.
+    #
+    # Use a subshell for the umask so it does not leak to later phases.
+    install -d -m 0750 /etc/vula
+    (
+        umask 077
+        cat > /etc/vula/creds.env <<CREDS_EOF
+PRINTER_API_BASE_URL=$API_URL
+PRINTER_API_KEY=$API_KEY
+CREDS_EOF
+    )
+    chown root:root /etc/vula/creds.env
+    chmod 0600 /etc/vula/creds.env
+    ok "Root-only creds written to /etc/vula/creds.env"
+
+    # Per-device stable identity. Do NOT rely on /etc/machine-id — it is
+    # baked into the base image and identical across cloned devices.
+    if [ ! -s /etc/vula/device-id ]; then
+        if command -v uuidgen >/dev/null 2>&1; then
+            uuidgen > /etc/vula/device-id
+        else
+            python3 -c "import uuid; print(uuid.uuid4())" > /etc/vula/device-id
+        fi
+        chmod 0644 /etc/vula/device-id
+        chown root:root /etc/vula/device-id
+        ok "Generated per-device ID: $(cat /etc/vula/device-id)"
+    else
+        dim "  Device ID already present: $(cat /etc/vula/device-id)"
+    fi
+
+    # ── venv ────────────────────────────────────────────────────
+    if [ -d "$SCRIPT_DIR/venv" ]; then
+        info "Existing venv found — reusing."
+    else
+        info "Creating venv..."
+        run as_user python3 -m venv --system-site-packages "$SCRIPT_DIR/venv" || return 1
+        ok "venv created."
+    fi
+
+    info "Installing Python dependencies..."
+    run as_user "$SCRIPT_DIR/venv/bin/pip" install --quiet -r "$SCRIPT_DIR/requirements_app.txt" || return 1
+    ok "Python packages installed."
+
+    # ── systemd user service ────────────────────────────────────
+    local svc_file="$REAL_HOME/.config/systemd/user/vula-print.service"
+    as_user mkdir -p "$REAL_HOME/.config/systemd/user"
+
+    cat > "$svc_file" <<SVC_EOF
+[Unit]
+Description=Vula! Print Label Printer
+After=graphical-session.target network-online.target
+Wants=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=$SCRIPT_DIR
+ExecStartPre=/bin/sleep 2
+ExecStart=$SCRIPT_DIR/launch_printer.sh
+Restart=on-failure
+RestartSec=15
+StartLimitIntervalSec=300
+StartLimitBurst=3
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=graphical-session.target
+SVC_EOF
+    chown "$REAL_USER":"$REAL_USER" "$svc_file"
+    ok "Service file written."
+
+    run loginctl enable-linger "$REAL_USER" >/dev/null 2>&1 || \
+        warn "Could not enable linger (systemd too old?)"
+
+    as_user systemctl --user daemon-reload
+    as_user systemctl --user enable vula-print.service >/dev/null 2>&1
+    as_user systemctl --user restart vula-print.service >/dev/null 2>&1 || true
+
+    sleep 2
+    if as_user systemctl --user is-active --quiet vula-print.service; then
+        ok "vula-print.service is running."
+    else
+        warn "vula-print.service is not yet active — will start on next login."
+    fi
+
+    return 0
+}
+
+# ════════════════════════════════════════════════════════════════
+# PHASE 6 — ANYDESK
+# ════════════════════════════════════════════════════════════════
+phase_anydesk() {
+    section "AnyDesk remote access"
+
+    if [ "$SKIP_ANYDESK" = "1" ]; then
+        info "AnyDesk phase skipped (--no-anydesk)."
+        return 0
+    fi
+
+    # 0a. Refuse to proceed on Wayland — unattended access will not work.
+    local cur="" sid
+    sid=$(loginctl --no-legend list-sessions 2>/dev/null | awk '/seat/{print $1; exit}')
+    [ -n "$sid" ] && cur=$(loginctl show-session "$sid" -p Type --value 2>/dev/null || echo "")
+    if [ "$cur" = "wayland" ]; then
+        err "Session is Wayland. Reboot into X11 first, then re-run:"
+        err "  sudo bash install.sh --phase=anydesk"
+        return 1
+    fi
+
+    # 0b. The handshake service needs /etc/vula/creds.env, written by
+    #     phase_print_app. If it isn't there, every retry cycle will be a
+    #     no-op log spam. Refuse early with a clear instruction.
+    if [ ! -s /etc/vula/creds.env ]; then
+        err "Missing /etc/vula/creds.env — run the print_app phase first:"
+        err "  sudo bash install.sh --phase=print_app"
+        err "  sudo bash install.sh --phase=anydesk"
+        return 1
+    fi
+
+    # 1. Signing key — HTTPS + dearmor, written into /etc/apt/keyrings.
+    install -d -m 0755 /etc/apt/keyrings
+    if [ ! -s /etc/apt/keyrings/anydesk.gpg ]; then
+        info "Fetching AnyDesk signing key..."
+        curl -fsSL https://keys.anydesk.com/repos/DEB-GPG-KEY \
+            | gpg --dearmor -o /etc/apt/keyrings/anydesk.gpg || return 1
+        chmod 0644 /etc/apt/keyrings/anydesk.gpg
+    fi
+    if ! gpg --show-keys --with-colons /etc/apt/keyrings/anydesk.gpg >/dev/null 2>&1; then
+        err "AnyDesk keyring is not a valid GPG file."
+        err "  rm /etc/apt/keyrings/anydesk.gpg and re-run."
+        return 1
+    fi
+    ok "AnyDesk keyring present."
+
+    # 2. Repo, pinned to that key.
+    cat > /etc/apt/sources.list.d/anydesk-stable.list <<'ANYDESK_LIST'
+deb [signed-by=/etc/apt/keyrings/anydesk.gpg] https://deb.anydesk.com/ all main
+ANYDESK_LIST
+
+    run apt-get update -qq || return 1
+    DEBIAN_FRONTEND=noninteractive run apt-get install -y --no-install-recommends anydesk || return 1
+    run systemctl enable --now anydesk || return 1
+
+    # 3. Wait for the daemon to answer --get-id. Note this can take a
+    #    moment on first install while AnyDesk registers with its cloud.
+    info "Waiting for AnyDesk daemon..."
+    local ad_id=""
+    local i
+    for i in $(seq 1 30); do
+        ad_id=$(as_user anydesk --get-id 2>/dev/null | tr -dc '0-9' || true)
+        [ -n "$ad_id" ] && break
+        sleep 1
+    done
+    if [ -z "$ad_id" ]; then
+        err "AnyDesk did not return an ID within 30s."
+        err "  systemctl status anydesk"
+        err "  sudo -u $REAL_USER anydesk --get-id"
+        return 1
+    fi
+    ok "AnyDesk ID: $ad_id"
+
+    # 4. Unattended password — 32 alphanumeric from /dev/urandom.
+    #    Pull 128 bytes so the alphanumeric filter reliably yields ≥32 chars.
+    local pw=""
+    pw=$(head -c 128 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9' | head -c 32)
+    if [ "${#pw}" -ne 32 ]; then
+        err "Password generation produced ${#pw} chars (want 32)."
+        return 1
+    fi
+
+    # AnyDesk CLI is inconsistent across versions: some prompt once, some
+    # prompt twice for confirmation. Sending the password twice is safe in
+    # both cases — the extra line is discarded when only one prompt fires.
+    if ! printf '%s\n%s\n' "$pw" "$pw" | as_user anydesk --set-password >/dev/null 2>&1; then
+        err "anydesk --set-password failed."
+        err "  Verify manually: sudo -u $REAL_USER anydesk --set-password"
+        return 1
+    fi
+    ok "Unattended password set."
+
+    # 5. Belt-and-braces: also flag unattended access in user config.
+    local ad_conf="$REAL_HOME/.anydesk/system.conf"
+    as_user mkdir -p "$REAL_HOME/.anydesk"
+    if [ -f "$ad_conf" ] && grep -q '^ad.anynet.unattended_access' "$ad_conf"; then
+        sed -i 's/^ad.anynet.unattended_access.*/ad.anynet.unattended_access=1/' "$ad_conf"
+    else
+        echo 'ad.anynet.unattended_access=1' >> "$ad_conf"
+    fi
+    chown "$REAL_USER":"$REAL_USER" "$ad_conf" 2>/dev/null || true
+    chmod 600 "$ad_conf" 2>/dev/null || true
+
+    # 6. Persist ID + password for the handshake service (root-only).
+    #    Wrap the write in a subshell so the restrictive umask does not
+    #    leak into later phases.
+    install -d -m 0750 /etc/vula
+    (
+        umask 077
+        cat > /etc/vula/anydesk.json <<ANYDESK_JSON
+{
+  "anydesk_id": "$ad_id",
+  "anydesk_password": "$pw",
+  "set_at": "$(date -Iseconds)",
+  "sent": false
+}
+ANYDESK_JSON
+    )
+    chown root:root /etc/vula/anydesk.json
+    chmod 0600 /etc/vula/anydesk.json
+
+    # 7. UFW rules for AnyDesk's inbound. Done here, AFTER security phase
+    #    has already reset the firewall — otherwise they'd be wiped.
+    if command -v ufw >/dev/null 2>&1; then
+        run ufw allow 7070/tcp comment 'AnyDesk direct' || true
+        run ufw allow 3478/udp comment 'AnyDesk STUN'   || true
+        run ufw allow 3479/udp comment 'AnyDesk relay'  || true
+        ok "UFW rules added for AnyDesk."
+    fi
+
+    # 8. Handshake helper + retry timer.
+    cat > /usr/local/bin/vula-anydesk-handshake.sh <<'HS_SCRIPT'
+#!/bin/bash
+# Vula AnyDesk handshake — POSTs ID + password to the backend, retries
+# via vula-anydesk-handshake.timer until the backend ACKs.
+set -u
+LOG=/var/log/vula/anydesk-handshake.log
+mkdir -p /var/log/vula
+JSON=/etc/vula/anydesk.json
+CREDS=/etc/vula/creds.env
+
+[ -f "$JSON" ]  || { echo "$(date -Iseconds) ERROR: $JSON missing"  >> "$LOG"; exit 1; }
+[ -f "$CREDS" ] || { echo "$(date -Iseconds) ERROR: $CREDS missing" >> "$LOG"; exit 1; }
+
+# Already sent? Nothing to do. The installer flips this to false on
+# every phase_anydesk run, so a reinstall will resend with a fresh pw.
+if python3 -c "import json,sys; sys.exit(0 if json.load(open('$JSON')).get('sent') else 1)" 2>/dev/null; then
+    echo "$(date -Iseconds) already sent — nothing to do" >> "$LOG"
+    exit 0
+fi
+
+# shellcheck disable=SC1090
+. "$CREDS"
+if [ -z "${PRINTER_API_BASE_URL:-}" ] || [ -z "${PRINTER_API_KEY:-}" ]; then
+    echo "$(date -Iseconds) ERROR: creds.env incomplete" >> "$LOG"
+    exit 1
+fi
+
+# Prefer the installer-generated per-device UUID. Fall back to machine-id
+# only if the UUID file is missing (pre-existing installs).
+serial=$(cat /etc/vula/device-id 2>/dev/null | tr -d '[:space:]')
+if [ -z "$serial" ]; then
+    serial=$(cat /etc/machine-id 2>/dev/null | tr -d '[:space:]')
+    echo "$(date -Iseconds) WARN: device-id missing, falling back to machine-id" >> "$LOG"
+fi
+[ -z "$serial" ] && serial=$(hostname)
+
+payload=$(python3 -c "
+import json, sys
+d = json.load(open('$JSON'))
+print(json.dumps({
+    'anydesk_id':       d['anydesk_id'],
+    'anydesk_password': d['anydesk_password'],
+    'serial':           sys.argv[1],
+}))
+" "$serial")
+
+# NOTE: no -f on curl. We want the response body and HTTP code even on
+# 4xx/5xx — otherwise every retry logs an opaque 'curl failed' and we
+# cannot tell 404 (endpoint not deployed) from 401 (bad key).
+resp=$(curl -sS -m 20 -w '\n%{http_code}' \
+    -H "X-Printer-API-Key: $PRINTER_API_KEY" \
+    -H "Content-Type: application/json" \
+    -X POST "$PRINTER_API_BASE_URL/admin/api/printer-app/anydesk" \
+    --data-raw "$payload" 2>&1) || {
+    echo "$(date -Iseconds) curl network failure: ${resp:0:200}" >> "$LOG"
+    exit 1
+}
+
+# Split response body / HTTP code on the last newline.
+code="${resp##*$'\n'}"
+body="${resp%$'\n'*}"
+
+# Defensive: an empty response or a code that isn't all digits means
+# the connection dropped mid-transfer.
+if ! [[ "$code" =~ ^[0-9]{3}$ ]]; then
+    echo "$(date -Iseconds) malformed response: code='$code' body='${body:0:200}'" >> "$LOG"
+    exit 1
+fi
+
+if [ "$code" = "200" ] || [ "$code" = "201" ] || [ "$code" = "204" ]; then
+    python3 - <<PY
+import json, datetime
+p = "$JSON"
+d = json.load(open(p))
+d["sent"]    = True
+d["sent_at"] = datetime.datetime.now().isoformat()
+json.dump(d, open(p, "w"), indent=2)
+PY
+    chmod 0600 "$JSON"
+    ad_id_echo=$(python3 -c "import json;print(json.load(open('$JSON'))['anydesk_id'])")
+    echo "$(date -Iseconds) handshake OK (anydesk_id=$ad_id_echo)" >> "$LOG"
+    systemctl disable --now vula-anydesk-handshake.timer >/dev/null 2>&1 || true
+    exit 0
+fi
+
+echo "$(date -Iseconds) handshake failed: HTTP $code body=${body:0:200}" >> "$LOG"
+exit 1
+HS_SCRIPT
+    chmod 0755 /usr/local/bin/vula-anydesk-handshake.sh
+
+    cat > /etc/systemd/system/vula-anydesk-handshake.service <<'HS_SVC'
+[Unit]
+Description=Vula AnyDesk handshake (retry until acknowledged)
+After=network-online.target anydesk.service
+Wants=network-online.target
+ConditionFileNotEmpty=/etc/vula/anydesk.json
+ConditionFileNotEmpty=/etc/vula/creds.env
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vula-anydesk-handshake.sh
+HS_SVC
+
+    cat > /etc/systemd/system/vula-anydesk-handshake.timer <<'HS_TIMER'
+[Unit]
+Description=Retry Vula AnyDesk handshake every 10 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+HS_TIMER
+
+    run systemctl daemon-reload
+    run systemctl enable --now vula-anydesk-handshake.timer || \
+        warn "Could not enable handshake retry timer."
+
+    # 9. Try the handshake immediately; if it fails, the timer will retry.
+    info "Attempting initial handshake..."
+    if [ "$DRY_RUN" = "1" ]; then
+        dim "DRY: /usr/local/bin/vula-anydesk-handshake.sh"
+    elif /usr/local/bin/vula-anydesk-handshake.sh; then
+        ok "Handshake acknowledged by backend."
+    else
+        warn "Initial handshake failed — retry timer will keep trying."
+        warn "  tail -f /var/log/vula/anydesk-handshake.log"
+    fi
+
+    ok "AnyDesk phase complete."
+    return 0
+}
+
+# ════════════════════════════════════════════════════════════════
+# PHASE 7 — FIREFOX
+# ════════════════════════════════════════════════════════════════
+phase_firefox() {
+    if [ "$SKIP_FIREFOX" = "1" ]; then
+        info "Firefox phase skipped (--no-firefox)."
+        return 0
+    fi
+
+    # Do NOT fall back to PRINTER_API_BASE_URL — the storefront and the API
+    # are different hosts. If no --store-url was supplied, skip the policy
+    # rather than pin Firefox to the wrong site.
+    if [ -z "$STORE_URL" ]; then
+        if [ "$ASSUME_YES" = "1" ]; then
+            warn "No --store-url supplied — Firefox homepage policy will be skipped."
+            warn "  Re-run with: sudo bash install.sh --phase=firefox --store-url=https://..."
+            return 0
+        fi
+        read -rp "${CYAN}[?]${NC} Store URL to set as Firefox homepage: " STORE_URL
+        [ -z "$STORE_URL" ] && { warn "Empty URL — skipping."; return 0; }
+    fi
+
+    if ! _validate_url "$STORE_URL"; then
+        warn "Skipping Firefox homepage policy due to invalid URL."
+        return 0
+    fi
+
+    info "Writing Firefox enterprise policies..."
+    # Debian's firefox-esr reads from /etc/firefox-esr/policies/.
+    # Mozilla's official build (non-Debian) reads from /etc/firefox/policies/.
+    # Write to both so the policy applies regardless of which binary is
+    # installed or which one a future apt upgrade switches to.
+    mkdir -p /etc/firefox-esr/policies /etc/firefox/policies
+    cat > /etc/firefox-esr/policies/policies.json <<FIREFOX_EOF
+{
+  "policies": {
+    "Homepage": {
+      "URL": "$STORE_URL",
+      "StartPage": "homepage",
+      "Locked": true
+    },
+    "OverrideFirstRunPage": "",
+    "OverridePostUpdatePage": "",
+    "DontCheckDefaultBrowser": true,
+    "DisplayBookmarksToolbar": "never",
+    "OfferToSaveLogins": false,
+    "PasswordManagerEnabled": false,
+    "DisableTelemetry": true,
+    "DisableFirefoxStudies": true,
+    "DisablePocket": true,
+    "DisableFeedbackCommands": true,
+    "SearchSuggestEnabled": false,
+    "Extensions": {
+      "Install": []
+    }
+  }
+}
+FIREFOX_EOF
+    cp /etc/firefox-esr/policies/policies.json /etc/firefox/policies/policies.json
+
+    info "Setting Firefox as the system default browser..."
+    update-alternatives --set x-www-browser /usr/bin/firefox-esr 2>/dev/null || \
+        warn "  could not set x-www-browser"
+    update-alternatives --set gnome-www-browser /usr/bin/firefox-esr 2>/dev/null || \
+        warn "  could not set gnome-www-browser"
+
+    # Per-user XDG default — needs a session bus. Run under dbus-run-session
+    # so it works even when the installer runs before first login.
+    if command -v dbus-run-session >/dev/null 2>&1; then
+        as_user dbus-run-session -- \
+            xdg-settings set default-web-browser firefox-esr.desktop 2>/dev/null || \
+            warn "  could not set per-user default browser (will apply on next login)"
+    fi
+    ok "Firefox homepage policy installed (locked to $STORE_URL)."
+    return 0
+}
+
+# ════════════════════════════════════════════════════════════════
+# PHASE 8 — AUTO-UPDATER
 # ════════════════════════════════════════════════════════════════
 phase_updater() {
     if [ "$SKIP_UPDATER" = "1" ]; then
@@ -599,7 +1097,7 @@ phase_updater() {
 
     mkdir -p /var/log/vula
 
-    # ── 5a. Daily apt upgrade ───────────────────────────────
+    # ── 8a. Daily apt upgrade ───────────────────────────────
     info "Installing daily apt-upgrade timer (04:00)..."
 
     cat > /usr/local/bin/vula-apt-upgrade.sh <<'APTUPGRADE_SCRIPT'
@@ -661,7 +1159,7 @@ APTTIMER_EOF
         warn "Could not start apt-upgrade timer."
     ok "apt upgrade scheduled (daily 04:00)."
 
-    # ── 5b. Optional: on shutdown ──────────────────────────
+    # ── 8b. Optional: on shutdown ──────────────────────────
     if [ "$APT_ON_SHUTDOWN" = "1" ]; then
         info "Adding on-shutdown apt upgrade service (30 min timeout)..."
         cat > /etc/systemd/system/vula-apt-on-shutdown.service <<'SHUTSVC_EOF'
@@ -689,7 +1187,7 @@ SHUTSVC_EOF
         ok "apt upgrade will also run on shutdown (30 min timeout)."
     fi
 
-    # ── 5c. App auto-update ────────────────────────────────
+    # ── 8c. App auto-update ────────────────────────────────
     info "Installing app auto-update timer (04:05, runs as $REAL_USER)..."
 
     cat > /usr/local/bin/vula-print-update.sh <<'APPUP_SCRIPT'
@@ -713,7 +1211,6 @@ if [ -z "$SCRIPT_DIR" ] || [ ! -d "$SCRIPT_DIR/.git" ]; then
     exit 1
 fi
 
-# Skip if a print job is currently in flight
 if [ -e /tmp/vula-print-busy ]; then
     echo "$(date -Iseconds) SKIP: /tmp/vula-print-busy is set" >> "$LOG"
     exit 0
@@ -741,19 +1238,16 @@ fi
 
 echo "$(date -Iseconds) updating ${LOCAL:0:7} -> ${REMOTE:0:7}" >> "$LOG"
 
-# Fast-forward only — never force
 if ! sudo -u "$REAL_USER" git merge --ff-only "$REMOTE" >> "$LOG" 2>&1; then
     echo "$(date -Iseconds) ERROR: fast-forward merge failed" >> "$LOG"
     exit 1
 fi
 
-# Refresh deps, in case requirements_app.txt changed
 if [ -x "$SCRIPT_DIR/venv/bin/pip" ]; then
     sudo -u "$REAL_USER" "$SCRIPT_DIR/venv/bin/pip" install --quiet \
         -r "$SCRIPT_DIR/requirements_app.txt" >> "$LOG" 2>&1 || true
 fi
 
-# Restart user service
 sudo -u "$REAL_USER" env HOME="$REAL_HOME" \
     XDG_RUNTIME_DIR="/run/user/$(id -u "$REAL_USER")" \
     DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u "$REAL_USER")/bus" \
@@ -801,26 +1295,11 @@ APPUPTIMER_EOF
 # ════════════════════════════════════════════════════════════════
 # PHASE RUNNER
 # ════════════════════════════════════════════════════════════════
-_validate_url() {
-    local url="${1:-}"
-    if [ -z "$url" ]; then
-        err "URL is empty."
-        return 1
-    fi
-    if ! echo "$url" | grep -qE '^https?://[^[:space:]]+'; then
-        err "Invalid URL: '$url'"
-        err "  Must start with http:// or https://"
-        return 1
-    fi
-    return 0
-}
-
 run_phase() {
     local key="$1"
     local name="$2"
     local fn="$3"
 
-    # Filter by --phase if provided
     if [ -n "$PHASES_TO_RUN" ]; then
         if ! echo ",$PHASES_TO_RUN," | grep -q ",$key,"; then
             dim "Skipping phase '$key' (not in --phase=$PHASES_TO_RUN)"
@@ -860,11 +1339,14 @@ run_phase() {
 # ════════════════════════════════════════════════════════════════
 FAILED=0
 
-run_phase system    "System preparation"       phase_system    || FAILED=1
-[ "$FAILED" = "0" ] && { run_phase print_app "Print application"      phase_print_app || FAILED=1; }
-[ "$FAILED" = "0" ] && { run_phase firefox   "Firefox provisioning"   phase_firefox   || FAILED=1; }
-[ "$FAILED" = "0" ] && { run_phase security  "Security hardening"     phase_security  || FAILED=1; }
-[ "$FAILED" = "0" ] && { run_phase updater   "Auto-updater setup"     phase_updater   || FAILED=1; }
+run_phase preflight "Preflight checks"          phase_preflight || FAILED=1
+[ "$FAILED" = "0" ] && { run_phase system    "System preparation"       phase_system    || FAILED=1; }
+[ "$FAILED" = "0" ] && { run_phase display   "X11 enforcement"          phase_display   || FAILED=1; }
+[ "$FAILED" = "0" ] && { run_phase security  "Security hardening"       phase_security  || FAILED=1; }
+[ "$FAILED" = "0" ] && { run_phase print_app "Print application"        phase_print_app || FAILED=1; }
+[ "$FAILED" = "0" ] && { run_phase anydesk   "AnyDesk remote access"    phase_anydesk   || FAILED=1; }
+[ "$FAILED" = "0" ] && { run_phase firefox   "Firefox provisioning"     phase_firefox   || FAILED=1; }
+[ "$FAILED" = "0" ] && { run_phase updater   "Auto-updater setup"       phase_updater   || FAILED=1; }
 
 # ── Summary ──────────────────────────────────────────────────
 section "Installation Summary"
@@ -881,7 +1363,7 @@ echo "  App log:   journalctl --user -u vula-print -f"
 echo "  Update:    sudo /usr/local/bin/vula-print-update.sh $REAL_USER $SCRIPT_DIR"
 echo
 echo "  Timers (system):"
-echo "    systemctl list-timers vula-apt-upgrade.timer vula-clamscan.timer vula-print-update.timer"
+echo "    systemctl list-timers vula-apt-upgrade.timer vula-clamscan.timer vula-print-update.timer vula-anydesk-handshake.timer"
 echo
 
 exit "$FAILED"

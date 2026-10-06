@@ -5,9 +5,13 @@ This mixin only performs the scan and publishes the device list.
 """
 from __future__ import annotations
 
+import logging
 from typing import List
 
 from vula_workers import PrinterScanner
+from vula_config import PRINTER_ROLE_ATTRS
+
+_log = logging.getLogger("vula.scan")
 
 
 class PrinterScanMixin:
@@ -42,6 +46,24 @@ class PrinterScanMixin:
         """Store the discovered device list and refresh any open views."""
         self.discovered_printers = list(printers or [])
 
+        # Emit a compact device→fingerprint table once per scan so the
+        # deployment audit can be done from the app log alone. Format:
+        #   "/dev/usb/lp0=usb:0416:5011:ABC123, /dev/usb/lp1=path:/dev/usb/lp1"
+        try:
+            from vula_device_io import fingerprint_for_path
+            summary = ", ".join(
+                f"{d}={fingerprint_for_path(d)}" for d in self.discovered_printers
+            )
+            _log.info("device fingerprint table: [%s]", summary or "(none)")
+        except Exception as exc:
+            _log.debug("fingerprint summary failed: %s", exc)
+
+        # Re-resolve role assignments by fingerprint. If the user assigned
+        # the POS role to a device that was at /dev/usb/lp2 last boot but is
+        # now at /dev/usb/lp0, this swaps the role path silently so prints
+        # keep going to the physical printer that was originally chosen.
+        self._resolve_role_fingerprints()
+
         # Refresh the Printers tab list if it's been built yet.
         if hasattr(self, "_discovered_list"):
             self._refresh_discovered_list()
@@ -52,6 +74,59 @@ class PrinterScanMixin:
             self.status_bar.showMessage(f"Found {len(printers)} printer(s)")
 
         self.upload_discovered_printers_if_ready()
+
+    def _resolve_role_fingerprints(self):
+        """Re-point role assignments to the current device paths by fingerprint.
+
+        If the fingerprint for a role's saved path no longer matches any
+        discovered device, leave the role untouched — the operator will see
+        the "Offline" red status on that card and re-assign it manually.
+        """
+        fingerprints = getattr(self, "printer_role_fingerprints", None) or {}
+        if not fingerprints or not self.discovered_printers:
+            return
+
+        from vula_device_io import fingerprint_for_path
+
+        # Pre-compute the discovered fingerprint → path map once.
+        discovered_fp: dict = {}
+        for dev in self.discovered_printers:
+            fp = fingerprint_for_path(dev)
+            if fp and fp not in discovered_fp:
+                discovered_fp[fp] = dev
+
+        changed = False
+        for role_key, state_attr in PRINTER_ROLE_ATTRS.items():
+            saved_fp = fingerprints.get(role_key)
+            if not saved_fp:
+                continue
+            current_path = getattr(self, state_attr, None)
+            # If the currently saved path already matches, nothing to do.
+            if current_path and fingerprint_for_path(current_path) == saved_fp:
+                continue
+            new_path = discovered_fp.get(saved_fp)
+            if not new_path:
+                continue
+            setattr(self, state_attr, new_path)
+            if role_key == "label":
+                self.last_selected_printer = new_path
+                self.selected_printer = new_path
+            elif role_key == "pos_slip":
+                self.last_selected_pos_printer = new_path
+                self.pos_selected_printer = new_path
+            changed = True
+            try:
+                self.status_bar.showMessage(
+                    f"Re-assigned {role_key} role to {new_path} (matched by fingerprint)"
+                )
+            except Exception:
+                pass
+
+        if changed:
+            try:
+                self.save_settings()
+            except Exception:
+                pass
 
     def _update_pos_worker_status(self, extra_note=None):
         """Refresh the POS worker readiness indicator in the sidebar."""

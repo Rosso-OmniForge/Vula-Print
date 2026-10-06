@@ -34,6 +34,10 @@ def main():
     # ── Global unhandled-exception hook ─────────────────────────
     # Any exception that escapes a Qt slot lands here. We log it with
     # full traceback before letting Python print it to stderr as usual.
+    #
+    # If a window (and therefore its _log_uploader) exists, we also
+    # fire-and-forget a log upload so the crash is visible from the
+    # admin dashboard without needing shell access to the client.
     import sys as _sys
     _orig_hook = _sys.excepthook
     def _vula_excepthook(exc_type, exc_value, exc_tb):
@@ -41,6 +45,17 @@ def main():
             "Unhandled exception",
             exc_info=(exc_type, exc_value, exc_tb),
         )
+        try:
+            # Look for any live VulaPrintApp instance. If we crash before
+            # the window is created, this is a no-op.
+            from PyQt6.QtWidgets import QApplication
+            for w in QApplication.topLevelWidgets():
+                uploader = getattr(w, "_log_uploader", None)
+                if uploader is not None:
+                    uploader.upload_async("crash")
+                    break
+        except Exception:
+            pass
         _orig_hook(exc_type, exc_value, exc_tb)
     _sys.excepthook = _vula_excepthook
 

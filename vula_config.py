@@ -42,6 +42,15 @@ APP_HISTORY_FILE = Path.home() / ".config" / "vula_print" / "print_history.json"
 
 MAX_STORE_CONNECTIONS = 4
 
+# Mapping of role key → attribute name on the app object that stores the
+# currently assigned device path. Kept here so both printers_tab.py and
+# printer_scan.py can share the same definition.
+PRINTER_ROLE_ATTRS = {
+    "label":    "last_selected_printer",
+    "pos_slip": "last_selected_pos_printer",
+    "a4":       "last_selected_a4_printer",
+}
+
 
 @dataclass
 class StoreConnection:

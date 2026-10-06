@@ -171,6 +171,11 @@ class POSMixin:
         conn = self.get_connection_by_id(connection_id)
         if not conn:
             return
+        # Concurrency guard: never start a second POS print job while one is
+        # already in flight, even if the backend still shows the previous
+        # slip as pending (its completion POST may not have landed yet).
+        if self.pos_print_job is not None and self.pos_print_job.isRunning():
+            return
         conn.pos_in_flight_ids.add(request_id)
         self.last_successful_pos_poll_at = datetime.now()
         conn.pos_backoff_seconds = 1
@@ -183,7 +188,7 @@ class POSMixin:
             qr_mode=self.pos_qr_mode,
             qr_module_px=self.pos_qr_module_px,
         )
-        self.pos_print_job.finished.connect(
+        self.pos_print_job.completed.connect(
             lambda s, m: self._on_pos_print_finished(s, m, request_id, connection_id)
         )
         self.pos_print_job.start()
@@ -206,10 +211,14 @@ class POSMixin:
                     f"POS slip #{request_id} printed (no connection to complete)"
                 )
         else:
+            # Print failed — release the in-flight flag so the next poll can
+            # retry. Successful prints must NOT release here; the backend
+            # won't have transitioned the row to completed until the POST
+            # in _on_pos_complete_done returns, and releasing early lets the
+            # next poll tick re-fetch and re-print the same slip.
+            if conn:
+                conn.pos_in_flight_ids.discard(request_id)
             self.status_bar.showMessage(f"POS slip #{request_id} failed: {message}")
-
-        if conn:
-            conn.pos_in_flight_ids.discard(request_id)
 
     def _dispatch_pos_complete(self, conn: StoreConnection, request_id: int):
         """Fire-and-forget POST to mark a POS slip complete. Adds to retry set on failure."""
@@ -245,11 +254,13 @@ class POSMixin:
         conn = self.get_connection_by_id(connection_id)
         if not conn:
             return
+        if self.pos_eod_print_job is not None and self.pos_eod_print_job.isRunning():
+            return
         conn.pos_eod_in_flight_ids.add(request_id)
         self.last_successful_pos_poll_at = datetime.now()
         self._update_pos_worker_status(f"Printing EOD via {conn.name}")
         self.pos_eod_print_job = POSEODReportPrintJob(self.pos_selected_printer, detail)
-        self.pos_eod_print_job.finished.connect(
+        self.pos_eod_print_job.completed.connect(
             lambda s, m: self._on_pos_eod_print_finished(s, m, request_id, connection_id)
         )
         self.pos_eod_print_job.start()
@@ -271,10 +282,9 @@ class POSMixin:
                     f"POS EOD report #{request_id} printed (no connection to complete)"
                 )
         else:
+            if conn:
+                conn.pos_eod_in_flight_ids.discard(request_id)
             self.status_bar.showMessage(f"POS EOD report #{request_id} failed: {message}")
-
-        if conn:
-            conn.pos_eod_in_flight_ids.discard(request_id)
 
     def _dispatch_eod_complete(self, conn: StoreConnection, request_id: int):
         w = HttpWorker(
