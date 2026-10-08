@@ -190,7 +190,7 @@ class PrintJob(QThread):
         tspl.append("SET TEAR ON")
         tspl.append("CLS")
 
-        LM         = 10                                  # left margin (dots)
+        LM         = 30                                  # left margin (dots)
         USABLE_W   = self.label_width_dots - LM * 2     # 300 dots printable width
         TITLE_FONT = "3"                                 # 16 dots/char
         TITLE_LINE_H = 26                                # font-3 height (24) + 2 gap
