@@ -326,38 +326,61 @@ class LabelQueueMixin:
                 "Error: could not determine store connection for this request."
             )
             return
-        try:
-            headers = self._headers_for(conn)
-            response = requests.get(
-                f"{conn.api_base_url}/admin/api/label-printing/request/{request['id']}",
-                headers=headers,
-                timeout=10,
+
+        # Details panel is loaded off-thread. The callback re-checks that
+        # this request is still the selected one — otherwise, a slow
+        # response from a previously clicked row could overwrite the panel
+        # with stale content after the operator has moved on.
+        self.details_text.setText("Loading details…")
+        w = HttpWorker(
+            tag=f"details:{conn.connection_id}:{request['id']}",
+            method="GET",
+            url=f"{conn.api_base_url.rstrip('/')}/admin/api/label-printing/request/{request['id']}",
+            headers=self._headers_for(conn),
+            timeout=10.0,
+        )
+        w.done.connect(
+            lambda r, c=conn, req=request: self._on_request_details_fetched(r, c, req)
+        )
+        w.finished.connect(lambda w=w: self._forget_http_worker(w))
+        self._http_workers.append(w)
+        w.start()
+
+    def _on_request_details_fetched(self, result, conn, request):
+        # Discard if the user has since selected a different request.
+        current = getattr(self, "_selected_request", None)
+        if (current is None
+                or current.get("id") != request.get("id")
+                or current.get("_connection_id") != request.get("_connection_id")):
+            return
+
+        if not (result.ok and result.status == 200):
+            if not result.ok:
+                self.details_text.setText(f"Error loading details: {result.error}")
+            else:
+                self.details_text.setText(f"Error loading details: HTTP {result.status}")
+            return
+
+        data = result.data if isinstance(result.data, dict) else {}
+        items = data.get("items", [])
+        lines = [
+            f"Store: {conn.name}",
+            f"Request ID: {request['id']}",
+            f"Source: {request.get('source', '')}",
+            f"Note: {request.get('note', '')}",
+            f"Total Labels: {request.get('total_labels', 0)}",
+            "",
+            "Items:",
+            "-" * 50,
+        ]
+        for item in items:
+            lines.append(
+                f"• {item.get('title', '')} - {item.get('variant_label', '')}"
             )
-
-            if response.status_code == 200:
-                data = response.json()
-                items = data.get("items", [])
-                lines = [
-                    f"Store: {conn.name}",
-                    f"Request ID: {request['id']}",
-                    f"Source: {request.get('source', '')}",
-                    f"Note: {request.get('note', '')}",
-                    f"Total Labels: {request.get('total_labels', 0)}",
-                    "",
-                    "Items:",
-                    "-" * 50,
-                ]
-                for item in items:
-                    lines.append(
-                        f"• {item.get('title', '')} - {item.get('variant_label', '')}"
-                    )
-                    lines.append(
-                        f"  SKU: {item.get('sku', '')} | Qty: {item.get('qty_to_print', 0)}"
-                    )
-                self.details_text.setText(NL.join(lines))
-
-        except Exception as e:
-            self.details_text.setText(f"Error loading details: {e}")
+            lines.append(
+                f"  SKU: {item.get('sku', '')} | Qty: {item.get('qty_to_print', 0)}"
+            )
+        self.details_text.setText(NL.join(lines))
 
     def _on_request_selection_changed(self):
         row = self.requests_table.currentRow()

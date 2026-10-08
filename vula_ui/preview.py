@@ -60,20 +60,30 @@ class PreviewMixin:
             QMessageBox.critical(self, "Error", "Could not determine store connection for this request.")
             return
 
-        try:
-            headers = self._headers_for(conn)
-            response = requests.get(
-                f"{conn.api_base_url}/admin/api/label-printing/request/{request['id']}",
-                headers=headers, timeout=10
-            )
-            if response.status_code != 200:
-                QMessageBox.warning(self, "Cannot Load", f"Server returned {response.status_code}.")
-                return
-            items = response.json().get("items", [])
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to fetch items: {e}")
-            return
+        w = HttpWorker(
+            tag=f"tsplpreview:{conn.connection_id}:{request['id']}",
+            method="GET",
+            url=f"{conn.api_base_url.rstrip('/')}/admin/api/label-printing/request/{request['id']}",
+            headers=self._headers_for(conn),
+            timeout=10.0,
+        )
+        w.done.connect(
+            lambda r, c=conn, req=request: self._on_tspl_preview_fetched(r, c, req)
+        )
+        w.finished.connect(lambda w=w: self._forget_http_worker(w))
+        self._http_workers.append(w)
+        w.start()
+        self.status_bar.showMessage(f"Loading TSPL preview for request #{request['id']}…")
 
+    def _on_tspl_preview_fetched(self, result, conn, request):
+        if not (result.ok and result.status == 200):
+            if result.ok:
+                QMessageBox.warning(self, "Cannot Load", f"Server returned {result.status}.")
+            else:
+                QMessageBox.critical(self, "Error", f"Failed to fetch items: {result.error}")
+            return
+        data = result.data if isinstance(result.data, dict) else {}
+        items = data.get("items", [])
         if not items:
             QMessageBox.information(self, "No Items", "This request has no items.")
             return
@@ -125,23 +135,30 @@ class PreviewMixin:
             QMessageBox.critical(self, "Error", "Could not determine store connection for this request.")
             return
 
-        try:
-            headers  = self._headers_for(conn)
-            response = requests.get(
-                f"{conn.api_base_url}/admin/api/label-printing/request/{request['id']}",
-                headers=headers, timeout=10,
-            )
-            if response.status_code != 200:
-                QMessageBox.warning(
-                    self, "Cannot Load",
-                    f"Server returned {response.status_code}.",
-                )
-                return
-            items = response.json().get("items", [])
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to fetch items: {e}")
-            return
+        w = HttpWorker(
+            tag=f"visualpreview:{conn.connection_id}:{request['id']}",
+            method="GET",
+            url=f"{conn.api_base_url.rstrip('/')}/admin/api/label-printing/request/{request['id']}",
+            headers=self._headers_for(conn),
+            timeout=10.0,
+        )
+        w.done.connect(
+            lambda r, c=conn, req=request: self._on_visual_preview_fetched(r, c, req)
+        )
+        w.finished.connect(lambda w=w: self._forget_http_worker(w))
+        self._http_workers.append(w)
+        w.start()
+        self.status_bar.showMessage(f"Loading visual preview for request #{request['id']}…")
 
+    def _on_visual_preview_fetched(self, result, conn, request):
+        if not (result.ok and result.status == 200):
+            if result.ok:
+                QMessageBox.warning(self, "Cannot Load", f"Server returned {result.status}.")
+            else:
+                QMessageBox.critical(self, "Error", f"Failed to fetch items: {result.error}")
+            return
+        data = result.data if isinstance(result.data, dict) else {}
+        items = data.get("items", [])
         if not items:
             QMessageBox.information(self, "No Items", "This request has no items.")
             return

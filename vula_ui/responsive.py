@@ -70,6 +70,14 @@ class ResponsiveMixin:
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._apply_responsive_layout()
+        # Sidebar width is independent of the content breakpoints above —
+        # it has its own tier thresholds in ThemeMixin._responsive_sidebar_width
+        # (1000 / 1300 / 1900 px), which don't align with the small /
+        # medium / large breakpoints that control column hiding. So we
+        # fire the width update on every resize, not just on breakpoint
+        # changes. The method itself is cheap: it only calls setFixedWidth
+        # when the target width actually differs from the current one.
+        self._update_sidebar_width()
 
     def _current_breakpoint(self) -> str:
         w = self.width() if self.width() > 0 else 9999

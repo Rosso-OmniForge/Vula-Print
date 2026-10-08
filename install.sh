@@ -249,9 +249,26 @@ phase_system() {
     #   * deb822  /etc/apt/sources.list.d/*.sources
     # A clean Debian 13 netinst ships deb822. An upgraded box may still
     # have the legacy file. Handle both.
+    # ── Back up any existing sources file before touching it.
+    # A Debian netinst ships either the legacy sources.list or the
+    # deb822 debian.sources; an upgraded box may have both. Whatever the
+    # layout, we back up before writing, and we only *truncate* the
+    # legacy file if it actually contains active `deb` lines that would
+    # conflict with the deb822 file. An operator-added repo (Docker,
+    # internal mirror, etc.) must survive a re-run of this installer.
+    _backup_sources_file() {
+        local f="$1"
+        [ -f "$f" ] || return 0
+        cp -a "$f" "${f}.vula-backup-$(date +%Y%m%d%H%M%S)"
+    }
+
     if [ -f /etc/apt/sources.list.d/debian.sources ]; then
-        info "deb822 layout detected — rewriting debian.sources for Trixie."
-        cat > /etc/apt/sources.list.d/debian.sources <<'DEB822_EOF'
+        if grep -q '^Suites:.*trixie' /etc/apt/sources.list.d/debian.sources 2>/dev/null; then
+            dim "  debian.sources already targets trixie — leaving untouched."
+        else
+            info "deb822 layout detected — updating debian.sources for Trixie."
+            _backup_sources_file /etc/apt/sources.list.d/debian.sources
+            cat > /etc/apt/sources.list.d/debian.sources <<'DEB822_EOF'
 Types: deb deb-src
 URIs: http://deb.debian.org/debian/
 Suites: trixie trixie-updates
@@ -264,10 +281,23 @@ Suites: trixie-security
 Components: main contrib non-free non-free-firmware
 Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
 DEB822_EOF
-        : > /etc/apt/sources.list
-        ok "debian.sources rewritten (legacy sources.list blanked)."
+            ok "debian.sources updated (backup saved alongside)."
+        fi
+
+        # Only blank the legacy sources.list if it has *active* deb lines
+        # that would duplicate what debian.sources already provides.
+        if grep -qE '^deb ' /etc/apt/sources.list 2>/dev/null; then
+            info "legacy sources.list has active entries — backing up and blanking."
+            _backup_sources_file /etc/apt/sources.list
+            : > /etc/apt/sources.list
+            ok "legacy sources.list blanked (backup saved)."
+        else
+            dim "  legacy sources.list is already empty or comment-only."
+        fi
+
     elif grep -qE '^deb .* (bookworm|bullseye|buster)' /etc/apt/sources.list 2>/dev/null; then
         info "Legacy layout, old release — rewriting sources.list for Trixie."
+        _backup_sources_file /etc/apt/sources.list
         cat > /etc/apt/sources.list <<'SRCLIST_EOF'
 # Debian 13 Trixie — managed by vula install.sh
 deb     http://deb.debian.org/debian/            trixie          main contrib non-free non-free-firmware
@@ -277,9 +307,9 @@ deb-src http://security.debian.org/debian-security trixie-security main contrib 
 deb     http://deb.debian.org/debian/            trixie-updates  main contrib non-free non-free-firmware
 deb-src http://deb.debian.org/debian/            trixie-updates  main contrib non-free non-free-firmware
 SRCLIST_EOF
-        ok "sources.list rewritten."
+        ok "sources.list rewritten (backup saved)."
     elif grep -qE '^deb .* trixie' /etc/apt/sources.list 2>/dev/null; then
-        ok "sources.list already on Trixie — leaving untouched."
+        dim "  sources.list already on Trixie — leaving untouched."
     else
         warn "Could not identify apt sources layout — leaving untouched."
         warn "  Verify manually: cat /etc/apt/sources.list /etc/apt/sources.list.d/*"
@@ -323,13 +353,50 @@ SRCLIST_EOF
         fi
     done
 
-    if [ ! -f /etc/udev/rules.d/60-usb-label-printer.rules ]; then
+    # v2 — cover both subsystems. On older kernels, USB printer-class
+    # devices (/dev/usb/lpN) are children of the "usb" subsystem; on
+    # newer kernels (Debian 13 and later) they moved to "usbmisc".
+    # Writing both rules is harmless — udev silently ignores a rule whose
+    # SUBSYSTEM never matches a device. This makes the fix correct on
+    # every kernel without needing to probe which one is active.
+    #
+    # v1 (previous) only matched "usb" and so quietly did nothing on
+    # newer kernels, leaving the device group to whatever the distro's
+    # own default rule set it to.
+    if [ ! -f /etc/udev/rules.d/60-usb-label-printer.rules ] || \
+       ! grep -q 'v2' /etc/udev/rules.d/60-usb-label-printer.rules; then
         cat > /etc/udev/rules.d/60-usb-label-printer.rules <<'UDEV_EOF'
-SUBSYSTEM=="usb", KERNEL=="lp[0-9]*", GROUP="lp", MODE="0664"
+# v2 — Vula! Print. Covers both kernel subsystems that have hosted
+# USB printer-class nodes across recent Debian releases.
+SUBSYSTEM=="usb",     KERNEL=="lp[0-9]*", GROUP="lp", MODE="0660"
+SUBSYSTEM=="usbmisc", KERNEL=="lp[0-9]*", GROUP="lp", MODE="0660"
 UDEV_EOF
         run udevadm control --reload-rules
         run udevadm trigger --subsystem-match=usb
-        ok "udev rule installed for printer device permissions."
+        run udevadm trigger --subsystem-match=usbmisc 2>/dev/null || true
+        ok "udev rule installed (v2, usb + usbmisc)."
+    else
+        dim "  udev rule already at v2 — leaving untouched."
+    fi
+
+    # ── Diagnostic: record which subsystem /dev/usb/lp* actually uses.
+    # No hardware on the dev box means we can't verify this offline.
+    # This block logs the truth on the first install that runs with a
+    # printer plugged in, so we have hard evidence for the next audit.
+    if [ "$DRY_RUN" != "1" ]; then
+        probe_log=/var/log/vula-device-probe.log
+        mkdir -p /var/log
+        {
+            echo "── $(date -Iseconds) ──"
+            for lp in /dev/usb/lp*; do
+                [ -e "$lp" ] || continue
+                echo "device: $lp"
+                echo "  path:  $(udevadm info -q path -n "$lp" 2>/dev/null || echo '(no path)')"
+                echo "  group: $(stat -c '%G' "$lp" 2>/dev/null || echo '?')"
+                echo "  mode:  $(stat -c '%A' "$lp" 2>/dev/null || echo '?')"
+            done
+            [ -e /dev/usb/lp0 ] || echo "device: (none present)"
+        } >> "$probe_log" 2>&1
     fi
 
     info "Enabling system services..."
@@ -440,7 +507,15 @@ phase_security() {
             fi
         fi
 
-        run ufw --force reset >/dev/null 2>&1 || true
+        # NOTE: we deliberately do NOT reset UFW here (previous versions
+        # ran `ufw --force` with the reset subcommand, which is removed).
+        # The reset wipes rules added by later phases (AnyDesk's 7070/
+        # 3478/3479 rules from phase_anydesk, in particular), which then
+        # never get re-applied if someone re-runs just this phase. UFW
+        # is idempotent — `ufw allow X` twice is a no-op the second time
+        # — so a reset buys us nothing and can silently break remote
+        # access. If a genuine from-scratch firewall is ever needed, make
+        # it an explicit `--reset-firewall` flag, never a default.
         run ufw default deny incoming
         run ufw default allow outgoing
         [ "$ALLOW_SSH" = "1" ] && run ufw allow 22/tcp comment 'SSH' || true
@@ -1364,6 +1439,15 @@ echo "  Update:    sudo /usr/local/bin/vula-print-update.sh $REAL_USER $SCRIPT_D
 echo
 echo "  Timers (system):"
 echo "    systemctl list-timers vula-apt-upgrade.timer vula-clamscan.timer vula-print-update.timer vula-anydesk-handshake.timer"
+echo
+echo "  ⚠  IMPORTANT — first install only:"
+echo "     Group memberships (lp, dialout, lpadmin, video, audio) added"
+echo "     during this install only take effect AFTER $REAL_USER logs"
+echo "     out and back in, or after a reboot. Until then, printing will"
+echo "     fail with 'Permission denied' on /dev/usb/lp*."
+echo
+echo "     Either:  log out, log back in as $REAL_USER"
+echo "     Or:      sudo reboot"
 echo
 
 exit "$FAILED"

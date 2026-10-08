@@ -110,7 +110,7 @@ class HistoryMixin:
         """Re-fetch a previously printed request by ID and print it again, using the
         SAME connection it was originally printed from (falls back to the first
         active connection if that store was removed)."""
-        if not self.selected_printer:
+        if not self.printer_roles.get("label"):
             QMessageBox.warning(self, "No Printer", "Please select a printer first.")
             return
 
@@ -134,26 +134,48 @@ class HistoryMixin:
                 f"configured. Using '{conn.name}' instead."
             )
 
-        try:
-            headers = self._headers_for(conn)
-            response = requests.get(
-                f"{conn.api_base_url}/admin/api/label-printing/request/{request_id}",
-                headers=headers, timeout=10
-            )
-            if response.status_code != 200:
-                QMessageBox.critical(self, "Reprint Failed",
-                    f"Server returned {response.status_code}.\n"
-                    "The request may have been deleted from the server.\n"
-                    "You can only reprint requests that still exist on the server.")
-                return
-            data = response.json()
-            items = data.get("items", [])
-        except Exception as e:
-            QMessageBox.critical(self, "Reprint Failed", f"Could not fetch request: {e}")
-            return
+        # Fetch the request detail off-thread. The confirm dialog and print
+        # start happen in the callback once the payload is available.
+        w = HttpWorker(
+            tag=f"reprintfetch:{conn.connection_id}:{request_id}",
+            method="GET",
+            url=f"{conn.api_base_url.rstrip('/')}/admin/api/label-printing/request/{request_id}",
+            headers=self._headers_for(conn),
+            timeout=10.0,
+        )
+        w.done.connect(
+            lambda r, c=conn, e=entry, rid=request_id:
+            self._on_reprint_detail_fetched(r, c, e, rid)
+        )
+        w.finished.connect(lambda w=w: self._forget_http_worker(w))
+        self._http_workers.append(w)
+        w.start()
+        self.status_bar.showMessage(f"Fetching request #{request_id} ({conn.name})…")
 
+    def _on_reprint_detail_fetched(self, result, conn, entry, request_id):
+        """Reprint detail fetch completed off-thread; confirm + print on main thread."""
+        if not (result.ok and result.status == 200):
+            if result.ok:
+                QMessageBox.critical(
+                    self, "Reprint Failed",
+                    f"Server returned {result.status}.\n"
+                    "The request may have been deleted from the server.\n"
+                    "You can only reprint requests that still exist on the server.",
+                )
+            else:
+                QMessageBox.critical(
+                    self, "Reprint Failed",
+                    f"Could not fetch request: {result.error}",
+                )
+            return
+        data = result.data if isinstance(result.data, dict) else {}
+        items = data.get("items", [])
         if not items:
             QMessageBox.warning(self, "No Items", "This request has no items to reprint.")
+            return
+        label_printer = self.printer_roles.get("label")
+        if not label_printer:
+            QMessageBox.warning(self, "No Printer", "Please select a printer first.")
             return
 
         confirm = QMessageBox.question(
@@ -161,7 +183,7 @@ class HistoryMixin:
             f"Reprint request #{request_id} ({conn.name})?\n"
             f"Originally printed: {entry.get('printed_at', 'unknown')}\n"
             f"Total labels: {entry.get('total_labels', 0)}",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if confirm != QMessageBox.StandardButton.Yes:
             return
@@ -169,7 +191,7 @@ class HistoryMixin:
         self._current_print_request = None   # don't re-save to history for reprints
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
-        self.print_job = PrintJob(self.selected_printer, items)
+        self.print_job = PrintJob(label_printer, items)
         self.print_job.progress.connect(self.on_print_progress)
         self.print_job.completed.connect(
             lambda s, m: self._on_reprint_finished(s, m, request_id)

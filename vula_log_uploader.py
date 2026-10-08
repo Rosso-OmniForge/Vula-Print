@@ -28,6 +28,11 @@ from vula_logging import LOG_FILE
 
 _log = logging.getLogger("vula.logupload")
 
+# Captured once at module import. Used by _uptime_seconds() to report
+# time-since-process-start rather than time-since-boot. Without this,
+# every device reported "uptime = 43719" the instant the app launched.
+_PROCESS_START = time.monotonic()
+
 # Tail caps — the server also enforces a 2 MB cap, this is the client side.
 MAX_TAIL_LINES = 500
 MAX_TAIL_BYTES = 1_000_000     # 1 MB
@@ -94,7 +99,7 @@ def _tail_log() -> tuple[str, int]:
 def _uptime_seconds() -> int:
     """Best-effort process uptime in seconds."""
     try:
-        return int(max(0, time.monotonic()))
+        return int(max(0, time.monotonic() - _PROCESS_START))
     except Exception:
         return 0
 
@@ -222,16 +227,12 @@ class LogUploadCoordinator:
 
 
 def _client_version() -> str:
-    """Return a short version string for the app."""
-    try:
-        import subprocess
-        r = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True,
-            cwd=Path(__file__).parent, timeout=2,
-        )
-        if r.returncode == 0:
-            return r.stdout.strip()[:64]
-    except Exception:
-        pass
-    return "unknown"
+    """Return the app's VERSION string, as read by vula_config.
+
+    Replaces a `git rev-parse` shell-out that broke whenever the source
+    tree wasn't a git checkout (any /opt or tarball deployment) and
+    reported a different value on every commit — useless for answering
+    "did the updater put the right build on this device?".
+    """
+    from vula_config import APP_VERSION_SHORT
+    return APP_VERSION_SHORT

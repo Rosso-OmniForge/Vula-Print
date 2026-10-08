@@ -306,93 +306,6 @@ class ConfigMixin:
         if result.ok and result.status == 200:
             conn.synced_config_version = int(config_version)
 
-    def _fetch_config_for_connection(self, conn: StoreConnection, show_dialogs: bool = False) -> bool:
-        """Fetch a single connection's printer-app config (user id, roles, branding, version)."""
-        try:
-            response = requests.get(
-                f"{conn.api_base_url}/admin/api/printer-app/config",
-                headers={"X-Printer-API-Key": conn.api_key},
-                timeout=8,
-            )
-        except Exception as e:
-            conn.last_connected = False
-            conn.last_status = "Connection failed"
-            if show_dialogs:
-                QMessageBox.critical(self, "Connection Failed", f"{conn.name}: {e}")
-            return False
-
-        if response.status_code == 200:
-            cfg = response.json()
-
-            conn.printer_user_id = int(cfg.get("user_id") or 0) or None
-            conn.config_version = int(cfg.get("config_version") or 0)
-            conn.synced_config_version = int(cfg.get("synced_config_version") or 0)
-            conn.last_connected = True
-            conn.last_status = "Connected"
-
-            # Branding (logo / CSS) is app-global rather than per-store; the
-            # first connection whose config successfully loads wins. This
-            # mirrors the pre-existing single-store assumption baked into
-            # the UI theme, and avoids re-theming the whole app on every
-            # multi-store poll.
-            if not self.logo_dark_url and not self.logo_light_url:
-                self.logo_dark_url = cfg.get("logo_dark_url", "")
-                self.logo_light_url = cfg.get("logo_light_url", "")
-                self.fetch_brand_css(conn)
-                self.apply_brand_theme_from_css()
-                self.download_brand_logo(conn)
-
-            self.save_settings()
-
-            if conn.config_version > conn.synced_config_version:
-                self.ack_printer_config(conn, conn.config_version)
-
-            if show_dialogs:
-                QMessageBox.information(
-                    self, "Connection Success",
-                    f"{conn.name}: connected (user_id={conn.printer_user_id})."
-                )
-            return True
-
-        conn.last_connected = False
-        if response.status_code == 401:
-            conn.last_status = "Invalid API key"
-        else:
-            conn.last_status = f"HTTP {response.status_code}"
-
-        if show_dialogs:
-            QMessageBox.warning(self, "Printer Config Error", f"{conn.name}: {conn.last_status}")
-
-        return False
-
-    def ack_printer_config(self, conn: StoreConnection, config_version: int) -> None:
-        try:
-            requests.post(
-                f"{conn.api_base_url}/admin/api/printer-app/config/ack",
-                headers=self._headers_for(conn, include_json=True),
-                json={"config_version": int(config_version)},
-                timeout=8,
-            )
-            conn.synced_config_version = int(config_version)
-        except Exception:
-            pass
-
-    def fetch_brand_css(self, conn: StoreConnection) -> None:
-        """Fetch and cache the current branded CSS from the backend."""
-        try:
-            css_path = "/admin/api/printer-app/brand-css"
-            response = requests.get(
-                f"{conn.api_base_url}{css_path}",
-                headers={"X-Printer-API-Key": conn.api_key},
-                timeout=8,
-            )
-            if response.status_code == 200:
-                css_file = Path.home() / ".config" / "vula_print" / "brand.css"
-                css_file.parent.mkdir(parents=True, exist_ok=True)
-                css_file.write_text(response.text, encoding="utf-8")
-        except Exception:
-            pass
-
     def apply_brand_theme_from_css(self) -> None:
         """Parse the saved backend brand.css and override Qt colours.
 
@@ -437,43 +350,15 @@ class ConfigMixin:
         self.C_WARNING = _colour("--status-warn-text", self.C_WARNING)
         self.C_SIDEBAR = _colour("--bg-sidebar", self.C_SIDEBAR)
 
-    def download_brand_logo(self, conn: StoreConnection) -> None:
-        """Download and cache the backend-provided printer brand logo.
-
-        Prefers the dark logo because the printer app uses a dark UI.
-        """
-        relative = self.logo_dark_url or self.logo_light_url
-        if not relative or not conn.api_base_url:
-            return
-
-        relative = relative.lstrip("/")
-        url = urljoin(conn.api_base_url.rstrip("/") + "/", relative)
-
-        try:
-            response = requests.get(url, timeout=8)
-            if response.status_code != 200:
-                return
-
-            logo_file = Path.home() / ".config" / "vula_print" / "brand_logo.png"
-            logo_file.parent.mkdir(parents=True, exist_ok=True)
-            logo_file.write_bytes(response.content)
-
-            self.brand_logo_path = str(logo_file)
-            self.save_settings()
-
-            if hasattr(self, "logo_label"):
-                pixmap = QPixmap(self.brand_logo_path)
-                if not pixmap.isNull():
-                    self.logo_label.setPixmap(
-                        pixmap.scaledToWidth(
-                            max(120, self.SIDEBAR_W - 36),
-                            Qt.TransformationMode.SmoothTransformation,
-                        )
-                    )
-        except Exception:
-            pass
-
     def upload_discovered_printers_if_ready(self) -> None:
+        """Post the current discovered-device list to every active backend.
+
+        Fire-and-forget, off the UI thread. This is a best-effort inventory
+        report — the response is not used, and failures are silently dropped
+        (they were before too). The previous implementation called
+        requests.post() synchronously, once per active connection, from a
+        Qt slot; on a slow link that was up to 8s of UI freeze per store.
+        """
         if not self.discovered_printers:
             return
 
@@ -490,36 +375,87 @@ class ConfigMixin:
             )
 
         for conn in self.active_connections:
-            try:
-                requests.post(
-                    f"{conn.api_base_url}/admin/api/printer-app/discovered-printers",
-                    headers=self._headers_for(conn, include_json=True),
-                    json=payload,
-                    timeout=8,
-                )
-            except Exception:
-                pass
+            w = HttpWorker(
+                tag=f"uploadprinters:{conn.connection_id}",
+                method="POST",
+                url=f"{conn.api_base_url.rstrip('/')}/admin/api/printer-app/discovered-printers",
+                headers=self._headers_for(conn, include_json=True),
+                json_body=payload,
+                timeout=8.0,
+            )
+            # Response is not used; connect to a no-op so HttpWorker's log
+            # line still fires and the worker cleans itself up properly.
+            w.done.connect(lambda r: None)
+            w.finished.connect(lambda w=w: self._forget_http_worker(w))
+            self._http_workers.append(w)
+            w.start()
 
     def test_all_connections(self):
-        """Test connectivity for every configured connection and report per-store results."""
+        """Test connectivity for every configured connection and report
+        per-store results. Fans out via HttpWorker so a slow or dead store
+        never freezes the UI.
+
+        Note: this is a connectivity check only. It updates each connection's
+        user_id / last_connected / last_status, but does not refresh branding
+        or ack config versions — those happen on the 60s config-refresh timer
+        (see setup_auto_refresh in printer_scan.py), or on the next
+        fetch_all_printer_configs call.
+        """
         active = self.active_connections
         if not active:
             QMessageBox.warning(self, "No Connections", "Add at least one store connection first.")
             return
 
-        results = []
-        for conn in active:
-            ok = self._fetch_config_for_connection(conn, show_dialogs=False)
-            results.append((conn.name, ok, conn.last_status))
+        self._test_all_pending = len(active)
+        self._test_all_results = []
+        self.status_bar.showMessage(f"Testing {len(active)} connection(s)…")
 
+        for conn in active:
+            w = HttpWorker(
+                tag=f"testconn:{conn.connection_id}",
+                method="GET",
+                url=f"{conn.api_base_url.rstrip('/')}/admin/api/printer-app/config",
+                headers={"X-Printer-API-Key": conn.api_key},
+                timeout=8.0,
+            )
+            w.done.connect(lambda r, c=conn: self._on_test_all_done(r, c))
+            w.finished.connect(lambda w=w: self._forget_http_worker(w))
+            self._http_workers.append(w)
+            w.start()
+
+    def _on_test_all_done(self, result: HttpResult, conn: StoreConnection):
+        if result.ok and result.status == 200 and isinstance(result.data, dict):
+            cfg = result.data
+            conn.printer_user_id = int(cfg.get("user_id") or 0) or None
+            conn.last_connected = True
+            conn.last_status = "Connected"
+            ok = True
+        else:
+            conn.last_connected = False
+            if not result.ok:
+                conn.last_status = "Connection failed"
+            elif result.status == 401:
+                conn.last_status = "Invalid API key"
+            else:
+                conn.last_status = f"HTTP {result.status}"
+            ok = False
+
+        self._test_all_results.append((conn.name, ok, conn.last_status))
+        self._test_all_pending = max(0, self._test_all_pending - 1)
+        if self._test_all_pending == 0:
+            self._on_test_all_finished()
+
+    def _on_test_all_finished(self):
         self._refresh_connection_status_summary()
         self.save_settings()
 
         lines = []
-        for name, ok, status in results:
+        for name, ok, status in self._test_all_results:
             mark = "✓" if ok else "✗"
             lines.append(f"{mark}  {name}: {status}")
         QMessageBox.information(self, "Connection Test Results", "\n".join(lines))
 
-        if any(ok for _, ok, _ in results):
+        if any(ok for _, ok, _ in self._test_all_results):
             self.fetch_pending_requests()
+
+        self.status_bar.showMessage("Ready")

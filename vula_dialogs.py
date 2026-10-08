@@ -243,18 +243,69 @@ class _ConnectionsDialog(QDialog):
         self._refresh_list()
         self._list.setCurrentRow(self._editing_index)
 
-        if conn.is_configured():
-            ok = self._app._fetch_config_for_connection(conn, show_dialogs=False)
-            self._user_id_input.setText("" if conn.printer_user_id is None else str(conn.printer_user_id))
-            self._set_status_label(conn)
-            self._refresh_list()
-            self._list.setCurrentRow(self._editing_index)
-            if not ok:
-                QMessageBox.warning(self, "Connection Failed", f"{conn.name}: {conn.last_status}")
-        else:
+        if not conn.is_configured():
             conn.last_connected = False
             conn.last_status = "Not configured"
             self._set_status_label(conn)
+            return
+
+        # Test the connection off-thread. The dialog stays responsive while
+        # a slow or dead backend is being probed, instead of freezing for
+        # up to 8s on the main thread.
+        self._status_lbl.setText("Testing…")
+        self._status_lbl.setStyleSheet(
+            f"background:#2a1f1a; color:{self._app.C_WARNING};"
+            f" border:1px solid #5a3b2a; border-radius:12px;"
+            f" font-size:11px; font-weight:600; padding:4px 10px;"
+        )
+
+        from vula_http import HttpWorker
+        w = HttpWorker(
+            tag=f"dlgtest:{conn.connection_id}",
+            method="GET",
+            url=f"{conn.api_base_url.rstrip('/')}/admin/api/printer-app/config",
+            headers={"X-Printer-API-Key": conn.api_key},
+            timeout=8.0,
+        )
+        w.done.connect(lambda r, c=conn: self._on_save_current_done(r, c))
+        w.finished.connect(lambda w=w: self._app._forget_http_worker(w))
+        self._app._http_workers.append(w)
+        w.start()
+
+    def _on_save_current_done(self, result, conn):
+        # The dialog may have been closed before the response arrived; in
+        # that case touching any widget raises RuntimeError. Swallow.
+        try:
+            if result.ok and result.status == 200 and isinstance(result.data, dict):
+                cfg = result.data
+                conn.printer_user_id = int(cfg.get("user_id") or 0) or None
+                conn.config_version = int(cfg.get("config_version") or 0)
+                conn.synced_config_version = int(cfg.get("synced_config_version") or 0)
+                conn.last_connected = True
+                conn.last_status = "Connected"
+            else:
+                conn.last_connected = False
+                if not result.ok:
+                    conn.last_status = "Connection failed"
+                elif result.status == 401:
+                    conn.last_status = "Invalid API key"
+                else:
+                    conn.last_status = f"HTTP {result.status}"
+
+            self._user_id_input.setText(
+                "" if conn.printer_user_id is None else str(conn.printer_user_id)
+            )
+            self._set_status_label(conn)
+            self._refresh_list()
+            self._list.setCurrentRow(self._editing_index)
+            if not conn.last_connected:
+                QMessageBox.warning(
+                    self, "Connection Failed",
+                    f"{conn.name}: {conn.last_status}",
+                )
+        except RuntimeError:
+            # Dialog closed while the request was in flight — nothing to do.
+            pass
 
 
 class _VisualPreviewDialog(QDialog):

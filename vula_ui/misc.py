@@ -63,16 +63,15 @@ class MiscMixin:
         )
 
     def _current_version(self) -> str:
-        """Return the current git short SHA as a version string."""
-        try:
-            result = subprocess.run(
-                ["git", "rev-parse", "--short", "HEAD"],
-                capture_output=True, text=True, cwd=Path(__file__).parent,
-                timeout=3,
-            )
-            return f"rev {result.stdout.strip()}" if result.returncode == 0 else "unknown"
-        except Exception:
-            return "unknown"
+        """Return the app version string read from the VERSION file.
+
+        Previously shelled out to `git rev-parse --short HEAD`, which
+        produced a different value on every commit and failed entirely
+        when the app was deployed without a .git directory. Reading a
+        single-file constant is both faster and actually meaningful.
+        """
+        from vula_config import APP_VERSION
+        return APP_VERSION
 
     def _do_update(self):
         """Show update status — automatic updates run via systemd timer.

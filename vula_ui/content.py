@@ -46,7 +46,8 @@ class ContentMixin:
 
     def init_ui(self):
         """Initialize the user interface."""
-        self.setWindowTitle("Vula! Print · Print Manager")
+        from vula_config import APP_VERSION
+        self.setWindowTitle(f"Vula! Print · Print Manager  —  {APP_VERSION}")
         screen_size = self._screen_size()
         min_w = max(920, int(screen_size.width() * 0.62))
         min_h = max(620, int(screen_size.height() * 0.72))
@@ -78,6 +79,9 @@ class ContentMixin:
         root_layout.setSpacing(0)
 
         sidebar = self._build_sidebar()
+        # Retained so _update_sidebar_width (SidebarMixin) can resize the
+        # sidebar on window resize without reaching into the layout.
+        self._sidebar_widget = sidebar
         root_layout.addWidget(sidebar)
 
         # thin separator line
@@ -104,18 +108,18 @@ class ContentMixin:
 
 
     def _build_content(self) -> QWidget:
-        """Tabbed main content area."""
+        """Tabbed main content area.
+
+        The old top-of-content "Vula! Print" header was removed — the
+        product name already sits prominently in the sidebar header, and
+        on smaller screens that header was costing ~40 px of vertical
+        space for zero new information.
+        """
         content = QWidget()
         content.setStyleSheet(f"background:{self.C_BG};")
         layout = QVBoxLayout(content)
         layout.setContentsMargins(20, 16, 20, 12)
         layout.setSpacing(12)
-
-        header = QLabel("Vula! Print")
-        header.setStyleSheet(
-            f"color:{self.C_TEXT}; font-size:18px; font-weight:700;"
-        )
-        layout.addWidget(header)
 
         layout.addWidget(self._build_tabs(), stretch=1)
         return content

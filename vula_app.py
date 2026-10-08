@@ -12,11 +12,15 @@ from typing import Any, Dict, List, Optional
 from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QMainWindow
 
-from vula_config import APP_CONFIG_FILE, APP_HISTORY_FILE, API_BASE_URL, API_KEY
+from vula_config import (
+    APP_CONFIG_FILE, APP_HISTORY_FILE, API_BASE_URL, API_KEY,
+    DEFAULT_POS_POLL_INTERVAL_SECONDS, StoreConnection,
+)
 from vula_http import HttpWorker
 from vula_log_uploader import LogUploadCoordinator
 from vula_workers import (
     POSPollWorker, POSEODReportPrintJob, POSSlipPrintJob, PrintJob,
+    _RetryFlushWorker,
 )
 from vula_ui.theme import ThemeMixin
 from vula_ui.sidebar import SidebarMixin
@@ -70,14 +74,21 @@ class VulaPrintApp(
         self.pos_qr_module_px: int = 4
         self.serial_config: Dict[str, Dict[str, Any]] = {}
 
-        self.selected_printer = None
-        self.pos_selected_printer = None
+        # Single source of truth for printer role assignments. Each role
+        # maps to a device path (str) or None. This replaces four
+        # previously-duplicated attributes (selected_printer /
+        # pos_selected_printer / last_selected_printer /
+        # last_selected_pos_printer / last_selected_a4_printer) that had
+        # to be kept in sync by hand at every call site. On-disk format is
+        # unchanged — settings.json still uses printer_roles + the legacy
+        # top-level keys (see settings.py.save_settings).
+        self.printer_roles: Dict[str, Optional[str]] = {
+            "label": None, "pos_slip": None, "a4": None,
+        }
         self.printer_calibrated = False
         self.pending_requests: List[Dict[str, Any]] = []
-        self.last_selected_printer: Optional[str] = None
-        self.last_selected_pos_printer: Optional[str] = None
         self.auto_connect_on_startup = True
-        self.pos_poll_interval_seconds = 2  # default 2s; HTTP is off-thread so low interval is safe
+        self.pos_poll_interval_seconds = DEFAULT_POS_POLL_INTERVAL_SECONDS
         self.calibration_job: Optional[PrintJob] = None
         self.print_job: Optional[PrintJob] = None
         self.pos_print_job: Optional[POSSlipPrintJob] = None

@@ -51,7 +51,7 @@ class ActionsMixin:
             QMessageBox.critical(self, "Error", "Could not determine store connection for this request.")
             return
 
-        if not self.selected_printer:
+        if not self.printer_roles.get("label"):
             QMessageBox.warning(self, "No Printer", "Please select a printer first.")
             return
 
@@ -65,45 +65,52 @@ class ActionsMixin:
             if reply == QMessageBox.StandardButton.No:
                 return
 
-        try:
-            # Fetch request details from the correct store
-            headers = self._headers_for(conn)
-            response = requests.get(
-                f"{conn.api_base_url}/admin/api/label-printing/request/{request['id']}",
-                headers=headers,
-                timeout=10
-            )
+        # Fetch the request detail off the UI thread. The previous sync
+        # requests.get() blocked the whole app for up to 10s on a slow
+        # link, which read as "the printer app has frozen".
+        w = HttpWorker(
+            tag=f"labeldetail:{conn.connection_id}:{request['id']}",
+            method="GET",
+            url=f"{conn.api_base_url.rstrip('/')}/admin/api/label-printing/request/{request['id']}",
+            headers=self._headers_for(conn),
+            timeout=10.0,
+        )
+        w.done.connect(
+            lambda r, c=conn, req=request: self._on_label_detail_fetched(r, c, req)
+        )
+        w.finished.connect(lambda w=w: self._forget_http_worker(w))
+        self._http_workers.append(w)
+        w.start()
+        self.status_bar.showMessage(f"Fetching request #{request['id']} ({conn.name})…")
 
-            if response.status_code != 200:
-                QMessageBox.critical(self, "Error", "Failed to fetch print job details")
-                return
+    def _on_label_detail_fetched(self, result, conn, request):
+        """Detail fetch completed off-thread; start the print job on the main thread."""
+        if not (result.ok and result.status == 200):
+            QMessageBox.critical(self, "Error", "Failed to fetch print job details")
+            return
+        data = result.data if isinstance(result.data, dict) else {}
+        items = data.get("items", [])
+        if not items:
+            QMessageBox.warning(self, "No Items", "This request has no items to print.")
+            return
+        # The user may have changed the label printer during the fetch
+        # window. Re-read the current assignment and use it directly — do
+        # not read self.printer_roles twice.
+        label_printer = self.printer_roles.get("label")
+        if not label_printer:
+            QMessageBox.warning(self, "No Printer", "Please select a printer first.")
+            return
 
-            data = response.json()
-            items = data.get("items", [])
-
-            if not items:
-                QMessageBox.warning(self, "No Items", "This request has no items to print.")
-                return
-
-            # Track for history saving
-            self._current_print_request = request
-
-            # Start print job
-            self.progress_bar.setVisible(True)
-            self.progress_bar.setValue(0)
-
-            self.print_job = PrintJob(self.selected_printer, items)
-            self.print_job.progress.connect(self.on_print_progress)
-            self.print_job.completed.connect(
-                lambda s, m: self.on_print_finished(s, m, request['id'], conn.connection_id)
-            )
-            self.print_job.start()
-
-            self.status_bar.showMessage(f"Printing request #{request['id']} ({conn.name})...")
-
-        except Exception as e:
-            QMessageBox.critical(self, "Print Error", f"Failed to start print job: {e}")
-            self.progress_bar.setVisible(False)
+        self._current_print_request = request
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.print_job = PrintJob(label_printer, items)
+        self.print_job.progress.connect(self.on_print_progress)
+        self.print_job.completed.connect(
+            lambda s, m: self.on_print_finished(s, m, request['id'], conn.connection_id)
+        )
+        self.print_job.start()
+        self.status_bar.showMessage(f"Printing request #{request['id']} ({conn.name})...")
 
     def on_print_progress(self, current: int, total: int):
         """Update progress bar."""
@@ -131,7 +138,8 @@ class ActionsMixin:
 
     def calibrate_printer(self):
         """Calibrate printer and print test label."""
-        if not self.selected_printer:
+        label_printer = self.printer_roles.get("label")
+        if not label_printer:
             QMessageBox.warning(self, "No Printer", "Please select a printer first.")
             return
 
@@ -152,12 +160,12 @@ class ActionsMixin:
             "HOME\n"        # advance to first clean label start
         )
         try:
-            with open(self.selected_printer, 'wb') as printer:
-                printer.write(calibration_tspl.encode('utf-8'))
+            from vula_device_io import write_to_device
+            write_to_device(label_printer, calibration_tspl.encode('utf-8'))
         except PermissionError:
             QMessageBox.critical(
                 self, "Permission Denied",
-                f"Cannot write to {self.selected_printer}.\n\n"
+                f"Cannot write to {label_printer}.\n\n"
                 f"The printer device requires your user account to be in the 'lp' group.\n\n"
                 f"Re-run the install script to fix this automatically, or run:\n"
                 f"  sudo usermod -aG lp $USER\n\n"
@@ -176,6 +184,13 @@ class ActionsMixin:
 
     def _print_calibration_test_label(self):
         """Second half of calibration: prints the test label after the feed."""
+        # Re-read the assignment — the 1.5 s gap since calibrate_printer
+        # ran is a window in which the operator could have changed it.
+        label_printer = self.printer_roles.get("label")
+        if not label_printer:
+            self.status_bar.showMessage("Printer unassigned during calibration")
+            return
+
         test_item = {
             "title": "VULA! PRINT",
             "variant_label": "Calibration Test",
@@ -185,7 +200,7 @@ class ActionsMixin:
             "currency": "ZAR",
         }
 
-        self.calibration_job = PrintJob(self.selected_printer, [test_item])
+        self.calibration_job = PrintJob(label_printer, [test_item])
         self.calibration_job.completed.connect(self.on_test_print_finished)
         self.calibration_job.start()
 
@@ -224,7 +239,8 @@ class ActionsMixin:
 
     def print_test_label_standalone(self):
         """Print a single representative test label to check layout without calibrating."""
-        if not self.selected_printer:
+        label_printer = self.printer_roles.get("label")
+        if not label_printer:
             QMessageBox.warning(self, "No Printer", "Please select a printer first.")
             return
 
@@ -248,7 +264,7 @@ class ActionsMixin:
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        job = PrintJob(self.selected_printer, [test_item])
+        job = PrintJob(label_printer, [test_item])
         job.completed.connect(self._on_test_label_standalone_finished)
         self.status_bar.showMessage("Printing test label…")
         job.start()
@@ -325,7 +341,8 @@ class ActionsMixin:
 
     def print_test_pos_slip(self):
         """Print a six-item sample POS slip for cutter/alignment verification."""
-        if not self.pos_selected_printer:
+        pos_printer = self.printer_roles.get("pos_slip")
+        if not pos_printer:
             QMessageBox.warning(self, "No POS Printer", "Please select a POS slip printer first.")
             return
         if self.pos_print_job and self.pos_print_job.isRunning():
@@ -344,7 +361,7 @@ class ActionsMixin:
 
         sample_payload = self._build_sample_pos_payload()
         self.pos_print_job = POSSlipPrintJob(
-            self.pos_selected_printer,
+            pos_printer,
             sample_payload,
             width_chars=self.pos_width_chars,
             qr_mode=self.pos_qr_mode,

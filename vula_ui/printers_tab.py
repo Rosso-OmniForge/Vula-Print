@@ -21,11 +21,12 @@ from PyQt6.QtWidgets import (
 )
 
 
-# (role_key, display_name, state_attribute_name)
+# (role_key, display_name) — role_key is the dict key into
+# VulaPrintApp.printer_roles.
 _ROLES = [
-    ("label",    "Label Printer",  "last_selected_printer"),
-    ("pos_slip", "POS Printer",    "last_selected_pos_printer"),
-    ("a4",       "A4 Printer",     "last_selected_a4_printer"),
+    ("label",    "Label Printer"),
+    ("pos_slip", "POS Printer"),
+    ("a4",       "A4 Printer"),
 ]
 
 
@@ -35,9 +36,10 @@ class PrintersTabMixin:
     # ── Entry point ─────────────────────────────────────────────
 
     def _build_printers_tab_content(self) -> QWidget:
-        # State defaults — A4 has no persistence yet.
-        if not hasattr(self, "last_selected_a4_printer"):
-            self.last_selected_a4_printer = None
+        # Defensive default in case this is ever called before
+        # vula_app.__init__ has run (tests, ad-hoc use).
+        if not hasattr(self, "printer_roles"):
+            self.printer_roles = {"label": None, "pos_slip": None, "a4": None}
         if not hasattr(self, "printer_status"):
             self.printer_status: Dict[str, str] = {}
 
@@ -68,8 +70,8 @@ class PrintersTabMixin:
 
         self._printer_card_labels: Dict[str, Dict[str, QLabel]] = {}
         self._printer_card_widgets: Dict[str, QWidget] = {}
-        for i, (role_key, role_name, state_attr) in enumerate(_ROLES):
-            card = self._build_printer_card(role_key, role_name, state_attr)
+        for i, (role_key, role_name) in enumerate(_ROLES):
+            card = self._build_printer_card(role_key, role_name)
             self._printer_card_widgets[role_key] = card
             self._printer_card_grid.addWidget(card, i // 2, i % 2)
 
@@ -118,7 +120,7 @@ class PrintersTabMixin:
 
     # ── Card ────────────────────────────────────────────────────
 
-    def _build_printer_card(self, role_key: str, role_name: str, state_attr: str) -> QWidget:
+    def _build_printer_card(self, role_key: str, role_name: str) -> QWidget:
         card = QFrame()
         card.setStyleSheet(f"""
             QFrame {{
@@ -168,8 +170,8 @@ class PrintersTabMixin:
         change_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         change_btn.setStyleSheet(self._btn_secondary())
         change_btn.clicked.connect(
-            lambda _, rk=role_key, rn=role_name, sa=state_attr:
-            self._change_role_printer(rk, rn, sa)
+            lambda _, rk=role_key, rn=role_name:
+            self._change_role_printer(rk, rn)
         )
 
         actions.addWidget(change_btn)
@@ -190,8 +192,8 @@ class PrintersTabMixin:
         settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         settings_btn.setStyleSheet(self._btn_secondary())
         settings_btn.clicked.connect(
-            lambda _, rk=role_key, rn=role_name, sa=state_attr:
-            self._open_serial_settings_for_role(rk, rn, sa)
+            lambda _, rk=role_key, rn=role_name:
+            self._open_serial_settings_for_role(rk, rn)
         )
         settings_btn.setEnabled(False)
         settings_btn.setToolTip(
@@ -232,8 +234,8 @@ class PrintersTabMixin:
         return "online"
 
     def _refresh_printer_status(self) -> None:
-        for role_key, _name, state_attr in _ROLES:
-            path = getattr(self, state_attr, None) or ""
+        for role_key, _name in _ROLES:
+            path = self.printer_roles.get(role_key) or ""
             status = self._probe_device(path)
             if path:
                 self.printer_status[path] = status
@@ -300,18 +302,22 @@ class PrintersTabMixin:
             self._discovered_list.addItem(item)
             return
 
-        from vula_device_io import describe_device
+        # Descriptions are computed in the PrinterScanner worker thread and
+        # cached; fall back to the raw path only if the cache missed (e.g.
+        # a device that appeared after the last scan).
+        descriptions = getattr(self, "_device_descriptions_cache", {}) or {}
         marker = {"online": "●", "permission": "◐", "offline": "○"}
         for dev in devices:
             status = self._probe_device(dev)
             glyph = marker.get(status, "?")
-            item = QListWidgetItem(f"  {glyph}   {describe_device(dev)}")
+            desc = descriptions.get(dev, dev)
+            item = QListWidgetItem(f"  {glyph}   {desc}")
             self._discovered_list.addItem(item)
 
     # ── Role assignment dialog ──────────────────────────────────
 
-    def _change_role_printer(self, role_key: str, role_name: str, state_attr: str) -> None:
-        current = getattr(self, state_attr, None)
+    def _change_role_printer(self, role_key: str, role_name: str) -> None:
+        current = self.printer_roles.get(role_key)
 
         dlg = QDialog(self)
         dlg.setWindowTitle(f"Assign {role_name}")
@@ -354,10 +360,10 @@ class PrintersTabMixin:
                 color:{self.C_ORANGE};
             }}
         """)
-        from vula_device_io import describe_device
+        descriptions = getattr(self, "_device_descriptions_cache", {}) or {}
         device_list.addItem(QListWidgetItem("—  None (unassign this role)"))
         for dev in (self.discovered_printers or []):
-            device_list.addItem(QListWidgetItem(f"   {describe_device(dev)}"))
+            device_list.addItem(QListWidgetItem(f"   {descriptions.get(dev, dev)}"))
         layout.addWidget(device_list, stretch=1)
 
         if current and current in (self.discovered_printers or []):
@@ -381,23 +387,20 @@ class PrintersTabMixin:
         row = device_list.currentRow()
         chosen = None if row <= 0 else (self.discovered_printers or [])[row - 1]
 
-        setattr(self, state_attr, chosen)
-
-        # Keep legacy attributes in sync
-        if role_key == "label":
-            self.last_selected_printer = chosen
-            self.selected_printer = chosen
-        elif role_key == "pos_slip":
-            self.last_selected_pos_printer = chosen
-            self.pos_selected_printer = chosen
+        self.printer_roles[role_key] = chosen
 
         # Record the stable fingerprint so we can re-resolve this role after
-        # a reboot re-enumerates /dev/usb/lpN in a different order.
+        # a reboot re-enumerates /dev/usb/lpN in a different order. Read
+        # from the cache computed by the PrinterScanner worker thread;
+        # fall back to a direct lookup only if the cache missed (rare —
+        # would mean the device appeared since the last scan).
         if not getattr(self, "printer_role_fingerprints", None):
             self.printer_role_fingerprints = {}
         if chosen:
-            from vula_device_io import fingerprint_for_path
-            fp = fingerprint_for_path(chosen)
+            fp = (getattr(self, "_device_fingerprints_cache", {}) or {}).get(chosen, "")
+            if not fp:
+                from vula_device_io import fingerprint_for_path
+                fp = fingerprint_for_path(chosen)
             if fp:
                 self.printer_role_fingerprints[role_key] = fp
         else:
@@ -425,8 +428,8 @@ class PrintersTabMixin:
             )
     # ── Serial settings ─────────────────────────────────────────
 
-    def _open_serial_settings_for_role(self, role_key: str, role_name: str, state_attr: str) -> None:
-        path = getattr(self, state_attr, None)
+    def _open_serial_settings_for_role(self, role_key: str, role_name: str) -> None:
+        path = self.printer_roles.get(role_key)
         if not path:
             QMessageBox.information(
                 self, "No Printer",

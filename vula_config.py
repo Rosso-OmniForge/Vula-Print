@@ -35,21 +35,52 @@ def _load_env_file(env_file: Path) -> None:
 APP_ROOT = Path(__file__).parent
 _load_env_file(APP_ROOT / ".env")
 
-API_BASE_URL = os.getenv("PRINTER_API_BASE_URL", "https://store.baytalemirati.co.za")
+
+def _read_app_version() -> tuple:
+    """Read the VERSION file at project root.
+
+    Returns (full, short). ``full`` is display-ready ("v1.1.871");
+    ``short`` is the raw value without the "v" prefix ("1.1.871") for
+    machine consumption (log uploads, ticket correlation).
+
+    Falls back to a safe placeholder if the file is missing or
+    unreadable, so a broken checkout still boots.
+    """
+    vfile = APP_ROOT / "VERSION"
+    try:
+        raw = vfile.read_text(encoding="utf-8").strip()
+        if raw:
+            short = raw.lstrip("vV")
+            return f"v{short}", short
+    except Exception:
+        pass
+    return "v0.0.0-unknown", "0.0.0-unknown"
+
+
+# App version, read once at import. Everything that wants to know "what
+# build is this device running?" should read from here rather than
+# shelling out to git — the git approach produced a different string on
+# every commit and failed entirely on any deployment without a .git dir.
+APP_VERSION, APP_VERSION_SHORT = _read_app_version()
+
+API_BASE_URL = os.getenv("PRINTER_API_BASE_URL", "")
 API_KEY = os.getenv("PRINTER_API_KEY", "")
+
+# Single source of truth for the default POS poll interval. Previously
+# vula_app.py said 2 and vula_ui/settings.py said 5 — they disagreed on
+# a fresh install before any settings file existed.
+DEFAULT_POS_POLL_INTERVAL_SECONDS = 5
+
 APP_CONFIG_FILE = Path.home() / ".config" / "vula_print" / "settings.json"
 APP_HISTORY_FILE = Path.home() / ".config" / "vula_print" / "print_history.json"
 
 MAX_STORE_CONNECTIONS = 4
 
-# Mapping of role key → attribute name on the app object that stores the
-# currently assigned device path. Kept here so both printers_tab.py and
-# printer_scan.py can share the same definition.
-PRINTER_ROLE_ATTRS = {
-    "label":    "last_selected_printer",
-    "pos_slip": "last_selected_pos_printer",
-    "a4":       "last_selected_a4_printer",
-}
+# Ordered tuple of the printer roles the app tracks. Each role maps to a
+# device path (or None) in VulaPrintApp.printer_roles. Kept here so
+# printers_tab.py, printer_scan.py, and any future role-aware code share
+# one definition.
+PRINTER_ROLES = ("label", "pos_slip", "a4")
 
 
 @dataclass

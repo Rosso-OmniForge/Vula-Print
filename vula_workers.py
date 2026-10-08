@@ -30,9 +30,16 @@ class PrinterScanner(QThread):
     Both raw serial device paths and their by-id symlinks may appear in the
     results. If a device is present via both, prefer the by-id symlink when
     assigning roles — it is stable across reboots and re-plugs.
+
+    Fingerprinting and human-readable descriptions are computed here (on
+    the worker thread) rather than in the slot that receives the result.
+    Both operations can walk sysfs and shell out to ``udevadm``, so doing
+    them on the Qt main thread caused a visible stutter on every scan tick
+    with multiple printers attached.
     """
 
-    printers_found = pyqtSignal(list)
+    # devices, {device_path: fingerprint}, {device_path: description}
+    printers_found = pyqtSignal(list, dict, dict)
 
     def run(self):
         devices = []
@@ -62,10 +69,28 @@ class PrinterScanner(QThread):
         except Exception as e:
             print(f"Error scanning for printers: {e}")
 
+        # Compute the fingerprint + description table here, off the UI
+        # thread. Both calls can be expensive for USB printer-class nodes
+        # (sysfs walk, possibly udevadm subprocess); the per-device cost is
+        # bounded but the aggregate was noticeable on multi-printer boxes.
+        from vula_device_io import fingerprint_for_path, describe_device
+
+        fingerprints: Dict[str, str] = {}
+        descriptions: Dict[str, str] = {}
+        for d in devices:
+            try:
+                fingerprints[d] = fingerprint_for_path(d) or ""
+            except Exception:
+                fingerprints[d] = ""
+            try:
+                descriptions[d] = describe_device(d)
+            except Exception:
+                descriptions[d] = d
+
         slog = logging.getLogger("vula.scan")
         slog.info("discovered %d device(s): %s",
                   len(devices), devices or "(none)")
-        self.printers_found.emit(devices)
+        self.printers_found.emit(devices, fingerprints, descriptions)
 
 
 class PrintJob(QThread):

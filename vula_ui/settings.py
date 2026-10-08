@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import (
 
 from vula_config import (
     API_BASE_URL, API_KEY, APP_CONFIG_FILE, APP_HISTORY_FILE,
-    MAX_STORE_CONNECTIONS, StoreConnection,
+    DEFAULT_POS_POLL_INTERVAL_SECONDS, MAX_STORE_CONNECTIONS, StoreConnection,
 )
 from vula_http import HttpWorker, HttpResult
 from vula_workers import (
@@ -93,10 +93,20 @@ class SettingsMixin:
 
             self.brand_logo_path = data.get("brand_logo_path") or self.brand_logo_path
             roles = data.get("printer_roles") or {}
-            self.last_selected_printer = roles.get("label") or data.get("label_printer_device") or None
-            self.last_selected_pos_printer = roles.get("pos_slip") or data.get("pos_slip_printer_device") or None
+            # Single source of truth. Legacy top-level keys
+            # (label_printer_device, pos_slip_printer_device) are read as
+            # a fallback for installs that predate the printer_roles dict.
+            self.printer_roles = {
+                "label":    roles.get("label")    or data.get("label_printer_device")    or None,
+                "pos_slip": roles.get("pos_slip") or data.get("pos_slip_printer_device") or None,
+                "a4":       roles.get("a4")       or None,
+            }
+
             self.auto_connect_on_startup = bool(data.get("auto_connect_on_startup", True))
-            self.pos_poll_interval_seconds = int(data.get("pos_poll_interval_seconds", 5) or 5)
+            self.pos_poll_interval_seconds = int(
+                data.get("pos_poll_interval_seconds", DEFAULT_POS_POLL_INTERVAL_SECONDS)
+                or DEFAULT_POS_POLL_INTERVAL_SECONDS
+            )
             # POS printer compatibility settings — see POSSlipPrintJob.
             # Defaults match the common "58mm receipt clone" hardware.
             self.pos_width_chars = int(data.get("pos_width_chars", 32) or 32)
@@ -131,11 +141,16 @@ class SettingsMixin:
         """Persist app settings."""
         try:
             APP_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            roles = getattr(self, "printer_roles", {}) or {}
             data = {
                 "store_connections": [c.to_settings_dict() for c in self.store_connections],
                 "brand_logo_path": self.brand_logo_path,
-                "label_printer_device": self.last_selected_printer,
-                "pos_slip_printer_device": self.last_selected_pos_printer,
+                # Legacy top-level keys are still written so a build that
+                # predates the printer_roles dict can read them if it ever
+                # runs against the same settings file. Load reads from
+                # printer_roles first and falls back to these.
+                "label_printer_device": roles.get("label"),
+                "pos_slip_printer_device": roles.get("pos_slip"),
                 "auto_connect_on_startup": self.auto_connect_on_startup,
                 "pos_poll_interval_seconds": self.pos_poll_interval_seconds,
                 "pos_width_chars": int(self.pos_width_chars),
@@ -143,8 +158,9 @@ class SettingsMixin:
                 "pos_qr_module_px": int(self.pos_qr_module_px),
                 "serial_config": dict(getattr(self, "serial_config", {}) or {}),
                 "printer_roles": {
-                    "label": self.last_selected_printer,
-                    "pos_slip": self.last_selected_pos_printer,
+                    "label":    roles.get("label"),
+                    "pos_slip": roles.get("pos_slip"),
+                    "a4":       roles.get("a4"),
                 },
                 "printer_role_fingerprints": dict(
                     getattr(self, "printer_role_fingerprints", {}) or {}

@@ -70,11 +70,11 @@ class ThemeMixin:
 
     C_SIDEBAR   = "#13161c"   # sidebar
 
-    SIDEBAR_W   = 220
+    SIDEBAR_W   = 210     # default; overridden at runtime by _responsive_sidebar_width
 
-    SIDEBAR_MIN_W = 170
+    SIDEBAR_MIN_W = 160
 
-    SIDEBAR_MAX_W = 280
+    SIDEBAR_MAX_W = 260
 
     def _screen_size(self) -> QSize:
         screen = QApplication.primaryScreen()
@@ -83,12 +83,21 @@ class ThemeMixin:
         return screen.availableGeometry().size()
 
     def _responsive_sidebar_width(self) -> int:
+        """Pick a sidebar width that scales with the window.
+
+        Four tiers instead of the previous three, and tighter at every
+        tier. The sidebar was eating a disproportionate share of the
+        horizontal space on small (1024×768 POS) screens where the
+        content area needs it most.
+        """
         width = self.width() if self.width() > 0 else self._screen_size().width()
-        if width <= 980:
-            return 178
-        if width >= 1900:
-            return 258
-        return 220
+        if width < 1000:
+            return 170
+        if width < 1300:
+            return 190
+        if width < 1900:
+            return 210
+        return 240
 
     def _dialog_size(self, width_ratio: float, height_ratio: float, min_w: int, min_h: int, max_w: int, max_h: int) -> QSize:
         screen_size = self._screen_size()

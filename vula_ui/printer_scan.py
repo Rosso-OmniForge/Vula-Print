@@ -9,7 +9,7 @@ import logging
 from typing import List
 
 from vula_workers import PrinterScanner
-from vula_config import PRINTER_ROLE_ATTRS
+from vula_config import PRINTER_ROLES
 
 _log = logging.getLogger("vula.scan")
 
@@ -42,17 +42,26 @@ class PrinterScanMixin:
         self.scanner.printers_found.connect(self.on_printers_found)
         self.scanner.start()
 
-    def on_printers_found(self, printers: List[str]):
-        """Store the discovered device list and refresh any open views."""
+    def on_printers_found(self, printers: List[str], fingerprints: dict = None,
+                          descriptions: dict = None):
+        """Store the discovered device list and refresh any open views.
+
+        The fingerprint and description tables are computed inside the
+        PrinterScanner worker thread and passed in here as plain dicts —
+        this slot runs on the Qt main thread, so we never call the
+        (potentially expensive) device_io helpers from here.
+        """
         self.discovered_printers = list(printers or [])
+        self._device_fingerprints_cache = dict(fingerprints or {})
+        self._device_descriptions_cache = dict(descriptions or {})
 
         # Emit a compact device→fingerprint table once per scan so the
         # deployment audit can be done from the app log alone. Format:
         #   "/dev/usb/lp0=usb:0416:5011:ABC123, /dev/usb/lp1=path:/dev/usb/lp1"
         try:
-            from vula_device_io import fingerprint_for_path
             summary = ", ".join(
-                f"{d}={fingerprint_for_path(d)}" for d in self.discovered_printers
+                f"{d}={self._device_fingerprints_cache.get(d, '')}"
+                for d in self.discovered_printers
             )
             _log.info("device fingerprint table: [%s]", summary or "(none)")
         except Exception as exc:
@@ -81,39 +90,43 @@ class PrinterScanMixin:
         If the fingerprint for a role's saved path no longer matches any
         discovered device, leave the role untouched — the operator will see
         the "Offline" red status on that card and re-assign it manually.
+
+        All fingerprint lookups read from the cache populated by the
+        PrinterScanner worker thread — this method runs on the Qt main
+        thread and must not call ``fingerprint_for_path`` directly.
         """
         fingerprints = getattr(self, "printer_role_fingerprints", None) or {}
         if not fingerprints or not self.discovered_printers:
             return
 
-        from vula_device_io import fingerprint_for_path
+        device_fps = getattr(self, "_device_fingerprints_cache", {}) or {}
 
         # Pre-compute the discovered fingerprint → path map once.
         discovered_fp: dict = {}
         for dev in self.discovered_printers:
-            fp = fingerprint_for_path(dev)
+            fp = device_fps.get(dev, "")
             if fp and fp not in discovered_fp:
                 discovered_fp[fp] = dev
 
         changed = False
-        for role_key, state_attr in PRINTER_ROLE_ATTRS.items():
+        for role_key in PRINTER_ROLES:
             saved_fp = fingerprints.get(role_key)
             if not saved_fp:
                 continue
-            current_path = getattr(self, state_attr, None)
-            # If the currently saved path already matches, nothing to do.
-            if current_path and fingerprint_for_path(current_path) == saved_fp:
-                continue
+            current_path = self.printer_roles.get(role_key)
+
+            # Cheap unchanged-check: if the currently saved path is present
+            # in this scan and its fingerprint matches what we saved, the
+            # role is already correct — nothing to do.
+            if current_path:
+                current_fp = device_fps.get(current_path, "")
+                if current_fp and current_fp == saved_fp:
+                    continue
+
             new_path = discovered_fp.get(saved_fp)
-            if not new_path:
+            if not new_path or new_path == current_path:
                 continue
-            setattr(self, state_attr, new_path)
-            if role_key == "label":
-                self.last_selected_printer = new_path
-                self.selected_printer = new_path
-            elif role_key == "pos_slip":
-                self.last_selected_pos_printer = new_path
-                self.pos_selected_printer = new_path
+            self.printer_roles[role_key] = new_path
             changed = True
             try:
                 self.status_bar.showMessage(
@@ -131,7 +144,7 @@ class PrinterScanMixin:
     def _update_pos_worker_status(self, extra_note=None):
         """Refresh the POS worker readiness indicator in the sidebar."""
         connections_with_user = [c for c in self.active_connections if c.printer_user_id]
-        ready = bool(self.pos_selected_printer and connections_with_user)
+        ready = bool(self.printer_roles.get("pos_slip") and connections_with_user)
         if ready:
             text = f"POS worker ready · {len(connections_with_user)} store(s)"
             if extra_note:
