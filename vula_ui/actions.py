@@ -148,16 +148,31 @@ class ActionsMixin:
             return
 
         # ── 1. Send the TSPL calibration sequence ────────────────────
+        # Restored from the pre-rewrite label_printer.py, which is the
+        # sequence known to work on the SM-USB / SMART SI clone at the
+        # client sites. The rewrite dropped four commands and added
+        # GAPDETECT + HOME, which the clone firmware does not implement
+        # correctly — the net effect was "calibration appears to do
+        # nothing" because stale buffer content was being printed.
+        #
+        #   ~!T          reset to power-on defaults — clean baseline
+        #   SHIFT 16     matches PrintJob.horizontal_shift_dots
+        #   OFFSET 0     explicit zero vertical offset
+        #   CLS          clear buffer — MUST be last
+        #
+        # Do not re-add GAPDETECT or HOME without a per-printer opt-in;
+        # they misbehave on the clone hardware we ship against.
         calibration_tspl = (
+            "~!T\n"
             "SIZE 40 mm,30 mm\n"
             "GAP 2 mm,0\n"
             "DIRECTION 0\n"
-            "REFERENCE 0,0\n"
-            "SET TEAR ON\n"
+            "SHIFT 16\n"
+            "OFFSET 0\n"
             "SPEED 4\n"
             "DENSITY 8\n"
-            "GAPDETECT\n"   # physically feeds and measures the gap
-            "HOME\n"        # advance to first clean label start
+            "SET TEAR ON\n"
+            "CLS\n"
         )
         try:
             from vula_device_io import write_to_device
@@ -198,6 +213,10 @@ class ActionsMixin:
             "code39": "CALIBTEST",
             "price_cents": 95000,
             "currency": "ZAR",
+            # qty_to_print drives PrintJob.run()'s total-label count.
+            # Its absence here meant the calibration test label silently
+            # printed zero copies.
+            "qty_to_print": 1,
         }
 
         self.calibration_job = PrintJob(label_printer, [test_item])

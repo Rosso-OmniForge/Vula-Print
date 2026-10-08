@@ -153,6 +153,22 @@ class _ConnectionsDialog(QDialog):
             self._list.setCurrentRow(0)
 
     def _refresh_list(self):
+        """Rebuild the connection list, preserving the current selection.
+
+        Clearing a QListWidget fires currentRowChanged(-1), which runs
+        _on_row_changed(-1), which sets self._editing_index = None.
+        Any caller that then does `self._list.setCurrentRow(
+        self._editing_index)` crashes with a TypeError on None.
+
+        Blocking signals during the rebuild, then restoring the saved
+        row, makes that class of bug impossible — by the time this
+        returns, _editing_index is either the same value it was on
+        entry, or None only if the list is now empty (which is a real
+        state, not a bug).
+        """
+        saved = self._editing_index
+
+        self._list.blockSignals(True)
         self._list.clear()
         for conn in self._app.store_connections:
             label = conn.name
@@ -162,6 +178,14 @@ class _ConnectionsDialog(QDialog):
             else:
                 label = f"—  {conn.name} (not configured)"
             self._list.addItem(QListWidgetItem(label))
+        self._list.blockSignals(False)
+
+        # Restore selection; this re-fires _on_row_changed, which
+        # repopulates the edit form with the (possibly updated) record.
+        if saved is not None and 0 <= saved < self._list.count():
+            self._list.setCurrentRow(saved)
+        else:
+            self._editing_index = None
 
     def _on_row_changed(self, row: int):
         self._editing_index = row if row is not None and row >= 0 else None
@@ -240,8 +264,11 @@ class _ConnectionsDialog(QDialog):
         conn.api_base_url = self._url_input.text().strip()
         conn.api_key = self._key_input.text().strip()
 
+        # _refresh_list preserves and restores the selection internally.
+        # Do NOT add a setCurrentRow(self._editing_index) here — that was
+        # the line that crashed (TypeError on None) before _refresh_list
+        # was made signal-safe.
         self._refresh_list()
-        self._list.setCurrentRow(self._editing_index)
 
         if not conn.is_configured():
             conn.last_connected = False
@@ -297,7 +324,6 @@ class _ConnectionsDialog(QDialog):
             )
             self._set_status_label(conn)
             self._refresh_list()
-            self._list.setCurrentRow(self._editing_index)
             if not conn.last_connected:
                 QMessageBox.warning(
                     self, "Connection Failed",
