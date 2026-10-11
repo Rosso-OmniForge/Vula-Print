@@ -37,10 +37,12 @@ from vula_ui.actions import ActionsMixin
 from vula_ui.preview import PreviewMixin
 from vula_ui.history import HistoryMixin
 from vula_ui.misc import MiscMixin
+from vula_ui.label_layout import LabelLayoutMixin
 
 
 class VulaPrintApp(
     MiscMixin,
+    LabelLayoutMixin,
     HistoryMixin,
     PreviewMixin,
     ActionsMixin,
@@ -75,13 +77,7 @@ class VulaPrintApp(
         self.serial_config: Dict[str, Dict[str, Any]] = {}
 
         # Single source of truth for printer role assignments. Each role
-        # maps to a device path (str) or None. This replaces four
-        # previously-duplicated attributes (selected_printer /
-        # pos_selected_printer / last_selected_printer /
-        # last_selected_pos_printer / last_selected_a4_printer) that had
-        # to be kept in sync by hand at every call site. On-disk format is
-        # unchanged — settings.json still uses printer_roles + the legacy
-        # top-level keys (see settings.py.save_settings).
+        # maps to a device path (str) or None.
         self.printer_roles: Dict[str, Optional[str]] = {
             "label": None, "pos_slip": None, "a4": None,
         }
@@ -109,9 +105,6 @@ class VulaPrintApp(
         self._pending_fetch_errors: List[str] = []
         self._pending_fetch_any_ok: bool = False
         # Round-robin cursor over store_connections for the POS poll cycle.
-        # Only one worker / one physical POS print job runs at a time; each
-        # timer tick advances to the next connection so both stores get
-        # serviced fairly without ever printing two slips concurrently.
         self._pos_poll_cursor = 0
         self.last_successful_pos_poll_at: Optional[datetime] = None
         self.last_successful_pos_print_at: Optional[datetime] = None
@@ -122,6 +115,11 @@ class VulaPrintApp(
         self.logo_light_url = ""
         self.discovered_printers: list[str] = []
         self.brand_logo_path = str(Path(__file__).parent / "assets" / "Vula_Logo.png")
+
+        # Label layout defaults — overwritten by load_settings() if a
+        # "label_layout" block is present in settings.json.
+        from vula_config import DEFAULT_LABEL_LAYOUT
+        self.label_layout: Dict[str, Any] = dict(DEFAULT_LABEL_LAYOUT)
 
         self.load_settings()
         from vula_device_io import set_serial_configs as _set_serial_cfgs
@@ -138,8 +136,6 @@ class VulaPrintApp(
         # Log upload cadence:
         #   * 45 s after startup (let the config fetch settle first)
         #   * every 6 hours thereafter
-        # Uploads are best-effort; if the backend doesn't have the endpoint
-        # yet, the coordinator suppresses retries for 24 h and logs once.
         QTimer.singleShot(45_000, lambda: self._log_uploader.upload_async("startup"))
         self._log_upload_timer = QTimer()
         self._log_upload_timer.timeout.connect(

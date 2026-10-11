@@ -353,7 +353,10 @@ class _VisualPreviewDialog(QDialog):
         self._items    = items
         self._idx      = 0
         self._renderer = TSPLRenderer()
-        self._job      = PrintJob("", items)
+        # Pass the current label layout so the preview reflects the
+        # actual print output after any Layout… dialog adjustments.
+        _layout = getattr(parent, "label_layout", None)
+        self._job      = PrintJob("", items, _layout)
         self._C = dict(text=color_text, dim=color_text_dim, border=color_border,
                        surface=color_surface, orange=color_orange, bg=color_bg)
 

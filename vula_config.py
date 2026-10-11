@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -71,6 +72,24 @@ API_KEY = os.getenv("PRINTER_API_KEY", "")
 # a fresh install before any settings file existed.
 DEFAULT_POS_POLL_INTERVAL_SECONDS = 5
 
+# Default TSPL label layout. These are tunable at runtime from the
+# Printers tab → Label card → Layout… dialog, and persisted to
+# settings.json under "label_layout". Exposed here so vula_workers'
+# PrintJob can fall back to sane values if nothing is in settings yet.
+#
+# Units are printer dots at 203 dpi (≈8 dots per millimetre).
+#   left_margin_dots: X position of every element on the label
+#   top_offset_dots:  Y offset added to every element
+#   label_width_dots: physical label width; affects printable width
+#   barcode_narrow / barcode_wide: Code 39 module widths
+DEFAULT_LABEL_LAYOUT = {
+    "left_margin_dots": 30,
+    "top_offset_dots":  0,
+    "label_width_dots": 320,
+    "barcode_narrow":   1,
+    "barcode_wide":     2,
+}
+
 APP_CONFIG_FILE = Path.home() / ".config" / "vula_print" / "settings.json"
 APP_HISTORY_FILE = Path.home() / ".config" / "vula_print" / "print_history.json"
 
@@ -120,7 +139,7 @@ class StoreConnection:
     @classmethod
     def from_settings_dict(cls, data: Dict[str, Any]) -> "StoreConnection":
         return cls(
-            connection_id=data.get("connection_id") or f"conn_{id(data)}",
+            connection_id=data.get("connection_id") or f"conn_{uuid.uuid4().hex[:8]}",
             name=data.get("name") or "Store",
             api_base_url=(data.get("api_base_url") or "").strip(),
             api_key=(data.get("api_key") or "").strip(),

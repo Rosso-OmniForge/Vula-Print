@@ -59,6 +59,18 @@ class PrinterScanner(QThread):
                     str(p) for p in serial_by_id.iterdir() if p.is_symlink()
                 )
 
+            # CUPS queues — enumerated from lpstat. Each queue yields two
+            # assignment strings (raw + driver) so the operator picks the
+            # mode in the role dialog. list_cups_queues() returns [] when
+            # CUPS isn't installed or has no queues.
+            try:
+                from vula_printer_target import list_cups_queues
+                devices.extend(list_cups_queues())
+            except Exception as exc:
+                logging.getLogger("vula.scan").debug(
+                    "CUPS enumeration failed: %s", exc
+                )
+
             seen = set()
             unique = []
             for d in devices:
@@ -99,12 +111,32 @@ class PrintJob(QThread):
     progress = pyqtSignal(int, int)      # current, total
     completed = pyqtSignal(bool, str)    # success, message
 
-    def __init__(self, printer_device: str, items: List[Dict[str, Any]]):
+    def __init__(
+        self,
+        printer_device: str,
+        items: List[Dict[str, Any]],
+        label_layout: Optional[Dict[str, Any]] = None,
+    ):
         super().__init__()
         self.printer_device = printer_device
         self.items = items
-        self.label_width_dots = 320
-        self.horizontal_shift_dots = 16
+
+        # Label layout — callers pass self.label_layout (from settings);
+        # fall back to DEFAULT_LABEL_LAYOUT so ad-hoc jobs (preview
+        # rendering, tests) still work without explicit wiring.
+        from vula_config import DEFAULT_LABEL_LAYOUT
+        layout = dict(DEFAULT_LABEL_LAYOUT)
+        if label_layout:
+            for k, v in label_layout.items():
+                if k in layout:
+                    try:
+                        layout[k] = int(v)
+                    except (TypeError, ValueError):
+                        pass
+        self.label_layout = layout
+
+        self.label_width_dots = layout["label_width_dots"]
+        self.horizontal_shift_dots = 16  # kept for backward compat; unused
         # Qt-idiomatic teardown. QThread.finished is the built-in 0-arg signal;
         # deleteLater is scheduled on the main-thread event loop AFTER the
         # C++ QThread has fully unwound. Without this, Python GC can destroy
@@ -190,35 +222,42 @@ class PrintJob(QThread):
         tspl.append("SET TEAR ON")
         tspl.append("CLS")
 
-        LM         = 30                                  # left margin (dots)
-        USABLE_W   = self.label_width_dots - LM * 2     # 300 dots printable width
+        # Layout values come from self.label_layout (settings.json →
+        # "label_layout"). Tunable from the Printers tab → Label card →
+        # Layout… dialog. All Y coordinates are also shifted by TOP.
+        LM         = int(self.label_layout.get("left_margin_dots", 30))
+        TOP        = int(self.label_layout.get("top_offset_dots", 0))
+        BN         = int(self.label_layout.get("barcode_narrow", 1))
+        BW         = int(self.label_layout.get("barcode_wide", 2))
+
+        USABLE_W   = self.label_width_dots - LM * 2
         TITLE_FONT = "3"                                 # 16 dots/char
         TITLE_LINE_H = 26                                # font-3 height (24) + 2 gap
 
         # ── Title (wraps to 2 lines if needed) ───────────────────────
         title_lines = self._wrap_text(title, TITLE_FONT, USABLE_W)
-        tspl.append(f'TEXT {LM},5,"{TITLE_FONT}",0,1,1,"{self._tspl_escape(title_lines[0])}"')
+        tspl.append(f'TEXT {LM},{5 + TOP},"{TITLE_FONT}",0,1,1,"{self._tspl_escape(title_lines[0])}"')
         if len(title_lines) > 1:
-            tspl.append(f'TEXT {LM},{5 + TITLE_LINE_H},"{TITLE_FONT}",0,1,1,"{self._tspl_escape(title_lines[1])}"')
+            tspl.append(f'TEXT {LM},{5 + TITLE_LINE_H + TOP},"{TITLE_FONT}",0,1,1,"{self._tspl_escape(title_lines[1])}"')
 
         # Shift all elements below the title down when title occupies 2 lines
         extra = TITLE_LINE_H if len(title_lines) > 1 else 0
 
         # ── Variant label ─────────────────────────────────────────────
         if variant_label:
-            tspl.append(f'TEXT {LM},{27 + extra},"2",0,1,1,"{self._tspl_escape(variant_label)}"')
+            tspl.append(f'TEXT {LM},{27 + extra + TOP},"2",0,1,1,"{self._tspl_escape(variant_label)}"')
 
         # ── Separator bar — full printable width ─────────────────────
-        tspl.append(f"BAR {LM},{44 + extra},{USABLE_W},2")
+        tspl.append(f"BAR {LM},{44 + extra + TOP},{USABLE_W},2")
 
         # ── Price (font 4, one step up from font 3) ───────────────────
-        tspl.append(f'TEXT {LM},{56 + extra},"4",0,1,1,"{self._tspl_escape(price)}"')
+        tspl.append(f'TEXT {LM},{56 + extra + TOP},"4",0,1,1,"{self._tspl_escape(price)}"')
 
         # ── Code39 barcode ────────────────────────────────────────────
-        tspl.append(f'BARCODE {LM},{95 + extra},"39",70,0,0,1,2,"{self._tspl_escape(code39)}"')
+        tspl.append(f'BARCODE {LM},{95 + extra + TOP},"39",70,0,0,{BN},{BW},"{self._tspl_escape(code39)}"')
 
         # ── SKU (bottom, small font) ──────────────────────────────────
-        tspl.append(f'TEXT {LM},215,"1",0,1,1,"{self._tspl_escape(sku)}"')
+        tspl.append(f'TEXT {LM},{215 + TOP},"1",0,1,1,"{self._tspl_escape(sku)}"')
 
         tspl.append("PRINT 1")
         return "\n".join(tspl) + "\n"
@@ -258,7 +297,9 @@ class PrintJob(QThread):
                     # Write — permission errors abort cleanly; other I/O
                     # errors are recorded but the batch continues.
                     try:
-                        write_to_device(self.printer_device, tspl.encode('utf-8'))
+                        from vula_printer_target import PrinterTarget, dispatch_print
+                        target = PrinterTarget.from_assignment(self.printer_device)
+                        dispatch_print(target, tspl.encode('utf-8'), doc_class="label")
                     except PermissionError:
                         self.completed.emit(
                             False,
@@ -631,7 +672,9 @@ class POSSlipPrintJob(QThread):
                      len(payload), self.width_chars, self.qr_mode,
                      self.printer_device)
             try:
-                write_to_device(self.printer_device, payload)
+                from vula_printer_target import PrinterTarget, dispatch_print
+                target = PrinterTarget.from_assignment(self.printer_device)
+                dispatch_print(target, payload, doc_class="pos_slip")
             except PermissionError:
                 self.completed.emit(
                     False,
@@ -754,7 +797,9 @@ class POSEODReportPrintJob(QThread):
             payload = self._build_receipt_bytes()
             log.info("POSEOD: %db -> %s", len(payload), self.printer_device)
             try:
-                write_to_device(self.printer_device, payload)
+                from vula_printer_target import PrinterTarget, dispatch_print
+                target = PrinterTarget.from_assignment(self.printer_device)
+                dispatch_print(target, payload, doc_class="pos_eod")
             except PermissionError:
                 self.completed.emit(
                     False,

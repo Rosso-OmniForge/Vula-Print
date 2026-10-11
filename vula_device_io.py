@@ -306,6 +306,17 @@ def fingerprint_for_path(path: str) -> str:
     if not path:
         return ""
 
+    # CUPS queue names are stable across reboots — the assignment string
+    # itself is a fine fingerprint. Strip the raw/driver suffix so that
+    # switching mode on the same queue keeps the role assignment valid
+    # (a printer that goes from raw to driver mode is still the same
+    # physical printer in the same CUPS queue).
+    if path.startswith("cups:"):
+        parts = path.split(":", 2)
+        if len(parts) >= 2 and parts[1]:
+            return f"cups:{parts[1]}"
+        return path
+
     # ── Serial by-id symlink — already stable ──────────────────────
     if path.startswith("/dev/serial/by-id/"):
         from pathlib import Path as _P
@@ -364,6 +375,19 @@ def describe_device(path: str) -> str:
     """
     if not path:
         return "(unassigned)"
+
+    # CUPS queue assignments come as "cups:<queue>:raw" or
+    # "cups:<queue>:driver". Present them with a mode hint so the
+    # operator knows what they picked.
+    if path.startswith("cups:"):
+        parts = path.split(":", 2)
+        if len(parts) == 3:
+            queue, mode = parts[1], parts[2]
+            if mode == "raw":
+                return f"CUPS queue — {queue}  (custom / raw bytes)  [{path}]"
+            if mode == "driver":
+                return f"CUPS queue — {queue}  (generic / driver)  [{path}]"
+        return f"CUPS queue  [{path}]"
 
     from pathlib import Path as _P
 

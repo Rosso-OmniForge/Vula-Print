@@ -1,0 +1,4 @@
+# v2 — Vula! Print. Covers both kernel subsystems that have hosted
+# USB printer-class nodes across recent Debian releases.
+SUBSYSTEM=="usb",     KERNEL=="lp[0-9]*", GROUP="lp", MODE="0660"
+SUBSYSTEM=="usbmisc", KERNEL=="lp[0-9]*", GROUP="lp", MODE="0660"

@@ -176,7 +176,7 @@ class PrintersTabMixin:
 
         actions.addWidget(change_btn)
 
-        # Label-only: Calibrate button (moved from sidebar in 4.5).
+        # Label-only: Calibrate and Layout buttons (moved from sidebar in 4.5).
         if role_key == "label":
             cal_btn = QPushButton("Calibrate")
             cal_btn.setMinimumHeight(32)
@@ -184,6 +184,16 @@ class PrintersTabMixin:
             cal_btn.setStyleSheet(self._btn_secondary())
             cal_btn.clicked.connect(self.calibrate_printer)
             actions.addWidget(cal_btn)
+
+            layout_btn = QPushButton("Layout…")
+            layout_btn.setMinimumHeight(32)
+            layout_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            layout_btn.setStyleSheet(self._btn_secondary())
+            layout_btn.setToolTip(
+                "Tune the label content position on the physical label"
+            )
+            layout_btn.clicked.connect(self._open_label_layout_dialog)
+            actions.addWidget(layout_btn)
 
         # Settings button — enabled only for serial devices. State is
         # refreshed by _update_card_status() on every probe tick.

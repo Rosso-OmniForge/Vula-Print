@@ -1,0 +1,12 @@
+// Allow local users to trigger the Vula update services without a password.
+// Needed so the GUI's "Update" button works without dropping to a terminal.
+// The action IDs are narrow — only the two specific units, not "all
+// systemd units" — so this cannot be used as a general privilege escalation.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        subject.local &&
+        (action.lookup("unit") == "vula-update-manual.service" ||
+         action.lookup("unit") == "vula-update-local.service")) {
+        return polkit.Result.YES;
+    }
+});

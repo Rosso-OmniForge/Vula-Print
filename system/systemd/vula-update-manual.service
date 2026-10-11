@@ -1,0 +1,11 @@
+[Unit]
+Description=Vula! Print — manual update (git pull + install)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vula-update.sh
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=900

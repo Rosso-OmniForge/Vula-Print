@@ -1,43 +1,14 @@
 """Mixin for VulaPrintApp — see vula_app.py for composition."""
 from __future__ import annotations
 
-import json
-import re
 import subprocess
-import time
-from dataclasses import dataclass, field, asdict
-from datetime import datetime
-from decimal import Decimal, ROUND_HALF_UP
+from datetime import datetime as _dt
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-from urllib.parse import urljoin
 
-import requests
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QProcess
-from PyQt6.QtGui import (
-    QFont, QIcon, QPalette, QColor, QPixmap, QPainter, QPen, QBrush, QImage,
-)
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QMessageBox, QFrame,
-    QProgressBar, QTextEdit, QLineEdit, QComboBox,
-    QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QStatusBar,
-    QScrollArea, QDialog, QListWidget, QListWidgetItem, QFormLayout,
-    QDialogButtonBox,
-)
-
-from vula_config import (
-    API_BASE_URL, API_KEY, APP_CONFIG_FILE, APP_HISTORY_FILE,
-    MAX_STORE_CONNECTIONS, StoreConnection,
-)
-from vula_http import HttpWorker, HttpResult
-from vula_workers import (
-    PrintJob, POSSlipPrintJob, POSEODReportPrintJob, POSPollWorker,
-    PrinterScanner, _RetryFlushWorker,
-)
-from vula_dialogs import (
-    _ConnectionsDialog, _VisualPreviewDialog, _TextDialog,
-    _HistoryDialog,
+    QApplication, QDialog, QHBoxLayout, QLabel, QPushButton, QTextEdit, QVBoxLayout,
 )
 
 
@@ -63,27 +34,12 @@ class MiscMixin:
         )
 
     def _current_version(self) -> str:
-        """Return the app version string read from the VERSION file.
-
-        Previously shelled out to `git rev-parse --short HEAD`, which
-        produced a different value on every commit and failed entirely
-        when the app was deployed without a .git directory. Reading a
-        single-file constant is both faster and actually meaningful.
-        """
+        """Return the app version string read from the VERSION file."""
         from vula_config import APP_VERSION
         return APP_VERSION
 
     def _do_update(self):
-        """Show update status — automatic updates run via systemd timer.
-
-        The in-app updater no longer runs a shell script. Updates are
-        handled by vula-print-update.timer running daily at 04:05 as
-        root. This dialog is informational; the manual command can be
-        copied for admins who want to force an update now.
-        """
-        from datetime import datetime as _dt
-        import subprocess as _sp
-
+        """Show update status — automatic updates run via systemd timer."""
         current = self._current_version()
 
         log_path = Path("/var/log/vula/app-update.log")
@@ -102,7 +58,7 @@ class MiscMixin:
 
         timer_status = "unknown"
         try:
-            r = _sp.run(
+            r = subprocess.run(
                 ["systemctl", "is-active", "vula-print-update.timer"],
                 capture_output=True, text=True, timeout=3,
             )
@@ -224,7 +180,6 @@ class MiscMixin:
         layout.addWidget(body, stretch=1)
 
         def _refresh():
-            from pathlib import Path as _P
             lines = 300
             if not LOG_FILE.exists():
                 info_lbl.setText("No log file yet: " + str(LOG_FILE))

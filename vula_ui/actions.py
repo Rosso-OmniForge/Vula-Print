@@ -1,44 +1,14 @@
 """Mixin for VulaPrintApp — see vula_app.py for composition."""
 from __future__ import annotations
 
-import json
-import re
-import subprocess
-import time
-from dataclasses import dataclass, field, asdict
 from datetime import datetime
-from decimal import Decimal, ROUND_HALF_UP
-from pathlib import Path
-from typing import Any, Dict, List, Optional
-from urllib.parse import urljoin
+from typing import Any, Dict
 
-import requests
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QProcess
-from PyQt6.QtGui import (
-    QFont, QIcon, QPalette, QColor, QPixmap, QPainter, QPen, QBrush, QImage,
-)
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QMessageBox, QFrame,
-    QProgressBar, QTextEdit, QLineEdit, QComboBox,
-    QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QStatusBar,
-    QScrollArea, QDialog, QListWidget, QListWidgetItem, QFormLayout,
-    QDialogButtonBox,
-)
+from PyQt6.QtCore import QTimer
+from PyQt6.QtWidgets import QMessageBox
 
-from vula_config import (
-    API_BASE_URL, API_KEY, APP_CONFIG_FILE, APP_HISTORY_FILE,
-    MAX_STORE_CONNECTIONS, StoreConnection,
-)
-from vula_http import HttpWorker, HttpResult
-from vula_workers import (
-    PrintJob, POSSlipPrintJob, POSEODReportPrintJob, POSPollWorker,
-    PrinterScanner, _RetryFlushWorker,
-)
-from vula_dialogs import (
-    _ConnectionsDialog, _VisualPreviewDialog, _TextDialog,
-    _HistoryDialog, _UpdateDialog,
-)
+from vula_http import HttpWorker
+from vula_workers import PrintJob, POSSlipPrintJob
 
 
 class ActionsMixin:
@@ -65,9 +35,6 @@ class ActionsMixin:
             if reply == QMessageBox.StandardButton.No:
                 return
 
-        # Fetch the request detail off the UI thread. The previous sync
-        # requests.get() blocked the whole app for up to 10s on a slow
-        # link, which read as "the printer app has frozen".
         w = HttpWorker(
             tag=f"labeldetail:{conn.connection_id}:{request['id']}",
             method="GET",
@@ -93,9 +60,6 @@ class ActionsMixin:
         if not items:
             QMessageBox.warning(self, "No Items", "This request has no items to print.")
             return
-        # The user may have changed the label printer during the fetch
-        # window. Re-read the current assignment and use it directly — do
-        # not read self.printer_roles twice.
         label_printer = self.printer_roles.get("label")
         if not label_printer:
             QMessageBox.warning(self, "No Printer", "Please select a printer first.")
@@ -104,7 +68,7 @@ class ActionsMixin:
         self._current_print_request = request
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
-        self.print_job = PrintJob(label_printer, items)
+        self.print_job = PrintJob(label_printer, items, self.label_layout)
         self.print_job.progress.connect(self.on_print_progress)
         self.print_job.completed.connect(
             lambda s, m: self.on_print_finished(s, m, request['id'], conn.connection_id)
@@ -125,7 +89,6 @@ class ActionsMixin:
         conn = self.get_connection_by_id(connection_id)
 
         if success:
-            # History is optimistic — saved the moment the print succeeds.
             self._save_to_history(self._current_print_request)
             QMessageBox.information(self, "Success", message)
             if conn:
@@ -147,21 +110,9 @@ class ActionsMixin:
             QMessageBox.information(self, "Calibration In Progress", "Calibration is already running.")
             return
 
-        # ── 1. Send the TSPL calibration sequence ────────────────────
-        # Restored from the pre-rewrite label_printer.py, which is the
-        # sequence known to work on the SM-USB / SMART SI clone at the
-        # client sites. The rewrite dropped four commands and added
-        # GAPDETECT + HOME, which the clone firmware does not implement
-        # correctly — the net effect was "calibration appears to do
-        # nothing" because stale buffer content was being printed.
-        #
-        #   ~!T          reset to power-on defaults — clean baseline
-        #   SHIFT 16     matches PrintJob.horizontal_shift_dots
-        #   OFFSET 0     explicit zero vertical offset
-        #   CLS          clear buffer — MUST be last
-        #
-        # Do not re-add GAPDETECT or HOME without a per-printer opt-in;
-        # they misbehave on the clone hardware we ship against.
+        # ── TSPL calibration sequence — do not add GAPDETECT or HOME
+        # without a per-printer opt-in; they misbehave on the clone
+        # hardware we ship against.
         calibration_tspl = (
             "~!T\n"
             "SIZE 40 mm,30 mm\n"
@@ -191,16 +142,11 @@ class ActionsMixin:
             QMessageBox.critical(self, "Calibration Error", f"Failed to calibrate: {e}")
             return
 
-        # Give the printer time to run the gap-detection feed (~1.5 s typical)
-        # WITHOUT blocking the Qt event loop. The timer fires on the main
-        # thread, so _print_calibration_test_label runs safely.
         self.status_bar.showMessage("Calibrating printer…")
         QTimer.singleShot(1500, self._print_calibration_test_label)
 
     def _print_calibration_test_label(self):
         """Second half of calibration: prints the test label after the feed."""
-        # Re-read the assignment — the 1.5 s gap since calibrate_printer
-        # ran is a window in which the operator could have changed it.
         label_printer = self.printer_roles.get("label")
         if not label_printer:
             self.status_bar.showMessage("Printer unassigned during calibration")
@@ -213,13 +159,10 @@ class ActionsMixin:
             "code39": "CALIBTEST",
             "price_cents": 95000,
             "currency": "ZAR",
-            # qty_to_print drives PrintJob.run()'s total-label count.
-            # Its absence here meant the calibration test label silently
-            # printed zero copies.
             "qty_to_print": 1,
         }
 
-        self.calibration_job = PrintJob(label_printer, [test_item])
+        self.calibration_job = PrintJob(label_printer, [test_item], self.label_layout)
         self.calibration_job.completed.connect(self.on_test_print_finished)
         self.calibration_job.start()
 
@@ -235,13 +178,9 @@ class ActionsMixin:
             )
             if reply == QMessageBox.StandardButton.Yes:
                 self.printer_calibrated = True
-                # calibration_status no longer lives in the sidebar; guard for it.
                 if hasattr(self, "calibration_status"):
                     self.calibration_status.setText("Calibrated")
-                    self.calibration_status.setStyleSheet(
-                        f"background:#0f2a1a; color:{self.C_GREEN}; border:1px solid #1a5a2a;"
-                        f"border-radius:12px; font-size:11px; font-weight:600; padding:4px 10px;"
-                    )
+                    self.calibration_status.setStyleSheet(self._pill_style("good"))
                 self.status_bar.showMessage("Printer calibrated successfully")
             else:
                 QMessageBox.information(
@@ -283,11 +222,10 @@ class ActionsMixin:
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        job = PrintJob(label_printer, [test_item])
+        job = PrintJob(label_printer, [test_item], self.label_layout)
         job.completed.connect(self._on_test_label_standalone_finished)
         self.status_bar.showMessage("Printing test label…")
         job.start()
-        # Keep a reference so it isn't GC'd
         self._test_label_job = job
 
     def _on_test_label_standalone_finished(self, success: bool, message: str):

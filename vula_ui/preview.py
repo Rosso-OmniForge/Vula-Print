@@ -1,44 +1,11 @@
 """Mixin for VulaPrintApp — see vula_app.py for composition."""
 from __future__ import annotations
 
-import json
-import re
-import subprocess
-import time
-from dataclasses import dataclass, field, asdict
-from datetime import datetime
-from decimal import Decimal, ROUND_HALF_UP
-from pathlib import Path
-from typing import Any, Dict, List, Optional
-from urllib.parse import urljoin
+from PyQt6.QtWidgets import QMessageBox
 
-import requests
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QProcess
-from PyQt6.QtGui import (
-    QFont, QIcon, QPalette, QColor, QPixmap, QPainter, QPen, QBrush, QImage,
-)
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QMessageBox, QFrame,
-    QProgressBar, QTextEdit, QLineEdit, QComboBox,
-    QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QStatusBar,
-    QScrollArea, QDialog, QListWidget, QListWidgetItem, QFormLayout,
-    QDialogButtonBox,
-)
-
-from vula_config import (
-    API_BASE_URL, API_KEY, APP_CONFIG_FILE, APP_HISTORY_FILE,
-    MAX_STORE_CONNECTIONS, StoreConnection,
-)
-from vula_http import HttpWorker, HttpResult
-from vula_workers import (
-    PrintJob, POSSlipPrintJob, POSEODReportPrintJob, POSPollWorker,
-    PrinterScanner, _RetryFlushWorker,
-)
-from vula_dialogs import (
-    _ConnectionsDialog, _VisualPreviewDialog, _TextDialog,
-    _HistoryDialog, _UpdateDialog,
-)
+from vula_dialogs import _TextDialog, _VisualPreviewDialog
+from vula_http import HttpWorker
+from vula_workers import PrintJob
 
 
 class PreviewMixin:
@@ -88,14 +55,13 @@ class PreviewMixin:
             QMessageBox.information(self, "No Items", "This request has no items.")
             return
 
-        # Build a temporary PrintJob just to use _generate_label_tspl
         preview_job = PrintJob("", items)
         lines = []
         lines.append(f"=== TSPL PREVIEW: Request #{request['id']} ({conn.name}) ===")
         lines.append(f"Total items: {len(items)}  |  Total labels: "
                      f"{sum(i.get('qty_to_print', 0) for i in items)}")
         lines.append("")
-        for idx, item in enumerate(items[:10], 1):   # preview first 10
+        for idx, item in enumerate(items[:10], 1):
             lines.append(f"{'─' * 60}")
             lines.append(f"[{idx}]  {item.get('title','')}  "
                          f"({item.get('variant_label','')})  "

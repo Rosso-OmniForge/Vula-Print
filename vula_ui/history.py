@@ -191,7 +191,7 @@ class HistoryMixin:
         self._current_print_request = None   # don't re-save to history for reprints
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
-        self.print_job = PrintJob(label_printer, items)
+        self.print_job = PrintJob(label_printer, items, self.label_layout)
         self.print_job.progress.connect(self.on_print_progress)
         self.print_job.completed.connect(
             lambda s, m: self._on_reprint_finished(s, m, request_id)

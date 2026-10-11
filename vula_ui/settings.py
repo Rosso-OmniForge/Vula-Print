@@ -2,42 +2,11 @@
 from __future__ import annotations
 
 import json
-import re
-import subprocess
-import time
-from dataclasses import dataclass, field, asdict
-from datetime import datetime
-from decimal import Decimal, ROUND_HALF_UP
-from pathlib import Path
-from typing import Any, Dict, List, Optional
-from urllib.parse import urljoin
-
-import requests
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QProcess
-from PyQt6.QtGui import (
-    QFont, QIcon, QPalette, QColor, QPixmap, QPainter, QPen, QBrush, QImage,
-)
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QMessageBox, QFrame,
-    QProgressBar, QTextEdit, QLineEdit, QComboBox,
-    QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QStatusBar,
-    QScrollArea, QDialog, QListWidget, QListWidgetItem, QFormLayout,
-    QDialogButtonBox,
-)
+from typing import List, Optional
 
 from vula_config import (
-    API_BASE_URL, API_KEY, APP_CONFIG_FILE, APP_HISTORY_FILE,
-    DEFAULT_POS_POLL_INTERVAL_SECONDS, MAX_STORE_CONNECTIONS, StoreConnection,
-)
-from vula_http import HttpWorker, HttpResult
-from vula_workers import (
-    PrintJob, POSSlipPrintJob, POSEODReportPrintJob, POSPollWorker,
-    PrinterScanner, _RetryFlushWorker,
-)
-from vula_dialogs import (
-    _ConnectionsDialog, _VisualPreviewDialog, _TextDialog,
-    _HistoryDialog, _UpdateDialog,
+    API_BASE_URL, API_KEY, APP_CONFIG_FILE,
+    DEFAULT_POS_POLL_INTERVAL_SECONDS, StoreConnection,
 )
 
 
@@ -78,7 +47,6 @@ class SettingsMixin:
                     StoreConnection.from_settings_dict(c) for c in connections_data
                 ]
             else:
-                # Legacy migration: single api_base_url / api_key -> one connection
                 legacy_base = (data.get("api_base_url") or "").strip()
                 legacy_key = (data.get("api_key") or "").strip()
                 legacy_user_id = data.get("printer_user_id")
@@ -93,9 +61,6 @@ class SettingsMixin:
 
             self.brand_logo_path = data.get("brand_logo_path") or self.brand_logo_path
             roles = data.get("printer_roles") or {}
-            # Single source of truth. Legacy top-level keys
-            # (label_printer_device, pos_slip_printer_device) are read as
-            # a fallback for installs that predate the printer_roles dict.
             self.printer_roles = {
                 "label":    roles.get("label")    or data.get("label_printer_device")    or None,
                 "pos_slip": roles.get("pos_slip") or data.get("pos_slip_printer_device") or None,
@@ -107,17 +72,24 @@ class SettingsMixin:
                 data.get("pos_poll_interval_seconds", DEFAULT_POS_POLL_INTERVAL_SECONDS)
                 or DEFAULT_POS_POLL_INTERVAL_SECONDS
             )
-            # POS printer compatibility settings — see POSSlipPrintJob.
-            # Defaults match the common "58mm receipt clone" hardware.
             self.pos_width_chars = int(data.get("pos_width_chars", 32) or 32)
             self.pos_qr_mode = str(data.get("pos_qr_mode", "raster") or "raster")
             self.pos_qr_module_px = int(data.get("pos_qr_module_px", 4) or 4)
             self.serial_config = data.get("serial_config") or {}
             self.printer_role_fingerprints = data.get("printer_role_fingerprints") or {}
+
+            from vula_config import DEFAULT_LABEL_LAYOUT
+            layout_from_disk = data.get("label_layout") or {}
+            self.label_layout = dict(DEFAULT_LABEL_LAYOUT)
+            for key in DEFAULT_LABEL_LAYOUT:
+                if key in layout_from_disk:
+                    try:
+                        self.label_layout[key] = int(layout_from_disk[key])
+                    except (TypeError, ValueError):
+                        pass
         except Exception as e:
             print(f"Warning: failed to load settings: {e}")
 
-        # Always ensure the fingerprint map exists, even if load failed.
         if not getattr(self, "printer_role_fingerprints", None):
             self.printer_role_fingerprints = {}
 
@@ -145,10 +117,6 @@ class SettingsMixin:
             data = {
                 "store_connections": [c.to_settings_dict() for c in self.store_connections],
                 "brand_logo_path": self.brand_logo_path,
-                # Legacy top-level keys are still written so a build that
-                # predates the printer_roles dict can read them if it ever
-                # runs against the same settings file. Load reads from
-                # printer_roles first and falls back to these.
                 "label_printer_device": roles.get("label"),
                 "pos_slip_printer_device": roles.get("pos_slip"),
                 "auto_connect_on_startup": self.auto_connect_on_startup,
@@ -165,11 +133,12 @@ class SettingsMixin:
                 "printer_role_fingerprints": dict(
                     getattr(self, "printer_role_fingerprints", {}) or {}
                 ),
+                "label_layout": dict(
+                    getattr(self, "label_layout", {}) or {}
+                ),
             }
             with open(APP_CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
-            # Push the new serial configs into the device-io registry
-            # so the next print job picks up any changes immediately.
             try:
                 from vula_device_io import set_serial_configs
                 set_serial_configs(getattr(self, "serial_config", {}) or {})

@@ -170,7 +170,29 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    # Primary: sudo from a user → that's the operator.
     REAL_USER="$SUDO_USER"
+elif [ -f /etc/vula/install.env ]; then
+    # Reinstall / update path. install.env is written by every prior
+    # install.sh run and is authoritative for who the operator is.
+    # Critical when invoked from vula-update.sh (systemd, no TTY, no
+    # SUDO_USER) — without this, install.sh would try to prompt on
+    # stdin and fail with "User '' does not exist."
+    REAL_USER=$(grep -E '^REAL_USER=' /etc/vula/install.env 2>/dev/null \
+                | tail -1 | cut -d= -f2-)
+    if [ -z "$REAL_USER" ]; then
+        err "/etc/vula/install.env present but REAL_USER is empty."
+        err "Delete and re-run to force fresh detection:"
+        err "  sudo rm /etc/vula/install.env && sudo bash $0"
+        exit 1
+    fi
+    info "Using REAL_USER=$REAL_USER (from /etc/vula/install.env)"
+elif [ "$ASSUME_YES" = "1" ]; then
+    # No SUDO_USER, no install.env, non-interactive — cannot proceed.
+    err "Cannot determine the operator user under --yes."
+    err "Either:  sudo bash $0"
+    err "Or:      sudo REAL_USER=<name> bash $0"
+    exit 1
 else
     read -rp "${CYAN}[?]${NC} Username to run Vula Print as: " REAL_USER
 fi
@@ -184,6 +206,70 @@ REAL_UID=$(id -u "$REAL_USER")
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
+# Read VERSION once so it can be recorded in /etc/vula/install.env and
+# shown in the summary. Falls back gracefully if the file is missing.
+VULA_VERSION=$(cat "$SCRIPT_DIR/VERSION" 2>/dev/null | tr -d '[:space:]')
+[ -n "$VULA_VERSION" ] || VULA_VERSION="unknown"
+
+# ── system/ tree helpers ──────────────────────────────────────────
+# Every file install.sh places under /usr/local/bin, /etc/systemd,
+# /etc/polkit-1, or /etc/udev comes from $SCRIPT_DIR/system/. The
+# installer copies; it does not generate. See system/README.md.
+install_system_tree() {
+    local sub="$1"          # e.g. "bin", "systemd", "polkit", "udev"
+    local dest="$2"         # e.g. "/usr/local/bin"
+    local mode="$3"         # e.g. "0755"
+
+    local src="$SCRIPT_DIR/system/$sub"
+    if [ ! -d "$src" ]; then
+        warn "system/$sub not found in source tree — skipping"
+        return 0
+    fi
+
+    install -d -m 0755 "$dest"
+
+    local f base
+    shopt -s nullglob
+    for f in "$src"/*; do
+        [ -f "$f" ] || continue
+        base="$(basename "$f")"
+        if [ "$DRY_RUN" = "1" ]; then
+            dim "DRY: install -m $mode $f $dest/$base"
+            continue
+        fi
+        install -m "$mode" "$f" "$dest/$base"
+        dim "    -> $dest/$base"
+    done
+    shopt -u nullglob
+    return 0
+}
+
+# Write /etc/vula/install.env. Read by system/bin/*.sh so that unit
+# files can stay static (no per-install substitution) and remain
+# diffable against the repo.
+write_install_env() {
+    install -d -m 0750 /etc/vula
+    if [ "$DRY_RUN" = "1" ]; then
+        dim "DRY: write /etc/vula/install.env"
+        return 0
+    fi
+    (
+        umask 027
+        cat > /etc/vula/install.env <<ENV_EOF
+# Vula! Print — install-time constants. Regenerated on every install.
+# Read by scripts under /usr/local/bin that need to know who the
+# operator user is and where the source tree lives.
+REAL_USER=$REAL_USER
+REAL_HOME=$REAL_HOME
+SOURCE_DIR=$SCRIPT_DIR
+VULA_VERSION=$VULA_VERSION
+ENV_EOF
+    )
+    chown root:root /etc/vula/install.env
+    chmod 0640 /etc/vula/install.env
+    ok "Wrote /etc/vula/install.env"
+}
+
 as_user() {
     sudo -u "$REAL_USER" \
         env HOME="$REAL_HOME" \
@@ -191,6 +277,13 @@ as_user() {
             DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$REAL_UID/bus" \
         "$@"
 }
+
+# ── Persist install-time constants, unconditionally ─────────────
+# Written before any phase runs, so it exists even if the caller
+# selects only a subset of phases. Critical for the update path:
+# vula-update.sh (systemd, no TTY) reads this to know who the
+# operator user is before it can re-invoke install.sh.
+write_install_env
 
 # ── Banner ───────────────────────────────────────────────────────
 echo
@@ -220,6 +313,13 @@ phase_preflight() {
         13|trixie) ok "Debian 13 (Trixie) confirmed." ;;
         *) warn "Expected Trixie, found '$codename' — continuing anyway." ;;
     esac
+
+    if [ ! -d "$SCRIPT_DIR/system" ]; then
+        err "system/ directory not found in source tree."
+        err "This installer expects a complete checkout. Aborting."
+        return 1
+    fi
+    ok "system/ tree present."
 
     info "Verifying APT archive keyring..."
     if [ ! -f /usr/share/keyrings/debian-archive-keyring.gpg ]; then
@@ -353,31 +453,15 @@ SRCLIST_EOF
         fi
     done
 
-    # v2 — cover both subsystems. On older kernels, USB printer-class
-    # devices (/dev/usb/lpN) are children of the "usb" subsystem; on
-    # newer kernels (Debian 13 and later) they moved to "usbmisc".
-    # Writing both rules is harmless — udev silently ignores a rule whose
-    # SUBSYSTEM never matches a device. This makes the fix correct on
-    # every kernel without needing to probe which one is active.
-    #
-    # v1 (previous) only matched "usb" and so quietly did nothing on
-    # newer kernels, leaving the device group to whatever the distro's
-    # own default rule set it to.
-    if [ ! -f /etc/udev/rules.d/60-usb-label-printer.rules ] || \
-       ! grep -q 'v2' /etc/udev/rules.d/60-usb-label-printer.rules; then
-        cat > /etc/udev/rules.d/60-usb-label-printer.rules <<'UDEV_EOF'
-# v2 — Vula! Print. Covers both kernel subsystems that have hosted
-# USB printer-class nodes across recent Debian releases.
-SUBSYSTEM=="usb",     KERNEL=="lp[0-9]*", GROUP="lp", MODE="0660"
-SUBSYSTEM=="usbmisc", KERNEL=="lp[0-9]*", GROUP="lp", MODE="0660"
-UDEV_EOF
-        run udevadm control --reload-rules
-        run udevadm trigger --subsystem-match=usb
-        run udevadm trigger --subsystem-match=usbmisc 2>/dev/null || true
-        ok "udev rule installed (v2, usb + usbmisc)."
-    else
-        dim "  udev rule already at v2 — leaving untouched."
-    fi
+    # udev rule — copied from system/udev/. Always overwrite, so the
+    # on-disk file matches the repo exactly. If a human edited it by
+    # hand on a device, the next install corrects it.
+    info "Installing udev rule from system/udev/..."
+    install_system_tree udev /etc/udev/rules.d 0644
+    run udevadm control --reload-rules
+    run udevadm trigger --subsystem-match=usb
+    run udevadm trigger --subsystem-match=usbmisc 2>/dev/null || true
+    ok "udev rule installed."
 
     # ── Diagnostic: record which subsystem /dev/usb/lp* actually uses.
     # No hardware on the dev box means we can't verify this offline.
@@ -758,6 +842,10 @@ CREDS_EOF
     else
         dim "  Device ID already present: $(cat /etc/vula/device-id)"
     fi
+
+    # (install.env is written at the top of the script, before the
+    # phase runner, so it exists even when only a subset of phases
+    # is selected. Do not call write_install_env here.)
 
     # ── venv ────────────────────────────────────────────────────
     if [ -d "$SCRIPT_DIR/venv" ]; then
@@ -1364,6 +1452,18 @@ APPUPTIMER_EOF
         warn "Could not start app-update timer."
     ok "App auto-update scheduled (daily 04:05)."
 
+    # ── 8d. Manual update helpers ──────────────────────────────
+    # Copied from system/. Backs the GUI's Update button. Polkit rule
+    # lets local users trigger the two services without a password.
+    section "Manual update helpers (from system/)"
+    install_system_tree bin     /usr/local/bin         0755
+    install_system_tree systemd /etc/systemd/system    0644
+    install_system_tree polkit  /etc/polkit-1/rules.d  0644
+    run systemctl daemon-reload
+    ok "Manual update helpers installed."
+    dim "  systemctl start vula-update-manual.service   # git pull + reinstall"
+    dim "  systemctl start vula-update-local.service    # --local reinstall"
+
     return 0
 }
 
@@ -1432,6 +1532,8 @@ else
 fi
 echo
 echo "  Log file:  $LOG_FILE"
+echo "  Version:   $VULA_VERSION"
+echo "  Config:    /etc/vula/install.env  /etc/vula/creds.env"
 echo "  Restart:   systemctl --user restart vula-print    (as $REAL_USER)"
 echo "  Status:    systemctl --user status vula-print"
 echo "  App log:   journalctl --user -u vula-print -f"

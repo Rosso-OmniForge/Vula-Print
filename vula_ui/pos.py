@@ -1,44 +1,14 @@
 """Mixin for VulaPrintApp — see vula_app.py for composition."""
 from __future__ import annotations
 
-import json
-import re
-import subprocess
 import time
-from dataclasses import dataclass, field, asdict
 from datetime import datetime
-from decimal import Decimal, ROUND_HALF_UP
-from pathlib import Path
-from typing import Any, Dict, List, Optional
-from urllib.parse import urljoin
 
 import requests
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QProcess
-from PyQt6.QtGui import (
-    QFont, QIcon, QPalette, QColor, QPixmap, QPainter, QPen, QBrush, QImage,
-)
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QMessageBox, QFrame,
-    QProgressBar, QTextEdit, QLineEdit, QComboBox,
-    QTableWidget, QTableWidgetItem, QHeaderView, QSizePolicy, QStatusBar,
-    QScrollArea, QDialog, QListWidget, QListWidgetItem, QFormLayout,
-    QDialogButtonBox,
-)
 
-from vula_config import (
-    API_BASE_URL, API_KEY, APP_CONFIG_FILE, APP_HISTORY_FILE,
-    MAX_STORE_CONNECTIONS, StoreConnection,
-)
+from vula_config import StoreConnection
 from vula_http import HttpWorker, HttpResult
-from vula_workers import (
-    PrintJob, POSSlipPrintJob, POSEODReportPrintJob, POSPollWorker,
-    PrinterScanner, _RetryFlushWorker,
-)
-from vula_dialogs import (
-    _ConnectionsDialog, _VisualPreviewDialog, _TextDialog,
-    _HistoryDialog, _UpdateDialog,
-)
+from vula_workers import POSSlipPrintJob, POSEODReportPrintJob, POSPollWorker, _RetryFlushWorker
 
 
 class POSMixin:
@@ -51,13 +21,8 @@ class POSMixin:
         ``self.finished.connect(self.deleteLater)`` — the C++ side of the
         object is destroyed the moment the thread ends. If the Python
         reference outlives the C++ object by even one event-loop turn,
-        calling ``.isRunning()`` on it raises RuntimeError
-        ("wrapped C/C++ object of type X has been deleted").
-
-        This helper catches that and treats it as "not running", which
-        is what every caller wants. Using it everywhere a worker's
-        liveness is checked makes the code immune to the deleteLater
-        race regardless of signal ordering.
+        calling ``.isRunning()`` on it raises RuntimeError. This helper
+        treats that as "not running", which is what every caller wants.
         """
         if worker is None:
             return False
@@ -116,11 +81,6 @@ class POSMixin:
             self._update_pos_worker_status()
             return
 
-        # Flush any pending completion retries OFF the main thread.
-        # We snapshot the pending ids here (safe — main thread), then let a
-        # background worker do the HTTP; successful completions come back
-        # via _on_retry_succeeded so the shared sets are only touched on
-        # the main thread.
         if not self._thread_alive(self._pos_retry_worker):
             tasks = []
             for conn in eligible:
@@ -143,8 +103,6 @@ class POSMixin:
                 )
                 self._pos_retry_worker.start()
 
-        # Round-robin: find the next eligible connection (by index in
-        # store_connections) that isn't currently backed off.
         now = time.time()
         n = len(eligible)
         for step in range(n):
@@ -169,24 +127,15 @@ class POSMixin:
             self._pos_poll_worker.all_clear.connect(self._on_poll_all_clear)
             self._pos_poll_worker.poll_error.connect(self._on_poll_error)
             self._pos_poll_worker.poll_fatal.connect(self._on_poll_fatal)
-            # Clear the reference the moment the worker ends, so nothing
-            # downstream ever touches a stale wrapper. Belt-and-braces on
-            # top of _thread_alive().
             self._pos_poll_worker.finished.connect(
                 lambda w=self._pos_poll_worker: self._on_poll_worker_finished(w)
             )
             self._pos_poll_worker.start()
             return
 
-        # Every eligible connection is currently backed off.
         self._update_pos_worker_status("All stores backing off")
 
     def _on_poll_worker_finished(self, worker):
-        """Clear our reference to a finished POSPollWorker.
-
-        Identified by identity, not by truthiness — if a new worker was
-        already started before this fires, we must not clobber it.
-        """
         if getattr(self, "_pos_poll_worker", None) is worker:
             self._pos_poll_worker = None
 
@@ -201,14 +150,7 @@ class POSMixin:
         conn.pos_backoff_seconds = min(conn.pos_backoff_seconds * 2, 30)
 
     def _on_retry_succeeded(self, succeeded: list):
-        """Background retry-flush completed — discard the ids that went through.
-
-        Both the retry set AND the in-flight set must be cleared. The retry
-        set is obvious (the retry succeeded). The in-flight set holds the id
-        from the moment the print job started, and it is only ever cleared
-        when the backend confirms the request is resolved — which is exactly
-        what a successful retry-flush means.
-        """
+        """Background retry-flush completed — discard the ids that went through."""
         for cid, kind, req_id in succeeded:
             conn = self.get_connection_by_id(cid)
             if not conn:
@@ -225,13 +167,8 @@ class POSMixin:
         conn = self.get_connection_by_id(connection_id)
         if not conn:
             return
-        # Concurrency guard: never start a second POS print job while one is
-        # already in flight, even if the backend still shows the previous
-        # slip as pending (its completion POST may not have landed yet).
         if self.pos_print_job is not None and self.pos_print_job.isRunning():
             return
-        # Snapshot the printer once — reading self.printer_roles twice is
-        # racy if the operator changes the role mid-tick.
         pos_printer = self.printer_roles.get("pos_slip")
         if not pos_printer:
             self._update_pos_worker_status("POS printer unassigned")
@@ -271,11 +208,6 @@ class POSMixin:
                     f"POS slip #{request_id} printed (no connection to complete)"
                 )
         else:
-            # Print failed — release the in-flight flag so the next poll can
-            # retry. Successful prints must NOT release here; the backend
-            # won't have transitioned the row to completed until the POST
-            # in _on_pos_complete_done returns, and releasing early lets the
-            # next poll tick re-fetch and re-print the same slip.
             if conn:
                 conn.pos_in_flight_ids.discard(request_id)
             self.status_bar.showMessage(f"POS slip #{request_id} failed: {message}")
@@ -297,14 +229,8 @@ class POSMixin:
         w.start()
 
     def _on_pos_complete_done(self, result: HttpResult, conn: StoreConnection, request_id: int):
-        # 200, 400, 404 all mean "resolved" per the API contract.
         if result.ok and result.status in (200, 400, 404):
             conn.pos_completion_retry_ids.discard(request_id)
-            # The backend has acknowledged this request. Drain the
-            # in-flight marker now — otherwise the set grows monotonically
-            # and, after enough successful slips, every new request id is
-            # already "in flight" from the poll worker's point of view,
-            # and printing silently stops.
             conn.pos_in_flight_ids.discard(request_id)
             self.status_bar.showMessage(
                 f"POS slip #{request_id} printed and completed"
@@ -374,9 +300,6 @@ class POSMixin:
     def _on_eod_complete_done(self, result: HttpResult, conn: StoreConnection, request_id: int):
         if result.ok and result.status in (200, 400, 404):
             conn.pos_eod_completion_retry_ids.discard(request_id)
-            # See _on_pos_complete_done for why the in-flight marker must
-            # be drained here too — same monotonic-growth bug on the EOD
-            # path.
             conn.pos_eod_in_flight_ids.discard(request_id)
             self.status_bar.showMessage(
                 f"POS EOD report #{request_id} printed and completed"
@@ -412,8 +335,6 @@ class POSMixin:
         let the operator fix its config; other connections keep polling normally."""
         conn = self.get_connection_by_id(connection_id)
         if conn:
-            # Push a long backoff so we don't hammer a mis-configured store,
-            # without stopping polling of the other connection entirely.
             conn.pos_backoff_until = time.time() + 30
             name = conn.name
         else:
@@ -428,13 +349,11 @@ class POSMixin:
         if not hasattr(self, "_pos_pending_by_conn"):
             self._pos_pending_by_conn: dict = {}
         self._pos_pending_by_conn[connection_id] = list(items or [])
-        # Refresh the queue table so the POS rows reflect the new snapshot.
         self.update_requests_table()
 
     def _on_eod_pending_list(self, connection_id: str, items: list):
         """Store the newest snapshot of pending EOD reports for this connection."""
         if not hasattr(self, "_eod_pending_by_conn"):
             self._eod_pending_by_conn: dict = {}
-        # EOD is only ever one report at a time; keep just the first item.
         self._eod_pending_by_conn[connection_id] = items[0] if items else None
         self.update_requests_table()
