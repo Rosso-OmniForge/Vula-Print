@@ -23,6 +23,8 @@
 #       --store-url=https://store.example.co.za
 #   sudo bash install.sh --no-ufw --no-clamav --no-dns --no-anydesk
 #   sudo bash install.sh --apt-on-shutdown  # also upgrade on shutdown
+#   sudo bash install.sh --force-install    # skip existing-install
+#                                           # detection and reinstall fully
 #
 # Full log: /var/log/vula-install-<timestamp>.log
 # ════════════════════════════════════════════════════════════════
@@ -32,6 +34,7 @@ set -uo pipefail
 # ── Argument parsing ─────────────────────────────────────────────
 DRY_RUN=0
 ASSUME_YES=0
+FORCE_INSTALL=0
 PHASES_TO_RUN=""
 STORE_URL=""
 API_URL=""
@@ -49,6 +52,7 @@ for arg in "$@"; do
     case "$arg" in
         --dry-run)          DRY_RUN=1 ;;
         --yes|-y)           ASSUME_YES=1 ;;
+        --force-install)    FORCE_INSTALL=1 ;;
         --phase=*)          PHASES_TO_RUN="${arg#--phase=}" ;;
         --store-url=*)      STORE_URL="${arg#--store-url=}" ;;
         --api-url=*)        API_URL="${arg#--api-url=}" ;;
@@ -277,6 +281,77 @@ as_user() {
             DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$REAL_UID/bus" \
         "$@"
 }
+
+# ── Existing-install detection ───────────────────────────────────
+# If a prior install is present, offer to run the updater instead of
+# doing a fresh install. Skipped when:
+#   * --phase= is passed — this is what the updater itself uses, so
+#     without the guard the updater would prompt itself on every call
+#   * --force-install is passed — explicit override
+#   * --dry-run is passed — the dry-run should always walk the full
+#     install path so the operator sees what a fresh install would do
+detect_existing_install() {
+    [ -f /etc/vula/install.env ] && return 0
+    # Fallback signals for a partially-installed box that's missing
+    # install.env but has some Vula artifacts on disk.
+    local user_home
+    user_home=$(getent passwd "${REAL_USER:-}" 2>/dev/null | cut -d: -f6)
+    [ -n "$user_home" ] && \
+        [ -f "$user_home/.config/systemd/user/vula-print.service" ] && return 0
+    return 1
+}
+
+if [ -z "$PHASES_TO_RUN" ] && \
+   [ "$FORCE_INSTALL" != "1" ] && \
+   [ "$DRY_RUN" != "1" ] && \
+   detect_existing_install; then
+    section "Existing Vula! Print installation detected"
+
+    _existing_src=$(grep '^SOURCE_DIR=' /etc/vula/install.env 2>/dev/null | cut -d= -f2-)
+    _existing_user=$(grep '^REAL_USER=' /etc/vula/install.env 2>/dev/null | cut -d= -f2-)
+    _existing_ver=$(grep '^VULA_VERSION=' /etc/vula/install.env 2>/dev/null | cut -d= -f2-)
+
+    info "Source dir : ${_existing_src:-unknown}"
+    info "Real user  : ${_existing_user:-unknown}"
+    info "Version    : ${_existing_ver:-unknown}"
+    echo
+
+    if [ "$ASSUME_YES" = "1" ]; then
+        _choice="1"
+        dim "  (--yes: defaulting to option 1 — update)"
+    else
+        echo "  What would you like to do?"
+        echo "    1) Run the updater (recommended — pulls latest, re-runs affected phases)"
+        echo "    2) Force a full reinstall (runs every phase from scratch)"
+        echo "    3) Exit"
+        read -rp "  Choice [1]: " _choice
+        _choice="${_choice:-1}"
+    fi
+
+    case "$_choice" in
+        1)
+            info "Running updater..."
+            if [ -x /usr/local/bin/vula-update.sh ]; then
+                # exec replaces this process entirely — the updater
+                # takes over, calls install.sh --phase=... on itself,
+                # and there's no double-banner for the operator to see.
+                exec /usr/local/bin/vula-update.sh
+            else
+                err "Updater not found at /usr/local/bin/vula-update.sh."
+                err "Falling back to phased reinstall from this source dir."
+                PHASES_TO_RUN="print_app,updater"
+            fi
+            ;;
+        2)
+            info "Forcing full reinstall..."
+            # Fall through to the normal install path below
+            ;;
+        3|*)
+            info "Aborted."
+            exit 0
+            ;;
+    esac
+fi
 
 # ── Persist install-time constants, unconditionally ─────────────
 # Written before any phase runs, so it exists even if the caller
@@ -800,54 +875,6 @@ phase_print_app() {
         fi
     fi
 
-    # Connections now live in print_jobs.db (see vula_store.py). The DB
-    # is created lazily by the app on first launch, but we seed it here
-    # so a fresh install has a working connection without the operator
-    # needing to open the Connections dialog.
-    #
-    # The DB is per-user (~/.config/vula_print/print_jobs.db). We run the
-    # seeding as REAL_USER so the file lands with the correct ownership.
-    #
-    # If an existing DB already has connections, the helper no-ops —
-    # re-running install.sh never clobbers an operator's configuration.
-    info "Seeding store connection into the local database..."
-    as_user env \
-        VULA_API_URL="$API_URL" \
-        VULA_API_KEY="$API_KEY" \
-        "$SCRIPT_DIR/venv/bin/python3" - <<'PYEOF' || return 1
-import os, sys
-from pathlib import Path
-
-# The venv's python runs from the repo dir; add it to sys.path so
-# vula_store and vula_config resolve.
-sys.path.insert(0, os.getcwd())
-
-from vula_store import PrintStore
-from vula_config import APP_DB_FILE
-
-url = os.environ.get("VULA_API_URL", "").strip()
-key = os.environ.get("VULA_API_KEY", "").strip()
-if not (url and key):
-    sys.exit(0)
-
-store = PrintStore(APP_DB_FILE)
-existing = store.list_connections()
-if existing:
-    print(f"  DB already has {len(existing)} connection(s); not overwriting")
-    sys.exit(0)
-
-store.upsert_connection(
-    connection_id="conn_1",
-    name="Store 1",
-    api_base_url=url,
-    api_key=key,
-    printer_user_id=None,
-    display_order=0,
-)
-print(f"  Seeded connection conn_1 -> {url}")
-PYEOF
-    ok "Connection seeded into $REAL_HOME/.config/vula_print/print_jobs.db"
-
     # Root-only copy for system services (AnyDesk handshake, updaters).
     # Not owned by the desktop user — the app reads .env, system services
     # read this. Same values, different ACLs.
@@ -896,6 +923,56 @@ CREDS_EOF
     info "Installing Python dependencies..."
     run as_user "$SCRIPT_DIR/venv/bin/pip" install --quiet -r "$SCRIPT_DIR/requirements_app.txt" || return 1
     ok "Python packages installed."
+
+    # ── Seed the store connection into the local DB ─────────────
+    # Connections now live in print_jobs.db (see vula_store.py). We
+    # seed here — AFTER the venv exists — so this python3 has the
+    # dependencies the store and config modules need. (An earlier
+    # version of this block sat before venv creation and failed with
+    # "env: 'venv/bin/python3': No such file or directory".)
+    #
+    # The DB is per-user (~/.config/vula_print/print_jobs.db). We run
+    # the seeding as REAL_USER so the file lands with the correct
+    # ownership. If the DB already has connections, the helper no-ops:
+    # re-running install.sh never clobbers an operator's configuration.
+    info "Seeding store connection into the local database..."
+    as_user env \
+        VULA_API_URL="$API_URL" \
+        VULA_API_KEY="$API_KEY" \
+        "$SCRIPT_DIR/venv/bin/python3" - <<'PYEOF' || warn "DB seed failed (non-fatal — app will seed on first launch)"
+import os, sys
+sys.path.insert(0, os.getcwd())
+
+try:
+    from vula_store import PrintStore
+    from vula_config import APP_DB_FILE
+except Exception as e:
+    print(f"  Could not import store modules: {e}")
+    sys.exit(0)   # non-fatal; app seeds on first launch
+
+url = os.environ.get("VULA_API_URL", "").strip()
+key = os.environ.get("VULA_API_KEY", "").strip()
+if not (url and key):
+    print("  No API credentials provided — skipping DB seed")
+    sys.exit(0)
+
+store = PrintStore(APP_DB_FILE)
+existing = store.list_connections()
+if existing:
+    print(f"  DB already has {len(existing)} connection(s); not overwriting")
+    sys.exit(0)
+
+store.upsert_connection(
+    connection_id="conn_1",
+    name="Store 1",
+    api_base_url=url,
+    api_key=key,
+    printer_user_id=None,
+    display_order=0,
+)
+print(f"  Seeded connection conn_1 -> {url}")
+PYEOF
+    ok "Store connection seeded."
 
     # ── systemd user service ────────────────────────────────────
     local svc_file="$REAL_HOME/.config/systemd/user/vula-print.service"
@@ -1017,11 +1094,17 @@ ANYDESK_LIST
     ok "AnyDesk ID: $ad_id"
 
     # 4. Unattended password — 32 alphanumeric from /dev/urandom.
-    #    Pull 128 bytes so the alphanumeric filter reliably yields ≥32 chars.
-    local pw=""
-    pw=$(head -c 128 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9' | head -c 32)
+    #    The tr pipeline can drop the last byte at the buffer boundary,
+    #    so a single pass sometimes yields 31 chars. Loop until we get
+    #    exactly 32, capped to avoid an infinite loop on a broken
+    #    system where /dev/urandom is misbehaving.
+    local pw="" _attempts=0
+    while [ "${#pw}" -ne 32 ] && [ "$_attempts" -lt 10 ]; do
+        pw=$(head -c 256 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9' | head -c 32)
+        _attempts=$((_attempts + 1))
+    done
     if [ "${#pw}" -ne 32 ]; then
-        err "Password generation produced ${#pw} chars (want 32)."
+        err "Password generation failed after $_attempts attempts (got ${#pw} chars)."
         return 1
     fi
 
@@ -1229,6 +1312,13 @@ phase_firefox() {
         fi
         read -rp "${CYAN}[?]${NC} Store URL to set as Firefox homepage: " STORE_URL
         [ -z "$STORE_URL" ] && { warn "Empty URL — skipping."; return 0; }
+        # Auto-prefix https:// if the operator typed a bare hostname
+        # ("example.com", "www.example.com"). Matches what they would
+        # type into a browser address bar, saves a re-run on a typo.
+        if ! echo "$STORE_URL" | grep -qE '^https?://'; then
+            STORE_URL="https://${STORE_URL}"
+            dim "  Prefixed with https:// -> $STORE_URL"
+        fi
     fi
 
     if ! _validate_url "$STORE_URL"; then
