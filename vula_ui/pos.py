@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import time
 from datetime import datetime
+from typing import Optional
 
 import requests
 
@@ -173,6 +174,35 @@ class POSMixin:
         if not pos_printer:
             self._update_pos_worker_status("POS printer unassigned")
             return
+
+        # Persist the detail BEFORE starting the print. This is the
+        # moment the slip enters history. If printing fails, we still
+        # have a record of what was attempted, why, and can reprint.
+        try:
+            job_id = self._store.upsert_fetched(
+                connection_id=conn.connection_id,
+                connection_name=conn.name,
+                doc_class="pos_slip",
+                request_id=int(request_id),
+                detail=detail,
+                summary={
+                    "invoice_number": (detail.get("request", {}) or {}).get("invoice_number", ""),
+                    "total_qty": sum(
+                        int(i.get("qty", 0) or 0)
+                        for i in (detail.get("items", []) or [])
+                    ),
+                },
+                created_at=(detail.get("request", {}) or {}).get("created_at"),
+            )
+        except Exception:
+            job_id = None
+
+        # CAS on the store row: fetched → printing. If another tick
+        # already won, skip this print entirely — a duplicate POS slip
+        # delivered to a customer is worse than a missed one.
+        if job_id is not None and not self._store.mark_printing(job_id, pos_printer):
+            return
+
         conn.pos_in_flight_ids.add(request_id)
         self.last_successful_pos_poll_at = datetime.now()
         conn.pos_backoff_seconds = 1
@@ -186,17 +216,24 @@ class POSMixin:
             qr_module_px=self.pos_qr_module_px,
         )
         self.pos_print_job.completed.connect(
-            lambda s, m: self._on_pos_print_finished(s, m, request_id, connection_id)
+            lambda s, m, jid=job_id:
+            self._on_pos_print_finished(s, m, request_id, connection_id, jid)
         )
         self.pos_print_job.start()
         self.status_bar.showMessage(f"Printing POS slip #{request_id} ({conn.name})...")
 
-    def _on_pos_print_finished(self, success: bool, message: str, request_id: int, connection_id: str):
+    def _on_pos_print_finished(self, success: bool, message: str, request_id: int,
+                               connection_id: str, job_id: Optional[int] = None):
         """Handle POS print completion and completion API semantics."""
         self.pos_print_job = None
         conn = self.get_connection_by_id(connection_id)
 
         if success:
+            if job_id is not None:
+                try:
+                    self._store.mark_completed(job_id)
+                except Exception:
+                    pass
             self.last_successful_pos_print_at = datetime.now()
             if conn is not None:
                 self._dispatch_pos_complete(conn, request_id)
@@ -208,6 +245,11 @@ class POSMixin:
                     f"POS slip #{request_id} printed (no connection to complete)"
                 )
         else:
+            if job_id is not None:
+                try:
+                    self._store.mark_failed(job_id, message)
+                except Exception:
+                    pass
             if conn:
                 conn.pos_in_flight_ids.discard(request_id)
             self.status_bar.showMessage(f"POS slip #{request_id} failed: {message}")
@@ -252,22 +294,48 @@ class POSMixin:
         if not pos_printer:
             self._update_pos_worker_status("POS printer unassigned")
             return
+
+        try:
+            job_id = self._store.upsert_fetched(
+                connection_id=conn.connection_id,
+                connection_name=conn.name,
+                doc_class="pos_eod",
+                request_id=int(request_id),
+                detail=detail,
+                summary={
+                    "date": (detail.get("report_data", {}) or {}).get("date", ""),
+                },
+                created_at=(detail.get("request", {}) or {}).get("created_at"),
+            )
+        except Exception:
+            job_id = None
+
+        if job_id is not None and not self._store.mark_printing(job_id, pos_printer):
+            return
+
         conn.pos_eod_in_flight_ids.add(request_id)
         self.last_successful_pos_poll_at = datetime.now()
         self._update_pos_worker_status(f"Printing EOD via {conn.name}")
         self.pos_eod_print_job = POSEODReportPrintJob(pos_printer, detail)
         self.pos_eod_print_job.completed.connect(
-            lambda s, m: self._on_pos_eod_print_finished(s, m, request_id, connection_id)
+            lambda s, m, jid=job_id:
+            self._on_pos_eod_print_finished(s, m, request_id, connection_id, jid)
         )
         self.pos_eod_print_job.start()
         self.status_bar.showMessage(f"Printing POS EOD report #{request_id} ({conn.name})...")
 
-    def _on_pos_eod_print_finished(self, success: bool, message: str, request_id: int, connection_id: str):
+    def _on_pos_eod_print_finished(self, success: bool, message: str, request_id: int,
+                                   connection_id: str, job_id: Optional[int] = None):
         """Handle POS EOD receipt print completion semantics."""
         self.pos_eod_print_job = None
         conn = self.get_connection_by_id(connection_id)
 
         if success:
+            if job_id is not None:
+                try:
+                    self._store.mark_completed(job_id)
+                except Exception:
+                    pass
             if conn is not None:
                 self._dispatch_eod_complete(conn, request_id)
                 self.status_bar.showMessage(
@@ -278,6 +346,11 @@ class POSMixin:
                     f"POS EOD report #{request_id} printed (no connection to complete)"
                 )
         else:
+            if job_id is not None:
+                try:
+                    self._store.mark_failed(job_id, message)
+                except Exception:
+                    pass
             if conn:
                 conn.pos_eod_in_flight_ids.discard(request_id)
             self.status_bar.showMessage(f"POS EOD report #{request_id} failed: {message}")

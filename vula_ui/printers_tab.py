@@ -116,7 +116,70 @@ class PrintersTabMixin:
         self._printer_probe_timer.start(5000)
         QTimer.singleShot(200, self._refresh_printer_status)
 
+        # Paint the toggle in its current state (persisted preference).
+        self._refresh_auto_print_toggle()
+
         return tab
+
+    # ── Auto-print toggle (Phase 4) ─────────────────────────────
+
+    def _toggle_auto_print(self) -> None:
+        """Flip the auto-print preference and persist it.
+
+        Does not itself start any print — the drain runs on the next
+        queue refresh tick, or immediately if there's a queued label
+        and no job in flight.
+        """
+        self.auto_print_labels = not getattr(self, "auto_print_labels", False)
+        self.save_settings()
+        self._refresh_auto_print_toggle()
+
+        if self.auto_print_labels:
+            self.status_bar.showMessage(
+                "Auto-print enabled — queued labels will drain automatically."
+            )
+            # Kick the drain immediately so the operator sees it work.
+            self._maybe_auto_print_next_label()
+        else:
+            self.status_bar.showMessage("Auto-print disabled.")
+
+    def _refresh_auto_print_toggle(self) -> None:
+        """Update the toggle button's text + style to match the current
+        value of self.auto_print_labels. Called after any programmatic
+        change (e.g. the auto-disable-on-failure path in actions.py)."""
+        btn = getattr(self, "_auto_print_btn", None)
+        if btn is None:
+            return
+        on = bool(getattr(self, "auto_print_labels", False))
+        btn.setChecked(on)
+        btn.setText("ON" if on else "OFF")
+        if on:
+            btn.setStyleSheet(
+                f"QPushButton {{"
+                f"  background:{self.C_ORANGE}; color:#000; border:none;"
+                f"  border-radius:5px; padding:5px 14px;"
+                f"  font-size:11px; font-weight:700;"
+                f"}}"
+                f"QPushButton:hover {{ background:{self.C_ORANGE_HI}; }}"
+            )
+            btn.setToolTip(
+                "Auto-print is ON. Queued label requests print automatically. "
+                "Click to turn off."
+            )
+        else:
+            btn.setStyleSheet(
+                f"QPushButton {{"
+                f"  background:{self.C_SURFACE2}; color:{self.C_TEXT_DIM};"
+                f"  border:1px solid {self.C_BORDER};"
+                f"  border-radius:5px; padding:5px 14px;"
+                f"  font-size:11px; font-weight:700;"
+                f"}}"
+                f"QPushButton:hover {{ border-color:{self.C_ORANGE}; color:{self.C_TEXT}; }}"
+            )
+            btn.setToolTip(
+                "Auto-print is OFF. Click to drain queued labels automatically. "
+                "Pauses on first failure."
+            )
 
     # ── Card ────────────────────────────────────────────────────
 
@@ -222,6 +285,35 @@ class PrintersTabMixin:
         )
         actions.addWidget(test_btn)
         layout.addLayout(actions)
+
+        # Label-only: auto-print toggle. Placed under the action buttons
+        # so the print-related controls are visually grouped together.
+        # State is read from self.auto_print_labels, which is persisted
+        # to settings.json — the toggle is a saved preference, not a
+        # session flag.
+        if role_key == "label":
+            auto_row = QHBoxLayout()
+            auto_row.setSpacing(6)
+            auto_row.setContentsMargins(0, 4, 0, 0)
+
+            auto_lbl = QLabel("Auto-print")
+            auto_lbl.setStyleSheet(
+                f"color:{self.C_TEXT_DIM}; font-size:11px; font-weight:600;"
+            )
+            auto_btn = QPushButton("—")
+            auto_btn.setMinimumHeight(28)
+            auto_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            auto_btn.setCheckable(True)
+            auto_btn.clicked.connect(self._toggle_auto_print)
+
+            auto_row.addWidget(auto_lbl)
+            auto_row.addWidget(auto_btn)
+            auto_row.addStretch()
+            layout.addLayout(auto_row)
+
+            # Stash the button so _refresh_auto_print_toggle can update
+            # both state and style without rebuilding the card.
+            self._auto_print_btn = auto_btn
 
         self._printer_card_labels[role_key] = {
             "dot": status_dot,

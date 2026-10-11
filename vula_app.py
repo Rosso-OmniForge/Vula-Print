@@ -13,7 +13,8 @@ from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QMainWindow
 
 from vula_config import (
-    APP_CONFIG_FILE, APP_HISTORY_FILE, API_BASE_URL, API_KEY,
+    APP_CONFIG_FILE, APP_DB_FILE, APP_HISTORY_FILE,
+    API_BASE_URL, API_KEY,
     DEFAULT_POS_POLL_INTERVAL_SECONDS, StoreConnection,
 )
 from vula_http import HttpWorker
@@ -36,14 +37,20 @@ from vula_ui.pos import POSMixin
 from vula_ui.actions import ActionsMixin
 from vula_ui.preview import PreviewMixin
 from vula_ui.history import HistoryMixin
+from vula_ui.history_tab import HistoryTabMixin
 from vula_ui.misc import MiscMixin
 from vula_ui.label_layout import LabelLayoutMixin
+
+
+import logging
+_log = logging.getLogger("vula.app")
 
 
 class VulaPrintApp(
     MiscMixin,
     LabelLayoutMixin,
     HistoryMixin,
+    HistoryTabMixin,
     PreviewMixin,
     ActionsMixin,
     POSMixin,
@@ -84,6 +91,7 @@ class VulaPrintApp(
         self.printer_calibrated = False
         self.pending_requests: List[Dict[str, Any]] = []
         self.auto_connect_on_startup = True
+        self.auto_print_labels = False   # overwritten by load_settings()
         self.pos_poll_interval_seconds = DEFAULT_POS_POLL_INTERVAL_SECONDS
         self.calibration_job: Optional[PrintJob] = None
         self.print_job: Optional[PrintJob] = None
@@ -110,6 +118,7 @@ class VulaPrintApp(
         self.last_successful_pos_print_at: Optional[datetime] = None
         self._selected_request: Optional[Dict[str, Any]] = None   # tracks table selection
         self._current_print_request: Optional[Dict[str, Any]] = None  # for history
+        self._current_print_job_id: Optional[int] = None  # store row for in-flight job
 
         self.logo_dark_url = ""
         self.logo_light_url = ""
@@ -121,7 +130,44 @@ class VulaPrintApp(
         from vula_config import DEFAULT_LABEL_LAYOUT
         self.label_layout: Dict[str, Any] = dict(DEFAULT_LABEL_LAYOUT)
 
+        # ── Persistent store ─────────────────────────────────────────
+        # Created BEFORE load_settings() so settings can read connections
+        # from the DB rather than from settings.json. The migration
+        # helper runs first: it imports connections from settings.json
+        # (one-time transition from the pre-DB design) or from a legacy
+        # $SCRIPT_DIR/.env file, whichever exists. Idempotent — no-op on
+        # every launch after the first.
+        from vula_store import PrintStore, migrate_legacy_connections_if_needed
+        try:
+            self._store = PrintStore(APP_DB_FILE)
+        except Exception as _e:
+            _log.error("Failed to open store: %s", _e)
+            self._store = None
+
+        if self._store is not None:
+            try:
+                migrated = migrate_legacy_connections_if_needed(
+                    self._store,
+                    APP_CONFIG_FILE,
+                    Path(__file__).parent / ".env",
+                )
+                if migrated:
+                    _log.info(
+                        "Imported %d legacy connection(s) into the DB",
+                        migrated,
+                    )
+            except Exception as _e:
+                _log.warning("Connection migration failed: %s", _e)
+
+            _stale = self._store.mark_interrupted_on_startup()
+            if _stale:
+                _log.warning(
+                    "Marked %d interrupted print job(s) from previous session",
+                    _stale,
+                )
+
         self.load_settings()
+
         from vula_device_io import set_serial_configs as _set_serial_cfgs
         _set_serial_cfgs(self.serial_config)
         self.apply_brand_theme_from_css()

@@ -82,6 +82,18 @@ as_user() {
         "$@"
 }
 
+# Record the current commit as "last-known-good" before any change.
+# If the update leaves the app unable to start, we revert to this SHA.
+LKG_FILE=/var/lib/vula/last-known-good
+mkdir -p /var/lib/vula
+if [ -d "$SOURCE_DIR/.git" ]; then
+    CURRENT_SHA=$(cd "$SOURCE_DIR" && as_user git rev-parse HEAD 2>/dev/null || echo "")
+    if [ -n "$CURRENT_SHA" ]; then
+        echo "$CURRENT_SHA" > "$LKG_FILE"
+        log "last-known-good recorded: ${CURRENT_SHA:0:12}"
+    fi
+fi
+
 # ── Check-only mode: report status and exit ─────────────────────
 if [ "$CHECK_ONLY" = "1" ]; then
     if [ -d "$SOURCE_DIR/.git" ]; then

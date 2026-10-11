@@ -22,7 +22,7 @@ class PrinterScanMixin:
         from PyQt6.QtCore import QTimer
 
         self.refresh_timer = QTimer()
-        self.refresh_timer.timeout.connect(self.fetch_pending_requests)
+        self.refresh_timer.timeout.connect(self._on_queue_refresh_tick)
         self.refresh_timer.start(30000)
 
         self.pos_refresh_timer = QTimer()
@@ -34,6 +34,86 @@ class PrinterScanMixin:
             lambda: self.fetch_all_printer_configs(show_dialogs=False)
         )
         self.config_refresh_timer.start(60_000)
+
+    # ── Auto-print drain (Phase 4) ──────────────────────────────
+
+    def _on_queue_refresh_tick(self) -> None:
+        """Fires every 30 s. Refreshes the queue, then (if auto-print is
+        on) offers the oldest queued label job to the print pipeline.
+
+        Split out from setup_auto_refresh so the two responsibilities —
+        network refresh and drain — are visible side by side and the
+        failure path for auto-print doesn't get entangled with the poll.
+        """
+        self.fetch_pending_requests()
+        self._maybe_auto_print_next_label()
+
+    def _maybe_auto_print_next_label(self) -> None:
+        """One-shot drain step. Called after every pending-queue refresh,
+        and again from on_print_finished when auto-print is on (so a
+        large backlog drains as fast as the printer can keep up, not one
+        per 30 s tick).
+
+        Safety:
+          * Bails silently if auto-print is off.
+          * Bails silently if a label printer isn't assigned.
+          * Bails silently if a print job is already running.
+          * On any print failure, flips self.auto_print_labels to False
+            and tells the operator. Never auto-retries — a batch of
+            duplicate labels is worse than a stalled queue.
+        """
+        if not getattr(self, "auto_print_labels", False):
+            return
+        if not self.printer_roles.get("label"):
+            return
+        # Any in-flight job — manual or auto — means wait.
+        if self._thread_alive(getattr(self, "print_job", None)):
+            return
+        if getattr(self, "calibration_job", None) and \
+                self._thread_alive(self.calibration_job):
+            return
+
+        # Head of the queued list (oldest fetched-but-not-printed).
+        try:
+            queued = self._store.list_queued("label")
+        except Exception:
+            return
+        if not queued:
+            return
+
+        head = queued[0]
+        conn = self.get_connection_by_id(head["connection_id"])
+        if conn is None:
+            # Store connection was removed. Mark the job failed so it
+            # doesn't block the drain forever. The operator can see it
+            # in History and deal with it.
+            try:
+                self._store.mark_failed(
+                    int(head["id"]),
+                    f"store connection '{head['connection_id']}' no longer configured",
+                )
+            except Exception:
+                pass
+            return
+
+        # Reconstruct the summary dict the print path expects. Pulled
+        # from the stored summary_json, which was captured during the
+        # original poll.
+        import json as _json
+        try:
+            summary = _json.loads(head.get("summary_json") or "{}")
+        except Exception:
+            summary = {}
+        # The print path reads `_connection_id` off the request dict
+        # to find the right connection — set it from the store row.
+        summary["id"] = head["request_id"]
+        summary["_connection_id"] = head["connection_id"]
+        summary["_connection_name"] = head["connection_name"]
+
+        self.status_bar.showMessage(
+            f"Auto-print: request #{head['request_id']} ({conn.name})…"
+        )
+        self._start_label_print_from_cached(head, conn, summary)
 
     def scan_for_printers(self):
         """Scan for available USB printers on a background thread."""

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QMessageBox
@@ -35,6 +35,18 @@ class ActionsMixin:
             if reply == QMessageBox.StandardButton.No:
                 return
 
+        # Cache-first: if the detail is already on disk (Phase 2 populates
+        # it during the pending-list poll), start printing immediately —
+        # no HTTP round trip, no UI stall. Fall back to a network fetch
+        # only on cache miss, which also populates the store so the next
+        # click (or auto-print tick) hits the cache.
+        cached = self._store.get_by_request(
+            conn.connection_id, "label", int(request["id"])
+        )
+        if cached:
+            self._start_label_print_from_cached(cached, conn, request)
+            return
+
         w = HttpWorker(
             tag=f"labeldetail:{conn.connection_id}:{request['id']}",
             method="GET",
@@ -60,21 +72,73 @@ class ActionsMixin:
         if not items:
             QMessageBox.warning(self, "No Items", "This request has no items to print.")
             return
-        label_printer = self.printer_roles.get("label")
-        if not label_printer:
-            QMessageBox.warning(self, "No Printer", "Please select a printer first.")
+
+        # Persist the fetched detail so a future click on this request
+        # (or an auto-print tick) doesn't need the network again, then
+        # delegate to the shared start path.
+        job_id = self._store.upsert_fetched(
+            connection_id=conn.connection_id,
+            connection_name=conn.name,
+            doc_class="label",
+            request_id=int(request["id"]),
+            detail=data,
+            summary={k: request.get(k) for k in (
+                "id", "source", "total_labels", "created_at",
+                "note", "created_by_username",
+            )},
+            created_at=request.get("created_at"),
+            total_labels=request.get("total_labels"),
+        )
+        cached = self._store.get_job(job_id)
+        if cached is None:
+            QMessageBox.critical(self, "Store Error",
+                "Failed to record print job. Try again.")
+            return
+        self._start_label_print_from_cached(cached, conn, request)
+
+    def _start_label_print_from_cached(self, cached_row, conn, request) -> None:
+        """Start a label PrintJob from a cached store row.
+
+        Called from two paths: the manual Print click (cache hit, or the
+        delegate from _on_label_detail_fetched) and the auto-print drain
+        (Phase 4). The compare-and-set on the store row ensures exactly
+        one of them wins if both race.
+
+        Safe to call with any cached_row status — mark_printing() will
+        return False if the job isn't in a pre-print state, and this
+        method then bails silently (with a status-bar note).
+        """
+        job_id = int(cached_row["id"])
+        label_printer = self.printer_roles.get("label") or ""
+
+        # CAS: fetched → printing. Second racer loses.
+        if not self._store.mark_printing(job_id, label_printer):
+            self.status_bar.showMessage(
+                f"Request #{request.get('id')} is already being printed"
+            )
+            return
+
+        detail = self._store.get_detail(job_id) or {}
+        items = detail.get("items", [])
+        if not items:
+            self._store.mark_failed(job_id, "empty items after cache read")
+            QMessageBox.warning(self, "No Items", "This request has no items to print.")
             return
 
         self._current_print_request = request
+        self._current_print_job_id = job_id
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.print_job = PrintJob(label_printer, items, self.label_layout)
         self.print_job.progress.connect(self.on_print_progress)
         self.print_job.completed.connect(
-            lambda s, m: self.on_print_finished(s, m, request['id'], conn.connection_id)
+            lambda s, m, req=request, c=conn, jid=job_id:
+            self.on_print_finished(s, m, req['id'], c.connection_id, jid)
         )
         self.print_job.start()
-        self.status_bar.showMessage(f"Printing request #{request['id']} ({conn.name})...")
+        self.status_bar.showMessage(
+            f"Printing request #{request.get('id')} ({conn.name})..."
+        )
 
     def on_print_progress(self, current: int, total: int):
         """Update progress bar."""
@@ -83,19 +147,53 @@ class ActionsMixin:
             self.progress_bar.setValue(percentage)
             self.status_bar.showMessage(f"Printing: {current}/{total} labels")
 
-    def on_print_finished(self, success: bool, message: str, request_id: int, connection_id: str):
+    def on_print_finished(self, success: bool, message: str, request_id: int,
+                          connection_id: str, job_id: Optional[int] = None):
         """Handle print job completion, completing on the SAME connection that supplied it."""
         self.progress_bar.setVisible(False)
+        self._current_print_job_id = None
         conn = self.get_connection_by_id(connection_id)
 
         if success:
+            if job_id is not None:
+                try:
+                    self._store.mark_completed(job_id)
+                except Exception:
+                    pass
             self._save_to_history(self._current_print_request)
-            QMessageBox.information(self, "Success", message)
+            # Suppress the "Success" popup when auto-printing — a batch
+            # of 40 labels would spawn 40 modal dialogs and block the
+            # drain on the operator clicking OK.
+            if not getattr(self, "auto_print_labels", False):
+                QMessageBox.information(self, "Success", message)
             if conn:
                 self._complete_label_request_async(conn, request_id)
             self.fetch_pending_requests()
+            # Immediately offer the next queued job to the drain, so a
+            # backlog runs continuously instead of one per 30 s tick.
+            self._maybe_auto_print_next_label()
         else:
-            QMessageBox.critical(self, "Print Failed", message)
+            if job_id is not None:
+                try:
+                    self._store.mark_failed(job_id, message)
+                except Exception:
+                    pass
+            # Auto-print safety: stop the drain on first failure. The
+            # operator has to explicitly re-enable after investigating,
+            # which is the right default — silent retries hide problems.
+            if getattr(self, "auto_print_labels", False):
+                self.auto_print_labels = False
+                self.save_settings()
+                if hasattr(self, "_refresh_auto_print_toggle"):
+                    self._refresh_auto_print_toggle()
+                QMessageBox.warning(
+                    self, "Auto-print paused",
+                    "Auto-print was disabled after a print failure.\n\n"
+                    "Fix the cause, then re-enable it in the Printers tab.\n"
+                    "The failed job is visible in History."
+                )
+            else:
+                QMessageBox.critical(self, "Print Failed", message)
 
         self.status_bar.showMessage("Ready")
 

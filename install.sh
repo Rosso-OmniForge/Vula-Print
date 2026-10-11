@@ -753,12 +753,12 @@ CLAM_TIMER_EOF
 # PHASE 5 — PRINT APP
 # ════════════════════════════════════════════════════════════════
 phase_print_app() {
-    local env_file="$SCRIPT_DIR/.env"
-
-    if [ -z "$API_KEY" ] && [ -f "$env_file" ]; then
-        API_KEY=$(grep -E '^PRINTER_API_KEY=' "$env_file" | tail -1 | cut -d= -f2-)
-        [ -n "$API_KEY" ] && info "Using existing API key from .env"
-    fi
+    # Legacy .env is no longer read or written here. Connections live in
+    # print_jobs.db and are migrated on first app launch — see
+    # vula_store.migrate_legacy_connections_if_needed.
+    # If $API_KEY is empty on a re-run, it's because --api-key wasn't
+    # given; the DB may already have a valid key from a previous run,
+    # in which case the seeding step below will no-op.
 
     # Fall back: if --api-url wasn't given, allow --store-url to double
     # as the API base for backwards compatibility, with a warning.
@@ -800,16 +800,53 @@ phase_print_app() {
         fi
     fi
 
-    # Persist per-user .env — API base, NOT the storefront. The storefront
-    # URL only feeds the Firefox homepage policy in phase_firefox.
-    cat > "$env_file" <<ENV_EOF
-# Vula! Print runtime environment — managed by install.sh
-PRINTER_API_BASE_URL=$API_URL
-PRINTER_API_KEY=$API_KEY
-ENV_EOF
-    chmod 600 "$env_file"
-    chown "$REAL_USER":"$REAL_USER" "$env_file"
-    ok "Credentials saved to $env_file"
+    # Connections now live in print_jobs.db (see vula_store.py). The DB
+    # is created lazily by the app on first launch, but we seed it here
+    # so a fresh install has a working connection without the operator
+    # needing to open the Connections dialog.
+    #
+    # The DB is per-user (~/.config/vula_print/print_jobs.db). We run the
+    # seeding as REAL_USER so the file lands with the correct ownership.
+    #
+    # If an existing DB already has connections, the helper no-ops —
+    # re-running install.sh never clobbers an operator's configuration.
+    info "Seeding store connection into the local database..."
+    as_user env \
+        VULA_API_URL="$API_URL" \
+        VULA_API_KEY="$API_KEY" \
+        "$SCRIPT_DIR/venv/bin/python3" - <<'PYEOF' || return 1
+import os, sys
+from pathlib import Path
+
+# The venv's python runs from the repo dir; add it to sys.path so
+# vula_store and vula_config resolve.
+sys.path.insert(0, os.getcwd())
+
+from vula_store import PrintStore
+from vula_config import APP_DB_FILE
+
+url = os.environ.get("VULA_API_URL", "").strip()
+key = os.environ.get("VULA_API_KEY", "").strip()
+if not (url and key):
+    sys.exit(0)
+
+store = PrintStore(APP_DB_FILE)
+existing = store.list_connections()
+if existing:
+    print(f"  DB already has {len(existing)} connection(s); not overwriting")
+    sys.exit(0)
+
+store.upsert_connection(
+    connection_id="conn_1",
+    name="Store 1",
+    api_base_url=url,
+    api_key=key,
+    printer_user_id=None,
+    display_order=0,
+)
+print(f"  Seeded connection conn_1 -> {url}")
+PYEOF
+    ok "Connection seeded into $REAL_HOME/.config/vula_print/print_jobs.db"
 
     # Root-only copy for system services (AnyDesk handshake, updaters).
     # Not owned by the desktop user — the app reads .env, system services

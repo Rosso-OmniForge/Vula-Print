@@ -5,7 +5,7 @@ import json
 from typing import List, Optional
 
 from vula_config import (
-    API_BASE_URL, API_KEY, APP_CONFIG_FILE,
+    APP_CONFIG_FILE,
     DEFAULT_POS_POLL_INTERVAL_SECONDS, StoreConnection,
 )
 
@@ -41,23 +41,21 @@ class SettingsMixin:
             with open(APP_CONFIG_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
-            connections_data = data.get("store_connections")
-            if connections_data:
+            # Connections come from the DB now. settings.json is only
+            # consulted for UI preferences. Legacy installs are migrated
+            # on first launch — see migrate_legacy_connections_if_needed
+            # in vula_store.py, called from vula_app.__init__.
+            if self._store is not None:
                 self.store_connections = [
-                    StoreConnection.from_settings_dict(c) for c in connections_data
+                    StoreConnection(
+                        connection_id=row["connection_id"],
+                        name=row["display_name"],
+                        api_base_url=row["api_base_url"],
+                        api_key=row["api_key"],
+                        printer_user_id=row.get("printer_user_id"),
+                    )
+                    for row in self._store.list_connections()
                 ]
-            else:
-                legacy_base = (data.get("api_base_url") or "").strip()
-                legacy_key = (data.get("api_key") or "").strip()
-                legacy_user_id = data.get("printer_user_id")
-                if legacy_base and legacy_key:
-                    self.store_connections = [StoreConnection(
-                        connection_id="conn_1",
-                        name="Store 1",
-                        api_base_url=legacy_base,
-                        api_key=legacy_key,
-                        printer_user_id=legacy_user_id if isinstance(legacy_user_id, int) else None,
-                    )]
 
             self.brand_logo_path = data.get("brand_logo_path") or self.brand_logo_path
             roles = data.get("printer_roles") or {}
@@ -68,6 +66,11 @@ class SettingsMixin:
             }
 
             self.auto_connect_on_startup = bool(data.get("auto_connect_on_startup", True))
+            # Auto-print: when on, the label queue drains itself each poll
+            # tick — one job per tick, CAS-guarded against the manual Print
+            # path. Flips itself off after any failed print (see
+            # vula_ui/printer_scan.py:_maybe_auto_print_next_label).
+            self.auto_print_labels = bool(data.get("auto_print_labels", False))
             self.pos_poll_interval_seconds = int(
                 data.get("pos_poll_interval_seconds", DEFAULT_POS_POLL_INTERVAL_SECONDS)
                 or DEFAULT_POS_POLL_INTERVAL_SECONDS
@@ -96,30 +99,41 @@ class SettingsMixin:
         self._apply_default_connection_if_empty()
 
     def _apply_default_connection_if_empty(self):
-        """Seed one connection from env vars if settings had none at all."""
+        """Ensure the connections list is never empty. Creates a blank
+        placeholder so the UI has something to show; the operator fills
+        it in via the Connections dialog."""
         if self.store_connections:
             return
-        if API_BASE_URL and API_KEY:
-            self.store_connections = [StoreConnection(
-                connection_id="conn_1",
-                name="Store 1",
-                api_base_url=API_BASE_URL,
-                api_key=API_KEY,
-            )]
-        else:
-            self.store_connections = [StoreConnection(connection_id="conn_1", name="Store 1")]
+        self.store_connections = [StoreConnection(connection_id="conn_1", name="Store 1")]
 
     def save_settings(self):
         """Persist app settings."""
         try:
             APP_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
             roles = getattr(self, "printer_roles", {}) or {}
+            # Write connections to the DB, UI prefs to settings.json.
+            if self._store is not None:
+                try:
+                    self._store.replace_all_connections([
+                        {
+                            "connection_id":   c.connection_id,
+                            "name":            c.name,
+                            "api_base_url":    c.api_base_url,
+                            "api_key":         c.api_key,
+                            "printer_user_id": c.printer_user_id,
+                        }
+                        for c in self.store_connections
+                    ])
+                except Exception as e:
+                    print(f"Warning: failed to persist connections: {e}")
+
             data = {
-                "store_connections": [c.to_settings_dict() for c in self.store_connections],
+                # "store_connections" key intentionally omitted — read from DB.
                 "brand_logo_path": self.brand_logo_path,
                 "label_printer_device": roles.get("label"),
                 "pos_slip_printer_device": roles.get("pos_slip"),
                 "auto_connect_on_startup": self.auto_connect_on_startup,
+                "auto_print_labels": bool(getattr(self, "auto_print_labels", False)),
                 "pos_poll_interval_seconds": self.pos_poll_interval_seconds,
                 "pos_width_chars": int(self.pos_width_chars),
                 "pos_qr_mode": str(self.pos_qr_mode),

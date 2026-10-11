@@ -100,6 +100,77 @@ class LabelQueueMixin:
             self._http_workers.append(w)
             w.start()
 
+    # ── Label detail cache (Phase 2) ──────────────────────────────
+
+    # Upper bound on detail fetches per poll cycle. A large pending
+    # queue on a slow link shouldn't turn into an HTTP storm — anything
+    # past this cap gets fetched on the next 30 s tick.
+    _LABEL_CACHE_MAX_PER_CYCLE = 20
+
+    def _cache_missing_label_details(self) -> None:
+        """Fetch + store detail for any pending label request not yet cached.
+
+        Runs after every pending-list refresh. Bounded to
+        _LABEL_CACHE_MAX_PER_CYCLE dispatches per cycle. Idempotent:
+        requests already in the store are skipped, so a re-poll of the
+        same pending set costs zero additional HTTP calls.
+        """
+        dispatched = 0
+        for req in self.pending_requests or []:
+            if dispatched >= self._LABEL_CACHE_MAX_PER_CYCLE:
+                break
+            conn = self._connection_for_request(req)
+            if not conn:
+                continue
+            rid = req.get("id")
+            if not rid:
+                continue
+            # Skip if already on disk (any status — fetched, printing,
+            # completed, failed, interrupted — all authoritative).
+            if self._store.get_by_request(conn.connection_id, "label", int(rid)):
+                continue
+            self._dispatch_label_detail_cache(conn, int(rid), req)
+            dispatched += 1
+
+    def _dispatch_label_detail_cache(self, conn, request_id: int, summary) -> None:
+        """Kick off an off-thread detail fetch for one request. On success
+        the payload is written to the store by _on_label_detail_cached."""
+        w = HttpWorker(
+            tag=f"labelcache:{conn.connection_id}:{request_id}",
+            method="GET",
+            url=f"{conn.api_base_url.rstrip('/')}/admin/api/label-printing/request/{request_id}",
+            headers=self._headers_for(conn),
+            timeout=10.0,
+        )
+        w.done.connect(
+            lambda r, c=conn, rid=request_id, s=summary:
+            self._on_label_detail_cached(r, c, rid, s)
+        )
+        w.finished.connect(lambda w=w: self._forget_http_worker(w))
+        self._http_workers.append(w)
+        w.start()
+
+    def _on_label_detail_cached(self, result, conn, request_id: int, summary) -> None:
+        """Detail fetch completed — write to the store. Silent on failure:
+        the next pending-list refresh will retry if the request is still
+        pending. Failures here are not worth surfacing to the operator."""
+        if not (result.ok and result.status == 200):
+            return
+        detail = result.data if isinstance(result.data, dict) else {}
+        try:
+            self._store.upsert_fetched(
+                connection_id=conn.connection_id,
+                connection_name=conn.name,
+                doc_class="label",
+                request_id=int(request_id),
+                detail=detail,
+                summary=summary,
+                created_at=summary.get("created_at") if isinstance(summary, dict) else None,
+                total_labels=(summary.get("total_labels") if isinstance(summary, dict) else None),
+            )
+        except Exception:
+            pass
+
     def _on_pending_fetch_done(self, result):
         if not result.tag.startswith("labelq:"):
             return
@@ -126,6 +197,7 @@ class LabelQueueMixin:
             )
             self.pending_requests = self._pending_fetch_accum
             self.update_requests_table()
+            self._cache_missing_label_details()
 
             if self._pending_fetch_any_ok:
                 msg = (f"Loaded {len(self.pending_requests)} pending request(s) "

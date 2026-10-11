@@ -100,37 +100,9 @@ class TabsMixin:
     def _build_printers_tab(self) -> QWidget:
         return self._build_printers_tab_content()
 
-    # ── History tab (placeholder, still uses dialog) ────────────
+    # ── History tab ─────────────────────────────────────────────
 
     def _build_history_tab(self) -> QWidget:
-        tab = QWidget()
-        tab.setStyleSheet("background: transparent;")
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(24, 24, 24, 24)
-        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        title = QLabel("Print History")
-        title.setStyleSheet(
-            f"color: {self.C_TEXT}; font-size: 18px; font-weight: 700;"
-        )
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        sub = QLabel(
-            "Inline history is coming in a later update.\n"
-            "For now, use the button below."
-        )
-        sub.setStyleSheet(f"color: {self.C_TEXT_DIM}; font-size: 12px;")
-        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        open_btn = QPushButton("Open History Dialog")
-        open_btn.setMinimumHeight(38)
-        open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        open_btn.setStyleSheet(self._btn_primary())
-        open_btn.clicked.connect(self.show_print_history)
-
-        layout.addWidget(title)
-        layout.addSpacing(8)
-        layout.addWidget(sub)
-        layout.addSpacing(16)
-        layout.addWidget(open_btn, alignment=Qt.AlignmentFlag.AlignCenter)
-        return tab
+        # The mixin lives in vula_ui/history_tab.py. Kept as a thin
+        # wrapper so this file's structure matches the other tabs.
+        return self._build_history_tab_content()
