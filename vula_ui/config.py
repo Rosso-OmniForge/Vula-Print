@@ -486,6 +486,11 @@ class ConfigMixin:
                 conn.last_status = "Invalid API key"
             else:
                 conn.last_status = f"HTTP {result.status}"
+            # N27: `ok` was unbound in this branch — any failing
+            # connection test raised NameError in this slot, which the
+            # Qt excepthook swallowed and the "Testing N…" status
+            # never cleared. Explicit False is required.
+            ok = False
 
         self._test_all_results.append((conn.name, ok, conn.last_status))
         self._test_all_pending = max(0, self._test_all_pending - 1)

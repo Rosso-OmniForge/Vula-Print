@@ -8,8 +8,6 @@ from typing import Optional
 
 _log = logging.getLogger("vula.pos")
 
-import requests
-
 from vula_config import StoreConnection
 from vula_http import HttpWorker, HttpResult
 from vula_workers import POSSlipPrintJob, POSEODReportPrintJob, POSPollWorker, _RetryFlushWorker
