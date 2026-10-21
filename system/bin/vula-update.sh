@@ -5,7 +5,7 @@
 # Invoked by:
 #   * vula-update-manual.service   (git pull + re-run install.sh)
 #   * vula-update-local.service    (re-run install.sh against current tree)
-#   * manually:  sudo vula-update.sh [--local] [--check] [--no-apt]
+#   * manually:  sudo vula-update.sh [--local] [--check] [--with-apt]
 #
 # Reads install-time constants from /etc/vula/install.env:
 #   REAL_USER    — the console user (source dir owner, app runtime user)
@@ -17,12 +17,20 @@ set -uo pipefail
 
 LOCAL=0
 CHECK_ONLY=0
-NO_APT=0
+# Audit M38: the system phase runs `apt-get update && apt-get upgrade`
+# and is now OFF by default. Rationale: at fleet scale, a bad apt
+# package (or a broken mirror, or a full /var) turns every 04:05
+# auto-update into an apt failure storm across 1000 boxes. The system
+# phase remains available for the manual update path and for the
+# scheduled apt-upgrade.timer that already handles unattended apt
+# independently — we do not need to duplicate that here.
+NO_APT=1
 for arg in "$@"; do
     case "$arg" in
-        --local)  LOCAL=1 ;;
-        --check)  CHECK_ONLY=1 ;;
-        --no-apt) NO_APT=1 ;;
+        --local)   LOCAL=1 ;;
+        --check)   CHECK_ONLY=1 ;;
+        --no-apt)  NO_APT=1 ;;
+        --with-apt) NO_APT=0 ;;
         --help|-h)
             sed -n '3,15p' "$0" | sed 's/^# \?//'
             exit 0
@@ -82,15 +90,47 @@ as_user() {
         "$@"
 }
 
+# ── Health probe ────────────────────────────────────────────────
+# A successful `systemctl restart` is not the same as a healthy app:
+# the service can be active for a fraction of a second, then crash,
+# restart, crash, ... until StartLimitBurst kicks in. Poll for a
+# window and require the service to be active at the end AND to have
+# been continuously active for at least the trailing half of that
+# window. This catches both "immediately crashes" and "crashes after
+# a few seconds" failure modes without misfiring on a single
+# transient restart.
+#
+# Window: 30 s total, 15 s consecutive required. Tuned for a PyQt
+# app that takes ~2 s to reach a stable state on the boxes we ship.
+health_check() {
+    local consecutive=0
+    local i
+    for i in $(seq 1 30); do
+        sleep 1
+        if as_user systemctl --user is-active --quiet vula-print.service 2>/dev/null; then
+            consecutive=$((consecutive + 1))
+        else
+            consecutive=0
+        fi
+    done
+    if [ "$consecutive" -ge 15 ]; then
+        log "health probe: PASS (${consecutive}s consecutive active)"
+        return 0
+    fi
+    log "health probe: FAIL (only ${consecutive}s consecutive active at end of 30s window)"
+    return 1
+}
+
 # Record the current commit as "last-known-good" before any change.
 # If the update leaves the app unable to start, we revert to this SHA.
 LKG_FILE=/var/lib/vula/last-known-good
 mkdir -p /var/lib/vula
+PRE_SHA=""
 if [ -d "$SOURCE_DIR/.git" ]; then
-    CURRENT_SHA=$(cd "$SOURCE_DIR" && as_user git rev-parse HEAD 2>/dev/null || echo "")
-    if [ -n "$CURRENT_SHA" ]; then
-        echo "$CURRENT_SHA" > "$LKG_FILE"
-        log "last-known-good recorded: ${CURRENT_SHA:0:12}"
+    PRE_SHA=$(cd "$SOURCE_DIR" && as_user git rev-parse HEAD 2>/dev/null || echo "")
+    if [ -n "$PRE_SHA" ]; then
+        echo "$PRE_SHA" > "$LKG_FILE"
+        log "rollback target (PRE_SHA) recorded: ${PRE_SHA:0:12}"
     fi
 fi
 
@@ -216,17 +256,80 @@ RC=$?
 
 log "install.sh exit code: $RC"
 
+# Case A: install.sh itself failed (pip, venv, DB seed, phase runner).
+# This is NOT the "bad commit shipped" scenario — usually a transient
+# network or dependency problem on this specific box. Reset the git
+# checkout back to PRE_SHA so the next timer run does not treat the
+# failed commit as the current baseline, then exit cleanly for manual
+# review. Do NOT auto-retry — a repeated failing install.sh against the
+# same commit just burns apt bandwidth and log space.
 if [ "$RC" -ne 0 ]; then
-    log "ERROR: install.sh failed. See $LOG for details."
-    log "Restart manually: systemctl --user restart vula-print  (as $REAL_USER)"
+    log "ERROR: install.sh failed (rc=$RC) — resetting git to PRE_SHA ${PRE_SHA:0:12}"
+    if [ -n "$PRE_SHA" ] && [ -d "$SOURCE_DIR/.git" ]; then
+        (cd "$SOURCE_DIR" && as_user git reset --hard "$PRE_SHA") >> "$LOG" 2>&1 || \
+            log "WARN: git reset --hard to PRE_SHA also failed"
+    fi
+    log "  Manual review required. Log: $LOG"
     exit 1
 fi
 
-sleep 2
-if as_user systemctl --user is-active --quiet vula-print.service 2>/dev/null; then
-    log "vula-print.service is running"
-else
-    log "WARN: vula-print.service not active after update"
+# Case B: install.sh succeeded. Now the correctness gate — did the app
+# actually come up and STAY up? This is the scenario audit C17 was
+# designed to catch: a merged commit that passes install.sh but breaks
+# the runtime (import error, config regression, Qt init crash, ...).
+NEW_SHA=$(cd "$SOURCE_DIR" && as_user git rev-parse HEAD 2>/dev/null || echo "")
+
+if ! health_check; then
+    log "════════════════════════════════════════════════════"
+    log "ROLLBACK: resetting to PRE_SHA ${PRE_SHA:0:12}"
+    log "════════════════════════════════════════════════════"
+
+    if [ -z "$PRE_SHA" ] || [ ! -d "$SOURCE_DIR/.git" ]; then
+        log "ERROR: no git checkout — cannot roll back"
+        exit 1
+    fi
+
+    (cd "$SOURCE_DIR" && as_user git reset --hard "$PRE_SHA") >> "$LOG" 2>&1 || {
+        log "ERROR: git reset --hard to $PRE_SHA failed"
+        exit 1
+    }
+
+    log "── re-running install.sh against ${PRE_SHA:0:12} ──"
+    bash "$SOURCE_DIR/install.sh" \
+        --yes \
+        --phase="$PHASES" \
+        --api-url="$API_URL" \
+        --api-key="$API_KEY" \
+        >> "$LOG" 2>&1
+    ROLLBACK_RC=$?
+    log "rollback install.sh exit code: $ROLLBACK_RC"
+
+    as_user systemctl --user restart vula-print.service >> "$LOG" 2>&1 || true
+
+    if health_check; then
+        log "rollback successful — app running at ${PRE_SHA:0:12}"
+        log "  The bad commit ${NEW_SHA:0:12} is still in git history."
+        log "  Investigate, then re-run: sudo vula-update.sh"
+        log "════════════════════════════════════════════════════"
+        # LKG file already contains PRE_SHA (never overwritten)
+        exit 0
+    fi
+
+    log "ERROR: rollback ALSO failed — app broken at both ${NEW_SHA:0:12} and ${PRE_SHA:0:12}"
+    log "  MANUAL INTERVENTION REQUIRED"
+    log "  Log: $LOG"
+    log "════════════════════════════════════════════════════"
+    exit 1
+fi
+
+# Health check passed — promote the new SHA to last-known-good. From
+# now on, any future update's PRE_SHA / rollback target is this SHA,
+# not the older one.
+if [ -n "$NEW_SHA" ] && [ -n "$PRE_SHA" ] && [ "$NEW_SHA" != "$PRE_SHA" ]; then
+    echo "$NEW_SHA" > "$LKG_FILE"
+    log "last-known-good promoted: ${PRE_SHA:0:12} -> ${NEW_SHA:0:12}"
+elif [ -n "$NEW_SHA" ]; then
+    log "no commit change (${NEW_SHA:0:12}); LKG unchanged"
 fi
 
 log "Update complete"

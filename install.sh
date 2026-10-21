@@ -1001,20 +1001,45 @@ if not (url and key):
     sys.exit(0)
 
 store = PrintStore(APP_DB_FILE)
-existing = store.list_connections()
-if existing:
-    print(f"  DB already has {len(existing)} connection(s); not overwriting")
-    sys.exit(0)
+all_conns = store.list_connections()
+conn_1 = next((c for c in all_conns if c.get("connection_id") == "conn_1"), None)
 
-store.upsert_connection(
-    connection_id="conn_1",
-    name="Store 1",
-    api_base_url=url,
-    api_key=key,
-    printer_user_id=None,
-    display_order=0,
-)
-print(f"  Seeded connection conn_1 -> {url}")
+if conn_1 is None:
+    # No conn_1 yet — seed it. Other custom connections (if any) are
+    # operator-added and are left untouched: we only manage conn_1,
+    # which is the installer's slot.
+    store.upsert_connection(
+        connection_id="conn_1",
+        name="Store 1",
+        api_base_url=url,
+        api_key=key,
+        printer_user_id=None,
+        display_order=0,
+    )
+    print(f"  Seeded connection conn_1 -> {url}")
+
+elif conn_1.get("api_base_url") == url and conn_1.get("api_key") == key:
+    # No change — the common case on every routine update re-run.
+    print("  conn_1 credentials already up to date; skipping")
+
+else:
+    # Audit M27: credentials changed. Previously we skipped entirely
+    # if ANY connection existed, so `install.sh --api-key=newkey` left
+    # the app running on the old key in print_jobs.db while
+    # /etc/vula/creds.env had the new one — three copies of the
+    # credential with no sync. Rotate now. Preserve everything else
+    # (name, printer_user_id, display_order) so an operator who
+    # customised conn_1 does not lose their settings.
+    store.upsert_connection(
+        connection_id="conn_1",
+        name=conn_1.get("display_name") or "Store 1",
+        api_base_url=url,
+        api_key=key,
+        printer_user_id=conn_1.get("printer_user_id"),
+        display_order=int(conn_1.get("display_order") or 0),
+    )
+    print(f"  Rotated conn_1 credentials -> {url} "
+          f"(name/printer_user_id preserved)")
 PYEOF
     ok "Store connection seeded."
 
@@ -1628,13 +1653,21 @@ set -u
 LOG=/var/log/vula/app-update.log
 mkdir -p /var/log/vula
 
-REAL_USER="${1:-}"
+# Accept args positionally for backward compatibility, then fall back
+# to the environment. EnvironmentFile=/etc/vula/install.env in the
+# unit now supplies REAL_USER and SOURCE_DIR — this avoids the
+# systemd ExecStart word-splitting hazard (audit H20): a source dir
+# containing spaces would have been split into two args under
+# `ExecStart=... $REAL_USER $SCRIPT_DIR`, silently passing a
+# truncated path. `${VAR}` expansion in ExecStart does not word-split,
+# so this remains robust regardless of path content.
+REAL_USER="${1:-${REAL_USER:-}}"
 if [ -z "$REAL_USER" ]; then
-    echo "$(date -Iseconds) ERROR: no user passed" >> "$LOG"
+    echo "$(date -Iseconds) ERROR: no user passed and REAL_USER unset" >> "$LOG"
     exit 1
 fi
 REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
-SCRIPT_DIR="${2:-}"
+SCRIPT_DIR="${2:-${SOURCE_DIR:-}}"
 if [ -z "$SCRIPT_DIR" ] || [ ! -d "$SCRIPT_DIR/.git" ]; then
     echo "$(date -Iseconds) ERROR: bad source dir '$SCRIPT_DIR'" >> "$LOG"
     exit 1
@@ -1694,7 +1727,15 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/vula-print-update.sh $REAL_USER $SCRIPT_DIR
+# EnvironmentFile supplies REAL_USER and SOURCE_DIR to the script.
+# Using \${VAR} (not \$VAR) in ExecStart makes systemd pass the value
+# through as a single argument regardless of any spaces — fixes the
+# word-splitting hazard identified in audit H20. The "=" without "-"
+# would fail hard if the file is missing; "-" tolerates missing files
+# so a broken install.env surfaces as a clear error in the script's
+# own log rather than as a systemd unit-load failure.
+EnvironmentFile=-/etc/vula/install.env
+ExecStart=/usr/local/bin/vula-print-update.sh \${REAL_USER} \${SOURCE_DIR}
 Nice=19
 IOSchedulingClass=idle
 TimeoutStartSec=900
