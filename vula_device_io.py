@@ -20,6 +20,8 @@ populated by the app once settings are loaded. See set_serial_configs().
 from __future__ import annotations
 
 import logging
+import os
+import select
 import threading
 import time
 from typing import Any, Dict, Optional
@@ -125,9 +127,33 @@ def write_to_device(path: str, data: bytes) -> None:
 
 
 def _write_file(path: str, data: bytes) -> None:
+    log = logging.getLogger("vula.device")
     with open(path, "wb") as f:
         f.write(data)
         f.flush()
+        # Force the kernel to push the entire buffer to the USB device
+        # before returning. flush() only empties Python's userspace
+        # buffer — the kernel may still hold the tail of the receipt.
+        # fsync surfaces driver-level write failures that flush() hides.
+        os.fsync(f.fileno())
+        # Non-blocking probe for the "device closed mid-write" case.
+        # On usblp, select() reports readable if the underlying USB
+        # device was disconnected (EOF) or queued a status byte. EOF
+        # means our write was almost certainly lost — raise so the
+        # caller reports failure instead of a false "printed".
+        try:
+            r, _, _ = select.select([f.fileno()], [], [], 0.05)
+            if r:
+                probe = os.read(f.fileno(), 1)
+                if probe == b"":
+                    raise RuntimeError(
+                        f"printer device closed unexpectedly during write: {path}"
+                    )
+                log.debug("printer status byte from %s: %r", path, probe)
+        except (OSError, ValueError):
+            # fd not selectable (some kernel variants) or already closed.
+            # Not a failure of the write itself — do not raise.
+            pass
 
 
 def _write_serial(path: str, data: bytes) -> None:
@@ -140,20 +166,38 @@ def _write_serial(path: str, data: bytes) -> None:
         )
 
     cfg = get_serial_config(path)
+    baud = int(cfg.get("baud", 9600))
+    # Scale write timeout to payload size. At `baud` bps with 10 bits per
+    # byte (8N1 + start/stop), a len(data)-byte payload takes
+    # len(data) * 10 / baud seconds on the wire. Add a 5 s floor (so a
+    # fully stuck port still eventually fails) and a 5 s margin (so a
+    # slow printer does not trip the timeout mid-receipt). The old fixed
+    # 5-second ceiling silently truncated long receipts on 9600-baud
+    # hardware — a real-POS slip with logo + QR regularly exceeds it.
+    if baud > 0:
+        wire_seconds = (len(data) * 10) / baud
+    else:
+        wire_seconds = 5.0
+    write_timeout = max(5.0, wire_seconds + 5.0)
+
     kwargs = dict(
         port=path,
-        baudrate=int(cfg.get("baud", 9600)),
+        baudrate=baud,
         bytesize=int(cfg.get("bytesize", 8)),
         parity=str(cfg.get("parity", "N")),
         stopbits=int(cfg.get("stopbits", 1)),
         timeout=5,
-        write_timeout=5,
+        write_timeout=write_timeout,
         xonxoff=(cfg.get("flow") == "xonxoff"),
         rtscts=(cfg.get("flow") == "rtscts"),
     )
 
     with serial.Serial(**kwargs) as s:
         s.write(data)
+        # pyserial's flush() calls tcdrain() — it blocks until the
+        # kernel has pushed every byte to the UART TX buffer. Correct
+        # semantics for receipt delivery: return only when the bytes
+        # have left both userspace and the kernel, and are on the wire.
         s.flush()
 
 

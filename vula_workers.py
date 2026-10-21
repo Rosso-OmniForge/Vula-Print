@@ -144,8 +144,22 @@ class PrintJob(QThread):
         self.finished.connect(self.deleteLater)
 
     def _tspl_escape(self, s: str) -> str:
-        """Escape a string for TSPL commands."""
-        return (s or "").replace('\\', '\\\\').replace('"', '\\"')
+        """Escape a string for TSPL command literals.
+
+        TSPL is line-oriented: every command lives on its own line. A
+        newline or CR inside a quoted string therefore terminates the
+        string AND starts a new command. A backend-supplied field
+        containing "\\nCLS\\n" is a real TSPL command — it blanks the
+        label or, depending on the interpreter, executes arbitrary TSPL.
+        Same for other control bytes. Reject anything outside printable
+        ASCII + space, then escape backslash and double quote.
+        """
+        raw = s or ""
+        cleaned = "".join(
+            c if c == " " or 0x20 <= ord(c) < 0x7F else " "
+            for c in raw
+        )
+        return cleaned.replace("\\", "\\\\").replace('"', '\\"')
 
     def _center_x_for_text(self, text: str, font: str = "4", xmul: int = 1) -> int:
         """Calculate centered X position for text."""
@@ -259,7 +273,11 @@ class PrintJob(QThread):
         # ── SKU (bottom, small font) ──────────────────────────────────
         tspl.append(f'TEXT {LM},{215 + TOP},"1",0,1,1,"{self._tspl_escape(sku)}"')
 
-        tspl.append("PRINT 1")
+        # PRINT <sets>,<copies> — the single-argument form works on
+        # some interpreters but is silently rejected by others (TSC
+        # firmware variants differ). Standardise on the two-argument
+        # form. One set, one copy.
+        tspl.append("PRINT 1,1")
         return "\n".join(tspl) + "\n"
 
     def run(self):
@@ -403,12 +421,22 @@ class POSSlipPrintJob(QThread):
         return f"{l}{' ' * space}{r}"
 
     def _txt(self, text: str = "") -> bytes:
-        # Truncate over-wide lines instead of letting the printer wrap them.
-        # This is the single most important fix for the "extra new lines"
-        # symptom on 58 mm printers.
-        if len(text) > self.width_chars:
-            text = text[: self.width_chars]
-        return (text + "\n").encode("ascii", errors="replace")
+        # Sanitise before width-truncation.
+        # Errors="replace" only handles non-ASCII (bytes > 0x7F); it
+        # passes ASCII control bytes (0x00-0x1F) straight through to
+        # the printer. Those bytes ARE ESC/POS commands: 0x1B=ESC,
+        # 0x1D=GS, 0x10=DLE. A product title containing "\x1b@" resets
+        # the printer mid-receipt; "\x1dV\x41\x00" fires the cutter;
+        # "\x1bp\x00\x19\xfa" opens the cash drawer. Any backend- or
+        # user-supplied field is a potential injection vector unless
+        # we strip control bytes here. Keep \t and \n (harmless).
+        cleaned = "".join(
+            c for c in str(text)
+            if c in ("\t", "\n") or 0x20 <= ord(c) < 0x7F
+        )
+        if len(cleaned) > self.width_chars:
+            cleaned = cleaned[: self.width_chars]
+        return (cleaned + "\n").encode("ascii", errors="replace")
 
     # ── QR / logo raster ───────────────────────────────────────────────
 
@@ -728,7 +756,14 @@ class POSEODReportPrintJob(QThread):
         return f"{l}{' ' * space}{r}"
 
     def _txt(self, text: str = "") -> bytes:
-        return (text + "\n").encode("ascii", errors="replace")
+        # Same ESC/POS control-byte strip as POSSlipPrintJob._txt.
+        # EOD report fields (staff names, dates, source) also flow from
+        # the backend — do not assume numeric-only is safe.
+        cleaned = "".join(
+            c for c in str(text)
+            if c in ("\t", "\n") or 0x20 <= ord(c) < 0x7F
+        )
+        return (cleaned + "\n").encode("ascii", errors="replace")
 
     def _build_receipt_bytes(self) -> bytes:
         req = self.detail_payload.get("request", {})
@@ -933,14 +968,30 @@ class POSPollWorker(QThread):
         # ── 2. No POS slips — check EOD reports ───────────────────────────
         self.pending_list_ready.emit(cid, [])
         try:
-            requests.post(
+            ensure_r = requests.post(
                 f"{self._api_base}/admin/api/pos-eod-reports/ensure-latest",
                 headers={**self._headers(), "Content-Type": "application/json"},
                 json={},
                 timeout=8,
             )
-        except Exception:
-            pass  # best-effort
+            if ensure_r.status_code not in (200, 204):
+                # The backend is supposed to generate today's EOD report
+                # on this call. If it does not, the client will see an
+                # empty pending list forever and the EOD is never
+                # printed. Surface it as a poll error so the operator
+                # (and the fleet dashboard) can see it, instead of a
+                # silent zero.
+                plog.warning(
+                    "[%s] ensure-latest -> HTTP %d (EOD generation may be "
+                    "stalled on the backend)",
+                    cid, ensure_r.status_code,
+                )
+                self.poll_error.emit(
+                    cid, f"ensure-latest HTTP {ensure_r.status_code}",
+                    ensure_r.status_code,
+                )
+        except Exception as exc:
+            plog.warning("[%s] ensure-latest failed: %s", cid, exc)
 
         try:
             eod_r = requests.get(
@@ -1005,7 +1056,15 @@ class _RetryFlushWorker(QThread):
 
     def run(self):
         done = []
-        for cid, base, key, uid, kind, req_id in self._tasks:
+        log = logging.getLogger("vula.poll.retry")
+        # Rate-limit. Without an inter-request delay, a client that
+        # accumulated many ids during an outage hammers the backend in
+        # one burst the instant connectivity returns. Thundering-herd
+        # risk at fleet scale. 0.25 s keeps individual retries fast but
+        # spreads a full flush across minutes, not seconds.
+        RETRY_INTERVAL_SECONDS = 0.25
+        task_count = len(self._tasks)
+        for idx, (cid, base, key, uid, kind, req_id) in enumerate(self._tasks):
             path = (
                 "/admin/api/pos-slips/complete"
                 if kind == "pos"
@@ -1022,11 +1081,33 @@ class _RetryFlushWorker(QThread):
                     json={"request_id": req_id},
                     timeout=10,
                 )
-                if r.status_code in (200, 400, 404):
+                if r.status_code in (200, 404):
+                    # 200 = completed. 404 = slip no longer exists.
+                    # Both are terminal from our side — discard the id.
                     done.append((cid, kind, req_id))
-            except Exception:
-                # Network hiccup — leave the id in the retry set for next tick.
-                pass
+                elif r.status_code == 400:
+                    # 400 = malformed completion request. That is a bug
+                    # (bad request_id shape, missing field, ...). Do
+                    # NOT treat it as silent success — log it for
+                    # review, but discard so the retry set cannot grow
+                    # unboundedly for a permanently broken request.
+                    log.warning(
+                        "completion retry %s #%d -> HTTP 400 "
+                        "(discarding, flag for review)", kind, req_id,
+                    )
+                    done.append((cid, kind, req_id))
+                else:
+                    log.warning(
+                        "completion retry %s #%d -> HTTP %d (will retry)",
+                        kind, req_id, r.status_code,
+                    )
+            except Exception as exc:
+                # Network hiccup — leave the id in the retry set.
+                log.debug("completion retry %s #%d failed: %s",
+                          kind, req_id, exc)
+            # Rate-limit between requests, not after the last one.
+            if idx + 1 < task_count:
+                time.sleep(RETRY_INTERVAL_SECONDS)
 
         if done:
             self.succeeded.emit(done)
