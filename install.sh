@@ -169,9 +169,12 @@ _validate_url() {
     fi
 
     if echo "$url" | grep -qE '^http://'; then
-        local _host
-        _host=$(echo "$url" | sed -E 's#^http://##; s#/.*##; s#:.*##; s#^\[##; s#\]$##')
-        if echo "$_host" | grep -qE '^(localhost|127\.[0-9]+\.[0-9]+\.[0-9]+|::1|.*\.local)$'; then
+        # Match the whole URL against loopback / mDNS patterns. An
+        # earlier version extracted the host with a sed pipeline that
+        # stripped the port (`s#:.*##`) BEFORE removing brackets, which
+        # ate everything inside `[::1]` and produced an empty hostname —
+        # http://[::1]:8000 was incorrectly rejected. Match directly.
+        if echo "$url" | grep -qE '^http://(localhost|127\.[0-9]+\.[0-9]+\.[0-9]+|\[::1\]|[^/]*\.local)(:[0-9]+)?(/.*)?$'; then
             warn "$purpose uses http:// (allowed for loopback/.local): '$url'"
             return 0
         fi
