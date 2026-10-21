@@ -1060,16 +1060,28 @@ CREDS_EOF
     as_user env \
         VULA_API_URL="$API_URL" \
         VULA_API_KEY="$API_KEY" \
-        "$SCRIPT_DIR/venv/bin/python3" - <<'PYEOF' || warn "DB seed failed (non-fatal — app will seed on first launch)"
+        VULA_SCRIPT_DIR="$SCRIPT_DIR" \
+        "$SCRIPT_DIR/venv/bin/python3" - <<'PYEOF'
 import os, sys
-sys.path.insert(0, os.getcwd())
+# Audit N78: use VULA_SCRIPT_DIR rather than os.getcwd(). When
+# install.sh is invoked from vula-update.sh (systemd, cwd=/), the
+# heredoc inherits cwd=/ — sys.path.insert(0, '/') doesn't find
+# vula_store. The env var is passed explicitly so this works
+# regardless of how install.sh was launched.
+script_dir = os.environ.get("VULA_SCRIPT_DIR", os.getcwd())
+sys.path.insert(0, script_dir)
 
 try:
     from vula_store import PrintStore
     from vula_config import APP_DB_FILE
 except Exception as e:
     print(f"  Could not import store modules: {e}")
-    sys.exit(0)   # non-fatal; app seeds on first launch
+    # Exit non-zero so the shell's `|| warn` fires (audit N75).
+    # The previous `sys.exit(0)` masked the failure — install.sh
+    # printed "[+ ] Store connection seeded." even though nothing
+    # was written. App would then fail migration on first launch
+    # with no diagnostic.
+    sys.exit(1)
 
 url = os.environ.get("VULA_API_URL", "").strip()
 key = os.environ.get("VULA_API_KEY", "").strip()
@@ -1118,7 +1130,12 @@ else:
     print(f"  Rotated conn_1 credentials -> {url} "
           f"(name/printer_user_id preserved)")
 PYEOF
-    ok "Store connection seeded."
+    _seed_rc=$?
+    if [ "$_seed_rc" -eq 0 ]; then
+        ok "Store connection seeded."
+    else
+        warn "Store connection seed failed (rc=$_seed_rc) — app will attempt on first launch"
+    fi
 
     # ── systemd user service ────────────────────────────────────
     local svc_file="$REAL_HOME/.config/systemd/user/vula-print.service"
@@ -1151,6 +1168,41 @@ SVC_EOF
 
     run loginctl enable-linger "$REAL_USER" >/dev/null 2>&1 || \
         warn "Could not enable linger (systemd too old?)"
+
+    # Kill orphans before restart (audit N73 + N77). A previous
+    # service lifetime can leave a forked app process behind if the
+    # service's main process exited cleanly but its child (the actual
+    # python) didn't. Without this, the restart sees "already running"
+    # from launch_printer.sh, exits, and every update rolls back.
+    #
+    # N77: the first version of this fix sent SIGTERM only and
+    # proceeded after 2s. PyQt apps can defer SIGTERM while the event
+    # loop is busy (blocked HTTP call, slow print) — the process
+    # survives, keeps holding the flock, and the launch still fails.
+    # Escalate to SIGKILL, which cannot be caught or deferred.
+    if as_user pgrep -u "$REAL_USER" -f "vula_print_app" >/dev/null 2>&1; then
+        info "Killing orphaned vula_print_app process before restart"
+        # SIGTERM first — clean shutdown so pending print history is
+        # flushed to the store.
+        as_user pkill -TERM -u "$REAL_USER" -f "vula_print_app" >/dev/null 2>&1 || true
+        _orphan_gone=0
+        for _i in 1 2 3; do
+            if ! as_user pgrep -u "$REAL_USER" -f "vula_print_app" >/dev/null 2>&1; then
+                _orphan_gone=1
+                break
+            fi
+            sleep 1
+        done
+        if [ "$_orphan_gone" = "0" ]; then
+            warn "App did not exit on SIGTERM — escalating to SIGKILL"
+            as_user pkill -KILL -u "$REAL_USER" -f "vula_print_app" >/dev/null 2>&1 || true
+            sleep 1
+        fi
+    fi
+    # Remove stale lock AFTER the process is gone — the file's
+    # existence is what launch_printer.sh's `[ -e "$LOCK_FILE" ]`
+    # gate checks. Belt-and-braces even though flock is authoritative.
+    as_user rm -f "$REAL_HOME/.config/vula_print/app.lock" 2>/dev/null || true
 
     as_user systemctl --user daemon-reload
     as_user systemctl --user enable vula-print.service >/dev/null 2>&1
@@ -1607,6 +1659,21 @@ phase_update_helpers() {
     install_update_helpers_tree bin     /usr/local/bin         0755 || return 1
     install_update_helpers_tree systemd /etc/systemd/system    0644 || return 1
     install_update_helpers_tree polkit  /etc/polkit-1/rules.d  0644 || return 1
+
+    # Udev rules (audit N74). These were previously installed by
+    # phase_system only, which is not in the routine update phase
+    # list (print_app,updater,update_helpers). Result: udev rule
+    # changes in the repo never reached a live device unless a
+    # system-phase reinstall was run — silently, forever. Adding
+    # here puts udev on the same small-file install path as the
+    # systemd and polkit files it's semantically grouped with.
+    if [ -d "$SCRIPT_DIR/system/udev" ]; then
+        info "Installing udev rules..."
+        install_system_tree udev /etc/udev/rules.d 0644
+        run udevadm control --reload-rules 2>/dev/null || true
+        run udevadm trigger --subsystem-match=usbmisc 2>/dev/null || true
+        ok "Udev rules installed and reloaded."
+    fi
 
     run systemctl daemon-reload || {
         err "systemctl daemon-reload failed."

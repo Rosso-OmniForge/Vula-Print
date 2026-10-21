@@ -1,6 +1,181 @@
 # Changelog
 
+## [1.1.876] - 2026-10-22
 
+Sprint continuation — **client-hardware audit findings.** Fixes the
+update-path regression 1.1.875 shipped to live hardware (orphaned app
+blocks every update cycle, health probe rolls back both new and old
+code, device silently freezes on an old build). Includes a one-shot
+client recovery script (`bugfix.sh`) and a persistent per-device
+recovery helper (`vula-print-recover.sh`).
+
+**Caveats up front:** this iteration was designed against the first
+real client audit (Vendor, 2026-10-22). It closes the specific failure
+mode that device exhibited — proven end-to-end on real hardware rather
+than in a unit test. The receipt-renderer and serial-timeout fixes from
+1.1.875 still have not been exercised against a physical ESC/POS
+printer; `print_audit.sh` from that release remains the collection
+tool for the next client run.
+
+### Added
+- **`bugfix.sh`** — one-shot client recovery + update script, repo
+  root. Diagnoses and unwinds every state the orphan bug can leave a
+  device in, in this order: stop service → SIGTERM-then-SIGKILL stuck
+  `vula_print_app` processes → remove stale lock file → `systemctl
+  reset-failed` → git pull `origin/main` (ff-only if the local HEAD is
+  an ancestor; create a `bugfix-backup-<ts>` tag and hard-reset if
+  diverged; skip entirely with `--no-pull`) → `install.sh
+  --phase=update_helpers,print_app,updater` → verify service active
+  and process alive with a 15 s poll window. Idempotent, `--dry-run`
+  capable, `--verbose` shows every subprocess. Logs to
+  `/var/log/vula/bugfix.log` in addition to stdout.
+- **`system/bin/vula-print-recover.sh`** — persistent per-device
+  recovery helper. Installed to `/usr/local/bin/` by
+  `install.sh --phase=update_helpers` via the existing `system/bin/*`
+  copy path. Same logic as `bugfix.sh` minus the git pull. For a
+  client that has already received this release but is in the
+  orphan state: `sudo /usr/local/bin/vula-print-recover.sh` unblocks
+  it in ~5 s without triggering a full update cycle. Idempotent,
+  safe to run on a healthy device (no-op except `reset-failed`).
+
+### Changed
+- **`install.sh::phase_print_app` — orphan-kill escalation.** The
+  1.1.875 version sent SIGTERM and proceeded after a fixed 2 s. On
+  real hardware, PyQt's event loop was blocking inside C-extension
+  code (network I/O, print write) when SIGTERM arrived, so the signal
+  sat pending until the call returned — by which point the update
+  script had already given up and moved on. The process survived,
+  held the singleton flock, and `launch_printer.sh` correctly refused
+  to start a second instance. Every update cycle rolled back; the
+  device ran the same old build until someone logged in manually.
+  New sequence: SIGTERM → poll 3 s → escalate to SIGKILL → verify
+  process gone → then remove lock file. SIGKILL cannot be deferred
+  by any userspace process. This is the actual fix for N73, which
+  the 1.1.875 attempt only partially addressed.
+- **`vula-update.sh` — same SIGTERM→SIGKILL escalation in two places.**
+  Immediately after the pre-update `systemctl stop` (kills orphans
+  the previous service lifetime left behind before the update
+  script's own `install.sh` call re-runs the escalation), and before
+  the post-rollback restart (defensive — if `install.sh`'s copy of
+  the escalation failed for any reason, this still prevents the
+  stuck loop). `reset-failed` added before both restarts.
+- **`install.sh::phase_print_app` DB seed — `VULA_SCRIPT_DIR` env
+  var.** The heredoc now calls `sys.path.insert(0,
+  os.environ["VULA_SCRIPT_DIR"])` instead of `sys.path.insert(0,
+  os.getcwd())`. When invoked from `vula-update.sh` (systemd, cwd=`/`),
+  the previous version inserted `/` into `sys.path`, `from vula_store
+  import PrintStore` raised ImportError, and the seed silently failed
+  with `Could not import store modules: No module named 'vula_store'`.
+  The env var is set explicitly on the shell side so the path is
+  correct regardless of how `install.sh` was launched.
+- **`install.sh::phase_print_app` DB seed — exit-code honesty.** The
+  Python heredoc now exits 1 on ImportError instead of 0. The shell
+  wrapper checks `$?` and prints `warn "Store connection seed failed
+  (rc=$_rc) — app will attempt on first launch"` on failure, instead
+  of the previous unconditional `[+ ] Store connection seeded.` —
+  which reported success while nothing had been written.
+- **`install.sh::phase_update_helpers` — installs udev rules.**
+  Previously only `phase_system` did, and `phase_system` is not in
+  the routine update phase list (`print_app,updater,update_helpers`).
+  Result: a udev rule change in the repo never reached a live client
+  via the daily timer — a silent deployment gap that showed up on
+  the first client as the pre-1.1.875 rule (both `usb` and `usbmisc`
+  lines) surviving three update cycles. Moved to
+  `phase_update_helpers`, which runs on every update, alongside the
+  systemd and polkit files it's semantically grouped with.
+- **`vula-update.sh::health_check()` — two-signal health.** Health
+  is now "service is active **or** app process is alive", not just
+  `systemctl is-active`. A healthy-but-orphaned app (previous
+  service lifetime ended, python child kept running) was reported as
+  broken, triggering an unnecessary rollback that failed for the
+  same reason the update failed — the loop was self-sustaining.
+  The fallback correctly recognises a working app in an untracked
+  state and reports PASS instead of triggering a rollback.
+- **`vula-update.sh` — local-branch logging uses `git -C`.** Replaced
+  `cd "$SOURCE_DIR" && as_user git ...` with `as_user git -C
+  "$SOURCE_DIR" ...`. `sudo` can reset the child's CWD depending on
+  sudoers config, so the previous form silently reported `unknown`
+  on every update cycle — the client audit showed this on the very
+  device whose update loop we were trying to debug. `git -C` is
+  explicit and matches the pattern `print_audit.sh` already uses.
+- **`VERSION`** — 1.1.875 → 1.1.876.
+
+### Fixed
+- **Silent update freeze on live hardware.** The 1.1.875 auto-updater
+  rewired the daily timer to `vula-update.sh`, adding a health probe
+  and auto-rollback. On the first real client, the probe failed on
+  every cycle because an orphaned app held the singleton lock —
+  `launch_printer.sh` then correctly refused to start, and both the
+  update attempt and the rollback attempt failed identically. The
+  failure counter (also 1.1.875) correctly surfaced the issue after
+  the fact; without it, the device would have stayed on the old
+  build indefinitely. Root cause is the SIGTERM-deferred-in-C-code
+  behaviour described above; fixed by SIGKILL escalation in both
+  scripts. The client in question unblocks on the next timer cycle
+  without manual intervention once this release is fetched — or
+  immediately via `sudo bash bugfix.sh` if the operator runs it.
+- **`vula-print-recover.sh` was not delivered to clients.** Added to
+  `system/bin/` after 1.1.875 was cut but not reachable through any
+  install phase that ran on routine updates until the udev-to-
+  `update_helpers` change in this release. Now delivered on the same
+  cycle as every other `system/bin/*` file.
+- **Update-failure counter now accurate.** `_on_exit` explicitly
+  returns `$_rc` — without this, the `if` body that fires on the 3rd
+  consecutive failure implicitly returned 0, hiding the failure at
+  the exact moment it needed to be visible. (Fix landed in 1.1.875
+  but was only verified against this release's client audit — the
+  counter correctly reported 1 on the Vendor device when the update
+  failed at 01:32.)
+
+### Security
+- No new attack surface. The SIGKILL escalation narrows the update
+  path's failure modes; it does not expand what a process can do.
+  `bugfix.sh` and `vula-print-recover.sh` both require root, act
+  only on processes owned by `$REAL_USER`, and refuse to run without
+  `/etc/vula/install.env` (root-owned 0640). Neither script accepts
+  user-controlled input beyond its three documented flags.
+- The DB seed path fix (`VULA_SCRIPT_DIR`) removes a failure mode
+  where the DB silently lost its `conn_1` row after an update cycle.
+  No credential was ever exposed — the row either existed or it
+  didn't — but a device with no `conn_1` would fail migration on
+  next launch with a confusing error rather than a clear one.
+
+### Known outstanding
+Carried forward from 1.1.875, plus two cosmetic items from this
+release's hardware verification:
+
+- **N72** — `vula-update.sh --check` still uses the pre-1.1.875
+  `rev-parse origin/main || rev-parse origin/master` fallback. The
+  non-check path was fixed in 1.1.875 (SHA-validated, `rev-parse
+  --verify` per candidate, per-ref logging). `--check` is diagnostic
+  only — it can report "behind" incorrectly on repos whose only
+  remote-tracking ref is `origin/main`, but it never triggers an
+  update or rollback. Cosmetic; deferred to a cleanup pass.
+- **N71** — health probe fixed 30 s window (15 s consecutive). Works
+  correctly but adds 30 s to every update cycle per device. Fleet-
+  scale tuning candidate; no functional issue.
+- **`launch_printer.sh` "already running" message** — the message is
+  factually correct (the flock **is** held) but reads to an operator
+  as "someone else has the app open." The more common cause after a
+  crash is an orphaned process, which the operator can now fix with
+  `vula-print-recover.sh`. Nice-to-have: `"Vula! Print is already
+  running (pid $(cat $LOCK_FILE)) — exiting."` so the operator sees
+  which process to investigate. Deferred — no functional change.
+- **Python `vula_singleton` and shell `flock` don't share PID
+  format.** Python writes `"<pid>\n"` into the lock file;
+  `launch_printer.sh`'s shell `flock` check doesn't read it. If we
+  want `launch_printer.sh` to surface the owning PID as suggested
+  above, both sides need to agree on format. Deferred alongside the
+  message change.
+- **Phase 4.2 (force-update), 4.3 (release channels), 4.4 (fleet
+  version dashboard)** — designs ready; blocked on backend
+  endpoints. `X-Client-Version` header from 1.1.875 is already sent
+  on every request, so 4.4 has no client-side prerequisite.
+- **Hardware verification — Phase 12.2 (USB printer-class, USB
+  serial @ 9600/115200, CUPS raw, 58 mm ESC/POS) and Phase 12.3
+  (3-device staging dry-run).** The Vendor audit is one device.
+  Once this release reaches Vendor plus one additional client and
+  both pass `bugfix.sh`/timer-cycle cleanly, criterion 14 is closed.
 
 ## [1.1.875] - 2026-10-22
 

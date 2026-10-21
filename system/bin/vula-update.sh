@@ -122,7 +122,11 @@ if [ ! -f "$SOURCE_DIR/install.sh" ]; then
 fi
 log "source dir: $SOURCE_DIR"
 log "real user : $REAL_USER"
-log "local branch: $(cd "$SOURCE_DIR" && as_user git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+# Use `git -C` (not `cd && as_user git`). sudo may reset CWD
+# depending on sudoers config, so relying on the parent shell's
+# cd doesn't survive into the child. `git -C` is explicit and
+# what the audit script uses — the same pattern that works.
+log "local branch: $(as_user git -C "$SOURCE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null | tr -d '[:space:]' || echo unknown)"
 
 REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
 REAL_UID=$(id -u "$REAL_USER")
@@ -148,6 +152,15 @@ as_user() {
 # Window: 30 s total, 15 s consecutive required. Tuned for a PyQt
 # app that takes ~2 s to reach a stable state on the boxes we ship.
 health_check() {
+    # Two independent health signals (audit N73):
+    #   1. systemctl is-active — the service is under systemd's control
+    #   2. App process is alive — the singleton lock holder is running
+    # Either counts as healthy. The version before this fix only
+    # checked #1, which meant a healthy-but-orphaned app (child of a
+    # previous launch_printer.sh that forked, then a shell restart
+    # dropped the parent) was mistaken for broken. Every update then
+    # rolled back — permanently, because the orphan was never killed
+    # and the next restart saw "already running" and exited.
     local consecutive=0
     local i
     for i in $(seq 1 30); do
@@ -155,14 +168,19 @@ health_check() {
         if as_user systemctl --user is-active --quiet vula-print.service 2>/dev/null; then
             consecutive=$((consecutive + 1))
         else
-            consecutive=0
+            # Service inactive — is the app process alive anyway?
+            if as_user pgrep -u "$REAL_USER" -f "vula_print_app" >/dev/null 2>&1; then
+                consecutive=$((consecutive + 1))
+            else
+                consecutive=0
+            fi
         fi
     done
     if [ "$consecutive" -ge 15 ]; then
-        log "health probe: PASS (${consecutive}s consecutive active)"
+        log "health probe: PASS (${consecutive}s consecutive healthy)"
         return 0
     fi
-    log "health probe: FAIL (only ${consecutive}s consecutive active at end of 30s window)"
+    log "health probe: FAIL (only ${consecutive}s healthy at end of 30s window)"
     return 1
 }
 
@@ -227,6 +245,32 @@ if as_user systemctl --user is-active --quiet vula-print.service 2>/dev/null; th
     log "stopping vula-print.service"
     as_user systemctl --user stop vula-print.service >> "$LOG" 2>&1 || true
 fi
+
+# ── Kill orphans with SIGTERM→SIGKILL escalation (audit N77) ────
+# systemctl stop only signals the tracked main PID. An orphaned
+# process from a previous service incarnation is not tracked and
+# survives, still holding the flock. launch_printer.sh then sees
+# "already running" and exits, the health probe reports inactive,
+# and the update rolls back — permanently, because the orphan is
+# never killed. SIGKILL cannot be caught or deferred.
+if as_user pgrep -u "$REAL_USER" -f "vula_print_app" >/dev/null 2>&1; then
+    log "killing orphaned vula_print_app process(es)"
+    as_user pkill -TERM -u "$REAL_USER" -f "vula_print_app" >> "$LOG" 2>&1 || true
+    _orphan_gone=0
+    for _i in 1 2 3; do
+        if ! as_user pgrep -u "$REAL_USER" -f "vula_print_app" >/dev/null 2>&1; then
+            _orphan_gone=1
+            break
+        fi
+        sleep 1
+    done
+    if [ "$_orphan_gone" = "0" ]; then
+        log "orphan ignored SIGTERM — escalating to SIGKILL"
+        as_user pkill -KILL -u "$REAL_USER" -f "vula_print_app" >> "$LOG" 2>&1 || true
+        sleep 1
+    fi
+fi
+rm -f "$REAL_HOME/.config/vula_print/app.lock" 2>/dev/null || true
 
 # ── Git pull (unless --local) ───────────────────────────────────
 if [ "$LOCAL" = "0" ] && [ -d "$SOURCE_DIR/.git" ]; then
@@ -469,6 +513,21 @@ if ! health_check; then
     ROLLBACK_RC=$?
     log "rollback install.sh exit code: $ROLLBACK_RC"
 
+    # Belt-and-braces (audit N77): ensure no orphan before the
+    # post-rollback restart, same escalation pattern.
+    if as_user pgrep -u "$REAL_USER" -f "vula_print_app" >/dev/null 2>&1; then
+        as_user pkill -TERM -u "$REAL_USER" -f "vula_print_app" >> "$LOG" 2>&1 || true
+        for _i in 1 2 3; do
+            if ! as_user pgrep -u "$REAL_USER" -f "vula_print_app" >/dev/null 2>&1; then break; fi
+            sleep 1
+        done
+        if as_user pgrep -u "$REAL_USER" -f "vula_print_app" >/dev/null 2>&1; then
+            as_user pkill -KILL -u "$REAL_USER" -f "vula_print_app" >> "$LOG" 2>&1 || true
+            sleep 1
+        fi
+    fi
+    rm -f "$REAL_HOME/.config/vula_print/app.lock" 2>/dev/null || true
+    as_user systemctl --user reset-failed vula-print.service >> "$LOG" 2>&1 || true
     as_user systemctl --user restart vula-print.service >> "$LOG" 2>&1 || true
 
     if health_check; then

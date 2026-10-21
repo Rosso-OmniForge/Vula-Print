@@ -316,7 +316,36 @@ except Exception as e:
         echo "MISSING"
 
     emit "print_jobs.db (summary queries)"
-    if [ -f "$REAL_HOME/.config/vula_print/print_jobs.db" ] && have sqlite3; then
+    # Prefer sqlite3 CLI when available; fall back to the venv's
+    # Python (which has the sqlite3 stdlib module). The previous
+    # version silently skipped the whole section on fresh client
+    # boxes — sqlite3 CLI is not in our base package list.
+    _sqlite_cmd=""
+    if have sqlite3; then
+        _sqlite_cmd="sqlite3"
+    elif [ -x "$SOURCE_DIR/venv/bin/python3" ]; then
+        _sqlite_cmd="__python__"
+    fi
+    if [ -f "$REAL_HOME/.config/vula_print/print_jobs.db" ] && [ -n "$_sqlite_cmd" ]; then
+        ls -la "$REAL_HOME/.config/vula_print/print_jobs.db"*
+        echo
+        _q() {
+            local sql="$1"
+            if [ "$_sqlite_cmd" = "__python__" ]; then
+                "$SOURCE_DIR/venv/bin/python3" -c "
+import sqlite3, sys
+con = sqlite3.connect('$REAL_HOME/.config/vula_print/print_jobs.db')
+for row in con.execute('''$sql'''):
+    print('|'.join(str(c) for c in row))
+con.close()
+" 2>&1
+            else
+                sqlite3 "$REAL_HOME/.config/vula_print/print_jobs.db" "$sql" 2>&1
+            fi
+        }
+        echo "── status counts ──"
+        _q "SELECT status, COUNT(*) FROM print_jobs GROUP BY status ORDER BY status"
+        # ... (rest of queries use _q helper)
         ls -la "$REAL_HOME/.config/vula_print/print_jobs.db"*
         echo
         echo "── status counts ──"
