@@ -35,6 +35,11 @@ set -uo pipefail
 DRY_RUN=0
 ASSUME_YES=0
 FORCE_INSTALL=0
+# --allow-http-dev: permit http:// against a non-loopback host for
+# interactive dev installs only. Refused together with --yes (the
+# auto-updater path) so a dev install cannot be silently revalidated
+# over http by the fleet updater.
+ALLOW_HTTP_DEV=0
 PHASES_TO_RUN=""
 STORE_URL=""
 API_URL=""
@@ -53,6 +58,7 @@ for arg in "$@"; do
         --dry-run)          DRY_RUN=1 ;;
         --yes|-y)           ASSUME_YES=1 ;;
         --force-install)    FORCE_INSTALL=1 ;;
+        --allow-http-dev)   ALLOW_HTTP_DEV=1 ;;
         --phase=*)          PHASES_TO_RUN="${arg#--phase=}" ;;
         --store-url=*)      STORE_URL="${arg#--store-url=}" ;;
         --api-url=*)        API_URL="${arg#--api-url=}" ;;
@@ -137,15 +143,50 @@ ask_yn() {
     [[ "${reply,,}" == "y" ]]
 }
 
+# Require https:// for anything that carries credentials (the API URL
+# transmits X-Printer-API-Key in a header, the store URL is subject to
+# Firefox cookie/session exposure). Plain http is a cleartext credential
+# leak on any shared store LAN.
+#
+# Permitted http:// exceptions (dev only):
+#   * loopback (localhost / 127.0.0.1 / [::1])
+#   * mDNS names (*.local)
+#   * explicit --allow-http-dev flag (interactive mode only; refused
+#     together with --yes because the fleet auto-updater runs in --yes
+#     mode and must never be able to silently downgrade an existing
+#     install)
 _validate_url() {
     local url="${1:-}"
+    local purpose="${2:-URL}"
     if [ -z "$url" ]; then
-        err "URL is empty."
+        err "$purpose is empty."
         return 1
     fi
     if ! echo "$url" | grep -qE '^https?://[^[:space:]]+'; then
-        err "Invalid URL: '$url'"
+        err "Invalid $purpose: '$url'"
         err "  Must start with http:// or https://"
+        return 1
+    fi
+
+    if echo "$url" | grep -qE '^http://'; then
+        local _host
+        _host=$(echo "$url" | sed -E 's#^http://##; s#/.*##; s#:.*##; s#^\[##; s#\]$##')
+        if echo "$_host" | grep -qE '^(localhost|127\.[0-9]+\.[0-9]+\.[0-9]+|::1|.*\.local)$'; then
+            warn "$purpose uses http:// (allowed for loopback/.local): '$url'"
+            return 0
+        fi
+        if [ "${ALLOW_HTTP_DEV:-0}" = "1" ] && [ "${ASSUME_YES:-0}" != "1" ]; then
+            warn "$purpose uses insecure http://: '$url'"
+            warn "  --allow-http-dev was passed; proceeding at your own risk."
+            return 0
+        fi
+        err "$purpose must use https:// (got: '$url')"
+        err "  Production must never transmit API keys over http."
+        err "  For dev: use http://localhost, http://127.0.0.1, or http://*.local."
+        err "  For explicit override: pass --allow-http-dev (interactive only)."
+        err "  Upgrading an existing http:// install? Update"
+        err "  /etc/vula/creds.env to https:// then re-run:"
+        err "    sudo bash install.sh --phase=print_app --api-url=https://..."
         return 1
     fi
     return 0
@@ -153,14 +194,14 @@ _validate_url() {
 
 # ── Validate --phase value early (before anything else runs) ─────
 if [ -n "$PHASES_TO_RUN" ]; then
-    _VALID_PHASES=" preflight system display security print_app anydesk firefox updater "
+    _VALID_PHASES=" preflight system display security print_app anydesk firefox updater update_helpers "
     IFS=',' read -ra _REQUESTED_PHASES <<< "$PHASES_TO_RUN"
     for _req in "${_REQUESTED_PHASES[@]}"; do
         _req="${_req// /}"
         [ -z "$_req" ] && continue
         if [[ "$_VALID_PHASES" != *" $_req "* ]]; then
             echo "Unknown phase in --phase='$PHASES_TO_RUN': '$_req'" >&2
-            echo "Valid phases: preflight system display security print_app anydesk firefox updater" >&2
+            echo "Valid phases: preflight system display security print_app anydesk firefox updater update_helpers" >&2
             exit 1
         fi
     done
@@ -865,7 +906,7 @@ phase_print_app() {
         return 1
     fi
 
-    _validate_url "$API_URL" || return 1
+    _validate_url "$API_URL" "API URL" || return 1
     if ! echo "$API_KEY" | grep -qE '^vp_'; then
         warn "API key does not start with 'vp_' — is that correct?"
         if [ "$ASSUME_YES" != "1" ]; then
@@ -1149,6 +1190,22 @@ ANYDESK_JSON
 
     # 7. UFW rules for AnyDesk's inbound. Done here, AFTER security phase
     #    has already reset the firewall — otherwise they'd be wiped.
+    #
+    #    Audit M3 decision — KEEP THESE RULES. Trade-off documented:
+    #      Why they must exist: AnyDesk unattended access requires
+    #      inbound 7070/tcp for direct connections, 3478/3479/udp for
+    #      STUN/relay when direct fails. Removing them breaks remote
+    #      support, which is a core operational requirement for a fleet.
+    #      Why we accept the exposure: the AnyDesk daemon is only
+    #      reachable after the shared password is presented, and the
+    #      password lives at /etc/vula/anydesk.json (0600 root:root)
+    #      plus the backend store (encrypted at rest on their side).
+    #      What's NOT mitigated: no per-device MFA, no password
+    #      rotation schedule, no backend audit of who connected when.
+    #      That is a Phase 10 design task, not a UFW bug — do not
+    #      silently remove these rules to "harden" the firewall, as
+    #      that will produce silent remote-support outages across the
+    #      fleet the next time a store needs help.
     if command -v ufw >/dev/null 2>&1; then
         run ufw allow 7070/tcp comment 'AnyDesk direct' || true
         run ufw allow 3478/udp comment 'AnyDesk STUN'   || true
@@ -1181,6 +1238,15 @@ fi
 . "$CREDS"
 if [ -z "${PRINTER_API_BASE_URL:-}" ] || [ -z "${PRINTER_API_KEY:-}" ]; then
     echo "$(date -Iseconds) ERROR: creds.env incomplete" >> "$LOG"
+    exit 1
+fi
+
+# Defence in depth. The installer now refuses to write http:// URLs
+# here, but a manual edit to /etc/vula/creds.env could bypass that.
+# Never POST the AnyDesk password over cleartext — the password grants
+# remote control of this box.
+if ! echo "$PRINTER_API_BASE_URL" | grep -qE '^https://'; then
+    echo "$(date -Iseconds) ERROR: PRINTER_API_BASE_URL is not https:// — refusing to transmit AnyDesk password over cleartext" >> "$LOG"
     exit 1
 fi
 
@@ -1321,7 +1387,7 @@ phase_firefox() {
         fi
     fi
 
-    if ! _validate_url "$STORE_URL"; then
+    if ! _validate_url "$STORE_URL" "Store URL"; then
         warn "Skipping Firefox homepage policy due to invalid URL."
         return 0
     fi
@@ -1373,6 +1439,76 @@ FIREFOX_EOF
             warn "  could not set per-user default browser (will apply on next login)"
     fi
     ok "Firefox homepage policy installed (locked to $STORE_URL)."
+    return 0
+}
+
+# ════════════════════════════════════════════════════════════════
+# PHASE — MANUAL UPDATE HELPERS
+# ════════════════════════════════════════════════════════════════
+install_update_helpers_tree() {
+    local sub="$1"
+    local dest="$2"
+    local mode="$3"
+    local src="$SCRIPT_DIR/system/$sub"
+    local f
+    local count=0
+    local had_nullglob=0
+    local files=()
+
+    if [ ! -d "$src" ]; then
+        err "Required source directory missing: $src"
+        return 1
+    fi
+
+    # Capture the files before installing. Fail if the directory is empty.
+    shopt -q nullglob && had_nullglob=1
+    shopt -s nullglob
+    files=( "$src"/* )
+    [ "$had_nullglob" = "1" ] || shopt -u nullglob
+
+    if [ "${#files[@]}" -eq 0 ]; then
+        err "No files found in required source directory: $src"
+        return 1
+    fi
+
+    run install -d -m 0755 "$dest" || {
+        err "Could not create destination: $dest"
+        return 1
+    }
+
+    for f in "${files[@]}"; do
+        [ -f "$f" ] || continue
+
+        run install -m "$mode" "$f" "$dest/$(basename "$f")" || {
+            err "Failed to install: $f"
+            return 1
+        }
+
+        dim "    -> $dest/$(basename "$f")"
+        count=$((count + 1))
+    done
+
+    if [ "$count" -eq 0 ]; then
+        err "No regular files installed from: $src"
+        return 1
+    fi
+
+    return 0
+}
+
+phase_update_helpers() {
+    section "Manual update helpers"
+
+    install_update_helpers_tree bin     /usr/local/bin         0755 || return 1
+    install_update_helpers_tree systemd /etc/systemd/system    0644 || return 1
+    install_update_helpers_tree polkit  /etc/polkit-1/rules.d  0644 || return 1
+
+    run systemctl daemon-reload || {
+        err "systemctl daemon-reload failed."
+        return 1
+    }
+
+    ok "Manual update helpers installed and systemd reloaded."
     return 0
 }
 
@@ -1579,18 +1715,6 @@ APPUPTIMER_EOF
         warn "Could not start app-update timer."
     ok "App auto-update scheduled (daily 04:05)."
 
-    # ── 8d. Manual update helpers ──────────────────────────────
-    # Copied from system/. Backs the GUI's Update button. Polkit rule
-    # lets local users trigger the two services without a password.
-    section "Manual update helpers (from system/)"
-    install_system_tree bin     /usr/local/bin         0755
-    install_system_tree systemd /etc/systemd/system    0644
-    install_system_tree polkit  /etc/polkit-1/rules.d  0644
-    run systemctl daemon-reload
-    ok "Manual update helpers installed."
-    dim "  systemctl start vula-update-manual.service   # git pull + reinstall"
-    dim "  systemctl start vula-update-local.service    # --local reinstall"
-
     return 0
 }
 
@@ -1649,6 +1773,7 @@ run_phase preflight "Preflight checks"          phase_preflight || FAILED=1
 [ "$FAILED" = "0" ] && { run_phase anydesk   "AnyDesk remote access"    phase_anydesk   || FAILED=1; }
 [ "$FAILED" = "0" ] && { run_phase firefox   "Firefox provisioning"     phase_firefox   || FAILED=1; }
 [ "$FAILED" = "0" ] && { run_phase updater   "Auto-updater setup"       phase_updater   || FAILED=1; }
+[ "$FAILED" = "0" ] && { run_phase update_helpers "Manual update helpers" phase_update_helpers || FAILED=1; }
 
 # ── Summary ──────────────────────────────────────────────────
 section "Installation Summary"
