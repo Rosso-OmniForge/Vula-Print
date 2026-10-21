@@ -9,3 +9,36 @@ ExecStart=/usr/local/bin/vula-update.sh --local
 StandardOutput=journal
 StandardError=journal
 TimeoutStartSec=900
+
+# ── Sandbox (audit C13 secondary / H7) ──────────────────────────
+# Defence in depth. The polkit rule that used to grant local users
+# passwordless start of this unit has been disabled (49-vula-update.rules
+# is now a hard no-op). These settings assume that protection might one
+# day be weakened or reintroduced incorrectly, and reduce the blast
+# radius if it is.
+#
+# ProtectHome is deliberately NOT set. The updater runs `as_user git`
+# and `install.sh --phase=print_app` writes into $REAL_HOME (creates
+# $SCRIPT_DIR/venv, writes git objects, etc.). Forcing ProtectHome=
+# read-only breaks the legitimate update path. ProtectSystem=strict
+# still protects /usr, /boot, /efi, /etc, /var, /proc, /sys, /dev.
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+# Paths install.sh writes to. Everything else in /etc, /usr, /var is
+# read-only. The `-` prefix tolerates non-existence at start.
+ReadWritePaths=-/etc/vula
+ReadWritePaths=-/etc/systemd/system
+ReadWritePaths=-/etc/udev/rules.d
+ReadWritePaths=-/etc/polkit-1/rules.d
+ReadWritePaths=-/usr/local/bin
+ReadWritePaths=-/var/log/vula
+ReadWritePaths=-/var/lib/vula
+ReadWritePaths=-/var/cache/apt
+ReadWritePaths=-/var/lib/apt
+ReadWritePaths=-/var/lib/dpkg
+ReadWritePaths=-/var/log/apt

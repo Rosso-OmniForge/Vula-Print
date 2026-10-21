@@ -348,7 +348,7 @@ if [ -f "$LEGACY" ]; then
 fi
 
 # ════════════════════════════════════════════════════════════════
-# 6. Remove udev rule
+# 6. Remove udev + polkit policy files
 # ════════════════════════════════════════════════════════════════
 if [ "$IS_ROOT" = "1" ]; then
     section "Removing udev rule"
@@ -359,6 +359,25 @@ if [ "$IS_ROOT" = "1" ]; then
         run udevadm trigger >/dev/null 2>&1 || true
     else
         dim "no udev rule found"
+    fi
+
+    # Audit N5 — remove the polkit rule too. Leaving it behind means a
+    # later reinstall (which just drops the file back in) resurrects
+    # any authorization the rule grants. It also leaves an orphan file
+    # on an otherwise-uninstalled box, which makes "this box has no
+    # Vula" untrue. The current rule is a no-op, but a future rule may
+    # not be — the uninstaller must be robust to that.
+    section "Removing polkit rule"
+    if [ -f /etc/polkit-1/rules.d/49-vula-update.rules ]; then
+        run rm -f /etc/polkit-1/rules.d/49-vula-update.rules && \
+            ok "removed 49-vula-update.rules"
+        # polkitd auto-reloads rules.d on file change, but a reload is
+        # a harmless belt-and-braces in case the daemon is missing or
+        # in a weird state.
+        run systemctl reload polkit >/dev/null 2>&1 || \
+            run systemctl restart polkit >/dev/null 2>&1 || true
+    else
+        dim "no polkit rule found"
     fi
 fi
 

@@ -150,6 +150,36 @@ if [ "$LOCAL" = "0" ] && [ -d "$SOURCE_DIR/.git" ]; then
     fi
 elif [ "$LOCAL" = "1" ]; then
     log "── --local: skipping git pull ──"
+
+    # Refuse to run install.sh if any privileged-install path is dirty.
+    #
+    # --local runs `bash "$SOURCE_DIR/install.sh"` as root. install.sh
+    # copies $SOURCE_DIR/system/bin/* -> /usr/local/bin, system/systemd/*
+    # -> /etc/systemd/system, system/polkit/* -> /etc/polkit-1/rules.d,
+    # system/udev/* -> /etc/udev/rules.d. A dirty tree in any of those
+    # paths means user-writable code is promoted to root-executed code
+    # — the exact local-to-root chain C13 relies on. The polkit rule
+    # that would let an unprivileged user trigger this service has
+    # already been disabled, so this check is defence in depth rather
+    # than the primary mitigation.
+    #
+    # App-code dirty changes (vula_*.py, requirements_app.txt, etc.) are
+    # permitted — those run under the user's UID and are the legitimate
+    # --local use case: deploy a bugfix to a specific box without
+    # pushing to origin/main. Only install.sh, uninstall.sh, and the
+    # system/ tree are refused.
+    if [ -d "$SOURCE_DIR/.git" ]; then
+        _priv_dirty=$(as_user git -C "$SOURCE_DIR" status --porcelain -- \
+            install.sh uninstall.sh system/ 2>/dev/null)
+        if [ -n "$_priv_dirty" ]; then
+            log "ERROR: privileged-install paths are dirty — refusing:"
+            printf '%s\n' "$_priv_dirty" | tee -a "$LOG"
+            log "  Clean:  sudo -u $REAL_USER git -C $SOURCE_DIR checkout -- install.sh uninstall.sh system/"
+            log "  Stash:  sudo -u $REAL_USER git -C $SOURCE_DIR stash push -- install.sh uninstall.sh system/"
+            exit 1
+        fi
+        log "── privileged paths clean — OK ──"
+    fi
 else
     log "── not a git checkout: skipping git pull ──"
 fi
@@ -169,10 +199,10 @@ if [ -z "$API_URL" ] || [ -z "$API_KEY" ]; then
 fi
 
 # ── Re-run install.sh ───────────────────────────────────────────
-PHASES="print_app,updater"
-if [ "$NO_APT" = "0" ]; then
-    PHASES="system,$PHASES"
-fi
+
+PHASES="print_app,updater,update_helpers"
+if [ "$NO_APT" = "0" ]; then PHASES="system,$PHASES"; fi
+
 
 log "── running install.sh --phase=$PHASES ──"
 

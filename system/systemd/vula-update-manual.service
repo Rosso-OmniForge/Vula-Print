@@ -9,3 +9,27 @@ ExecStart=/usr/local/bin/vula-update.sh
 StandardOutput=journal
 StandardError=journal
 TimeoutStartSec=900
+
+# ── Sandbox (audit C13 secondary / H7) ──────────────────────────
+# Identical hardening to vula-update-local.service — see that file's
+# comment block for full rationale. Same reasons apply: `--manual`
+# also runs install.sh --phase=system by default (apt writes to
+# /var/lib/dpkg etc.) and also needs $REAL_HOME writable for git.
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+ReadWritePaths=-/etc/vula
+ReadWritePaths=-/etc/systemd/system
+ReadWritePaths=-/etc/udev/rules.d
+ReadWritePaths=-/etc/polkit-1/rules.d
+ReadWritePaths=-/usr/local/bin
+ReadWritePaths=-/var/log/vula
+ReadWritePaths=-/var/lib/vula
+ReadWritePaths=-/var/cache/apt
+ReadWritePaths=-/var/lib/apt
+ReadWritePaths=-/var/lib/dpkg
+ReadWritePaths=-/var/log/apt
