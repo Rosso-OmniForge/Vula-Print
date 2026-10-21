@@ -44,7 +44,7 @@ class PreviewMixin:
 
     def _on_tspl_preview_fetched(self, result, conn, request):
         if not (result.ok and result.status == 200):
-            if result.ok:
+            if result.transport_ok:
                 QMessageBox.warning(self, "Cannot Load", f"Server returned {result.status}.")
             else:
                 QMessageBox.critical(self, "Error", f"Failed to fetch items: {result.error}")
@@ -118,7 +118,7 @@ class PreviewMixin:
 
     def _on_visual_preview_fetched(self, result, conn, request):
         if not (result.ok and result.status == 200):
-            if result.ok:
+            if result.transport_ok:
                 QMessageBox.warning(self, "Cannot Load", f"Server returned {result.status}.")
             else:
                 QMessageBox.critical(self, "Error", f"Failed to fetch items: {result.error}")

@@ -155,7 +155,7 @@ class HistoryMixin:
     def _on_reprint_detail_fetched(self, result, conn, entry, request_id):
         """Reprint detail fetch completed off-thread; confirm + print on main thread."""
         if not (result.ok and result.status == 200):
-            if result.ok:
+            if result.transport_ok:
                 QMessageBox.critical(
                     self, "Reprint Failed",
                     f"Server returned {result.status}.\n"

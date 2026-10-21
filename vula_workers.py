@@ -216,12 +216,44 @@ class PrintJob(QThread):
         line2 = text[len(line1):].strip()[:max_chars]  # hard-truncate remainder
         return [line1, line2] if line2 else [line1]
 
+    # Code39 alphabet — exactly what the symbology supports. Anything
+    # outside this set has undefined behaviour on the printer: some
+    # models reject the whole job, some encode garbage, some silently
+    # truncate to the last valid character. A corrupted barcode scans
+    # as the wrong SKU or fails at the till.
+    _CODE39_ALPHABET = frozenset("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-. $/+%")
+
     def _generate_label_tspl(self, item: Dict[str, Any]) -> str:
         """Generate TSPL commands for a single label."""
         title         = (item.get("title") or "")
         variant_label = item.get("variant_label") or ""
         sku           = item.get("sku") or ""
-        code39        = item.get("code39") or sku
+        code39_raw    = str(item.get("code39") or sku or "")
+
+        # Code39 sanitisation:
+        #   * uppercase first — Code39 is uppercase-only by spec, and
+        #     lowercase SKUs are common from the backend;
+        #   * filter to the supported alphabet — drops `@`, `!`, `*`,
+        #     and any non-ASCII or whitespace outside the one allowed
+        #     space;
+        #   * if the result is empty, RAISE — some printer firmware
+        #     crashes on `BARCODE ...,""`, others print a starburst.
+        #     A render failure per-item is caught and reported by
+        #     PrintJob.run; that is the correct outcome here.
+        code39 = "".join(
+            c for c in code39_raw.upper() if c in self._CODE39_ALPHABET
+        )
+        if not code39:
+            raise ValueError(
+                f"empty code39 after sanitisation "
+                f"(raw={code39_raw!r}, sku={sku!r})"
+            )
+        if code39 != code39_raw:
+            logging.getLogger("vula.print").warning(
+                "code39 sanitised %r -> %r (sku=%r)",
+                code39_raw, code39, sku,
+            )
+
         price         = self._format_price(item.get("price_cents", 0), item.get("currency", "ZAR"))
 
         tspl = []
@@ -384,6 +416,7 @@ class POSSlipPrintJob(QThread):
         width_chars: int = 48,
         qr_mode: str = "raster",
         qr_module_px: int = 4,
+        api_base_url: str = "",
     ):
         super().__init__()
         self.printer_device = printer_device
@@ -391,6 +424,11 @@ class POSSlipPrintJob(QThread):
         self.width_chars = int(width_chars)
         self.qr_mode = str(qr_mode).lower()
         self.qr_module_px = int(qr_module_px)
+        # Origin used by _logo_bytes to reject non-backend logo URLs
+        # (SSRF guard, audit C9). Empty string disables logo download
+        # entirely — a caller that doesn't pass this cannot
+        # accidentally fetch from an arbitrary origin.
+        self.api_base_url = str(api_base_url or "").rstrip("/")
         self.finished.connect(self.deleteLater)
 
     # ── Formatting helpers ─────────────────────────────────────────────
@@ -421,19 +459,35 @@ class POSSlipPrintJob(QThread):
         return f"{l}{' ' * space}{r}"
 
     def _txt(self, text: str = "") -> bytes:
-        # Sanitise before width-truncation.
-        # Errors="replace" only handles non-ASCII (bytes > 0x7F); it
-        # passes ASCII control bytes (0x00-0x1F) straight through to
-        # the printer. Those bytes ARE ESC/POS commands: 0x1B=ESC,
-        # 0x1D=GS, 0x10=DLE. A product title containing "\x1b@" resets
-        # the printer mid-receipt; "\x1dV\x41\x00" fires the cutter;
-        # "\x1bp\x00\x19\xfa" opens the cash drawer. Any backend- or
-        # user-supplied field is a potential injection vector unless
-        # we strip control bytes here. Keep \t and \n (harmless).
-        cleaned = "".join(
-            c for c in str(text)
-            if c in ("\t", "\n") or 0x20 <= ord(c) < 0x7F
-        )
+        # Strip control bytes (ESC/POS injection vectors) but preserve
+        # non-ASCII — encode(..., errors="replace") turns any non-ASCII
+        # char into "?" rather than silently dropping it. A previous
+        # revision stripped everything >= 0x7F, which turned "Café" into
+        # "Caf" — silent character loss is worse than a visible "?" on a
+        # tax-relevant receipt.
+        #
+        # Vectors explicitly rejected:
+        #   * 0x00-0x1F  — C0 controls. 0x1B=ESC, 0x1D=GS, 0x10=DLE. An
+        #                  injection here resets the printer, fires the
+        #                  cutter, opens the cash drawer.
+        #   * 0x7F       — DEL.
+        #   * 0x80-0x9F  — C1 controls (rare but interpreted by some
+        #                  ESC/POS clones as extended commands).
+        # \t and \n are harmless and preserved.
+        cleaned_chars = []
+        for c in str(text):
+            if c == "\t" or c == "\n":
+                cleaned_chars.append(c)
+                continue
+            o = ord(c)
+            if o < 0x20:
+                continue
+            if o == 0x7F:
+                continue
+            if 0x80 <= o < 0xA0:
+                continue
+            cleaned_chars.append(c)
+        cleaned = "".join(cleaned_chars)
         if len(cleaned) > self.width_chars:
             cleaned = cleaned[: self.width_chars]
         return (cleaned + "\n").encode("ascii", errors="replace")
@@ -486,30 +540,142 @@ class POSSlipPrintJob(QThread):
         out += bytes([GS, k, 3, 0, 49, 81, 48])                  # print
         return bytes(out)
 
+    # Logo hard limits. A compressed image can decode to a bitmap
+    # orders of magnitude larger than the file — a 10 MB PNG at 8-bit
+    # RGBA decompresses to hundreds of MB. Cap on both the wire body
+    # and the decoded pixel count. 2 MB / 20 MP is generous for any
+    # legitimate receipt logo (a 600×200 PNG is <50 KB / 0.12 MP).
+    _LOGO_MAX_BODY_BYTES = 2_000_000
+    _LOGO_MAX_PIXELS = 20_000_000
+    _LOGO_ALLOWED_FORMATS = frozenset({"PNG", "JPEG", "GIF"})
+
     def _logo_bytes(self, logo_url: str, max_width_dots: int) -> bytes:
         """Download + rasterise the receipt logo as GS v 0 bytes.
 
-        Returns b"" if the URL is missing, the download fails, or the
-        image can't be parsed — the receipt prints fine without a logo.
+        Three safety guards (audit C9 + H19 + N16):
+
+          * SSRF: only URLs whose origin matches the connection's
+            api_base_url are fetched. Blocks a compromised backend
+            from coaxing the client to fetch AWS metadata
+            (169.254.169.254), localhost admin endpoints, or the
+            local intranet.
+          * Resource exhaustion: body capped at 2 MB (streaming
+            iter_content, not buffered), decoded pixels capped at
+            20 MP. Together these defeat "small file, huge decode"
+            on low-RAM POS terminals.
+          * Parser surface: only PNG/JPEG/GIF accepted. Exotic
+            Pillow parsers (PDF, EPS, TIFF) are disabled — a backend-
+            controlled URL should not be able to drive them.
+
+        Returns b"" (receipt prints without a logo) on any failure —
+        a logo is decorative, never worth failing a print job over.
         """
+        log = logging.getLogger("vula.print")
+
         if not logo_url:
             return b""
+        # Relative URLs need resolving by the caller to an absolute
+        # form we can origin-check. Bail rather than guess.
+        if logo_url.startswith("/"):
+            return b""
+
+        # ── Origin allowlist ─────────────────────────────────────────
+        if not self.api_base_url:
+            return b""
         try:
-            if logo_url.startswith("/"):
-                # Relative URL — caller should have made it absolute.
+            from urllib.parse import urlparse
+            logo_parts = urlparse(logo_url)
+            api_parts = urlparse(self.api_base_url)
+            # Both must be HTTP(S) with a netloc, and the scheme +
+            # netloc (host:port) triple must match. Comparing netloc
+            # — not just host — prevents port-confusion tricks.
+            # Comparing scheme prevents downgrade (https backend
+            # serving a logo over http, which would leak the fetch
+            # via a passive attacker).
+            if logo_parts.scheme not in ("http", "https"):
+                log.warning("logo URL scheme %r rejected: %s",
+                            logo_parts.scheme, logo_url)
+                return b""
+            if not logo_parts.netloc or not api_parts.netloc:
+                return b""
+            if (
+                logo_parts.scheme != api_parts.scheme
+                or logo_parts.netloc != api_parts.netloc
+            ):
+                log.warning(
+                    "logo URL origin mismatch — refusing to fetch: %s "
+                    "(expected origin from %s)",
+                    logo_url, self.api_base_url,
+                )
+                return b""
+        except Exception:
+            return b""
+
+        try:
+            # ── Capped streaming download ────────────────────────────
+            with requests.get(logo_url, timeout=8, stream=True) as resp:
+                if resp.status_code != 200:
+                    return b""
+                try:
+                    cl = int(resp.headers.get("Content-Length", "0") or "0")
+                    if cl > self._LOGO_MAX_BODY_BYTES:
+                        log.warning(
+                            "logo Content-Length %d exceeds cap %d — refusing",
+                            cl, self._LOGO_MAX_BODY_BYTES,
+                        )
+                        return b""
+                except (TypeError, ValueError):
+                    pass
+
+                chunks = []
+                total = 0
+                for chunk in resp.iter_content(65536):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > self._LOGO_MAX_BODY_BYTES:
+                        log.warning(
+                            "logo body exceeded cap %d bytes — aborting",
+                            self._LOGO_MAX_BODY_BYTES,
+                        )
+                        return b""
+                    chunks.append(chunk)
+                body = b"".join(chunks)
+            if not body:
                 return b""
 
-            resp = requests.get(logo_url, timeout=8)
-            if resp.status_code != 200 or not resp.content:
-                return b""
-
+            # ── Decode with pixel cap + format check ────────────────
             from io import BytesIO
-            from PIL import Image
+            try:
+                from PIL import Image
+            except ImportError:
+                return b""
             from vula_rendering_qr import render_pil_image_gs_v0
 
-            img = Image.open(BytesIO(resp.content))
+            # Pillow's decompression-bomb guard — set once per call;
+            # idempotent (module global) and stricter than Pillow's
+            # 89 MP default, so this is a tightening.
+            Image.MAX_IMAGE_PIXELS = self._LOGO_MAX_PIXELS
+
+            img = Image.open(BytesIO(body))
+            fmt = (img.format or "").upper()
+            if fmt not in self._LOGO_ALLOWED_FORMATS:
+                log.warning(
+                    "logo format %r not in whitelist %s — refusing",
+                    fmt, sorted(self._LOGO_ALLOWED_FORMATS),
+                )
+                return b""
+            # verify() forces a header + structural parse; it closes
+            # the file, so reopen for the render pass.
+            try:
+                img.verify()
+            except Exception as exc:
+                log.warning("logo failed Pillow verify(): %s", exc)
+                return b""
+            img = Image.open(BytesIO(body))
             return render_pil_image_gs_v0(img, max_width_dots=max_width_dots)
-        except Exception:
+        except Exception as exc:
+            log.debug("logo fetch/render failed: %s", exc)
             return b""
 
     # ── Receipt body ───────────────────────────────────────────────────
@@ -657,8 +823,20 @@ class POSSlipPrintJob(QThread):
         if footer_note:
             out += self._txt(self._line_sep())
             out += self._esc(ESC, 0x61, 0x01)
-            for chunk_start in range(0, len(footer_note), self.width_chars):
-                out += self._txt(footer_note[chunk_start : chunk_start + self.width_chars])
+            # Word-wrap instead of char-boundary slicing. Slicing
+            # cut mid-word ("...free deliv" / "ery on orders") —
+            # visually broken on a tax receipt. textwrap also handles
+            # the edge case of a single word longer than width_chars
+            # (break_long_words=True) so nothing is silently dropped.
+            import textwrap as _tw
+            wrapped = _tw.wrap(
+                footer_note,
+                width=self.width_chars,
+                break_long_words=True,
+                break_on_hyphens=False,
+            ) or [footer_note[: self.width_chars]]
+            for line in wrapped:
+                out += self._txt(line)
             out += self._esc(ESC, 0x61, 0x00)
 
         # ── QR code ─────────────────────────────────────────────────
@@ -728,10 +906,17 @@ class POSEODReportPrintJob(QThread):
 
     completed = pyqtSignal(bool, str)
 
-    def __init__(self, printer_device: str, detail_payload: Dict[str, Any]):
+    def __init__(
+        self,
+        printer_device: str,
+        detail_payload: Dict[str, Any],
+        *,
+        width_chars: int = 48,
+    ):
         super().__init__()
         self.printer_device = printer_device
         self.detail_payload = detail_payload
+        self.width_chars = int(width_chars)
         self.finished.connect(self.deleteLater)
 
     @staticmethod
@@ -744,25 +929,39 @@ class POSEODReportPrintJob(QThread):
     def _esc(*values: int) -> bytes:
         return bytes(values)
 
-    @staticmethod
-    def _line_sep(width: int = 48, ch: str = "-") -> str:
-        return ch * width
+    def _line_sep(self, ch: str = "-") -> str:
+        return ch * self.width_chars
 
-    @staticmethod
-    def _col2(left: str, right: str, width: int = 48) -> str:
+    def _col2(self, left: str, right: str) -> str:
         l = str(left or "")
         r = str(right or "")
-        space = max(1, width - len(l) - len(r))
+        space = max(1, self.width_chars - len(l) - len(r))
         return f"{l}{' ' * space}{r}"
 
     def _txt(self, text: str = "") -> bytes:
-        # Same ESC/POS control-byte strip as POSSlipPrintJob._txt.
-        # EOD report fields (staff names, dates, source) also flow from
-        # the backend — do not assume numeric-only is safe.
-        cleaned = "".join(
-            c for c in str(text)
-            if c in ("\t", "\n") or 0x20 <= ord(c) < 0x7F
-        )
+        # Same control-byte strip + non-ASCII preservation as
+        # POSSlipPrintJob._txt (see that method's comment for the
+        # detailed rationale — ESC/POS injection vectors, why stripping
+        # non-ASCII here would be worse than visible "?" substitution).
+        cleaned_chars = []
+        for c in str(text):
+            if c == "\t" or c == "\n":
+                cleaned_chars.append(c)
+                continue
+            o = ord(c)
+            if o < 0x20:
+                continue
+            if o == 0x7F:
+                continue
+            if 0x80 <= o < 0xA0:
+                continue
+            cleaned_chars.append(c)
+        cleaned = "".join(cleaned_chars)
+        # Truncate to configured receipt width — without this a 58 mm
+        # printer wraps long _col2 lines at its own narrower width and
+        # misaligns the money columns.
+        if len(cleaned) > self.width_chars:
+            cleaned = cleaned[: self.width_chars]
         return (cleaned + "\n").encode("ascii", errors="replace")
 
     def _build_receipt_bytes(self) -> bytes:
@@ -876,6 +1075,7 @@ class POSPollWorker(QThread):
     all_clear      = pyqtSignal(str)              # (connection_id)
     poll_error     = pyqtSignal(str, str, int)     # (connection_id, message, http_status) 0=network
     poll_fatal     = pyqtSignal(str, str, int)     # (connection_id, message, http_status) auth/config
+    eod_ensure_attempted = pyqtSignal(str)         # (connection_id) — hourly-gate bookkeeping
 
     def __init__(
         self,
@@ -885,6 +1085,8 @@ class POSPollWorker(QThread):
         user_id: int,
         in_flight_ids: frozenset,
         eod_in_flight_ids: frozenset,
+        *,
+        do_eod_ensure: bool = True,
         parent=None,
     ):
         super().__init__(parent)
@@ -894,6 +1096,7 @@ class POSPollWorker(QThread):
         self._user_id = user_id
         self._in_flight_ids = in_flight_ids
         self._eod_in_flight_ids = eod_in_flight_ids
+        self._do_eod_ensure = bool(do_eod_ensure)
         self.finished.connect(self.deleteLater)
 
     def _headers(self) -> Dict[str, str]:
@@ -967,31 +1170,31 @@ class POSPollWorker(QThread):
 
         # ── 2. No POS slips — check EOD reports ───────────────────────────
         self.pending_list_ready.emit(cid, [])
-        try:
-            ensure_r = requests.post(
-                f"{self._api_base}/admin/api/pos-eod-reports/ensure-latest",
-                headers={**self._headers(), "Content-Type": "application/json"},
-                json={},
-                timeout=8,
-            )
-            if ensure_r.status_code not in (200, 204):
-                # The backend is supposed to generate today's EOD report
-                # on this call. If it does not, the client will see an
-                # empty pending list forever and the EOD is never
-                # printed. Surface it as a poll error so the operator
-                # (and the fleet dashboard) can see it, instead of a
-                # silent zero.
-                plog.warning(
-                    "[%s] ensure-latest -> HTTP %d (EOD generation may be "
-                    "stalled on the backend)",
-                    cid, ensure_r.status_code,
+        if self._do_eod_ensure:
+            try:
+                ensure_r = requests.post(
+                    f"{self._api_base}/admin/api/pos-eod-reports/ensure-latest",
+                    headers={**self._headers(), "Content-Type": "application/json"},
+                    json={},
+                    timeout=8,
                 )
-                self.poll_error.emit(
-                    cid, f"ensure-latest HTTP {ensure_r.status_code}",
-                    ensure_r.status_code,
-                )
-        except Exception as exc:
-            plog.warning("[%s] ensure-latest failed: %s", cid, exc)
+                # Emit attempt regardless of outcome — the caller uses
+                # this to update last_eod_ensure_at so a broken endpoint
+                # does not retry every 5 s.
+                self.eod_ensure_attempted.emit(cid)
+                if ensure_r.status_code not in (200, 204):
+                    plog.warning(
+                        "[%s] ensure-latest -> HTTP %d (EOD generation may "
+                        "be stalled on the backend)",
+                        cid, ensure_r.status_code,
+                    )
+                    self.poll_error.emit(
+                        cid, f"ensure-latest HTTP {ensure_r.status_code}",
+                        ensure_r.status_code,
+                    )
+            except Exception as exc:
+                plog.warning("[%s] ensure-latest failed: %s", cid, exc)
+                self.eod_ensure_attempted.emit(cid)
 
         try:
             eod_r = requests.get(

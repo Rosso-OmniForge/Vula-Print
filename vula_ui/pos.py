@@ -1,9 +1,12 @@
 """Mixin for VulaPrintApp — see vula_app.py for composition."""
 from __future__ import annotations
 
+import logging
 import time
 from datetime import datetime
 from typing import Optional
+
+_log = logging.getLogger("vula.pos")
 
 import requests
 
@@ -73,9 +76,14 @@ class POSMixin:
             return
         if self._thread_alive(self._pos_poll_worker):
             return
-        if not self.printer_roles.get("pos_slip"):
-            self._update_pos_worker_status()
-            return
+        # Deliberately do NOT gate polling on having a POS printer role.
+        # If the operator has not assigned a device, polling continues
+        # so the backend sees regular /pending GETs — its fleet dashboard
+        # can then distinguish "client is dead" from "client is alive
+        # but printer unassigned". The role gate stays in
+        # _on_poll_slip_ready / _on_poll_eod_slip_ready, which refuse to
+        # print without a role but still record the pending list for
+        # the operator.
 
         eligible = [c for c in self.active_connections if c.printer_user_id]
         if not eligible:
@@ -113,6 +121,12 @@ class POSMixin:
                 continue
             self._pos_poll_cursor = (idx + 1) % n
 
+            # Hourly gate on ensure-latest — otherwise every idle poll
+            # cycle (5 s default) hits the backend with a POST, i.e.
+            # 12 000 req/min at 1000-client scale.
+            do_eod_ensure = (
+                time.time() - getattr(conn, "last_eod_ensure_at", 0.0)
+            ) >= 3600
             self._pos_poll_worker = POSPollWorker(
                 connection_id=conn.connection_id,
                 api_base=conn.api_base_url,
@@ -120,6 +134,7 @@ class POSMixin:
                 user_id=conn.printer_user_id,
                 in_flight_ids=frozenset(conn.pos_in_flight_ids),
                 eod_in_flight_ids=frozenset(conn.pos_eod_in_flight_ids),
+                do_eod_ensure=do_eod_ensure,
             )
             self._pos_poll_worker.slip_ready.connect(self._on_poll_slip_ready)
             self._pos_poll_worker.eod_slip_ready.connect(self._on_poll_eod_slip_ready)
@@ -128,6 +143,9 @@ class POSMixin:
             self._pos_poll_worker.all_clear.connect(self._on_poll_all_clear)
             self._pos_poll_worker.poll_error.connect(self._on_poll_error)
             self._pos_poll_worker.poll_fatal.connect(self._on_poll_fatal)
+            self._pos_poll_worker.eod_ensure_attempted.connect(
+                self._on_eod_ensure_attempted
+            )
             self._pos_poll_worker.finished.connect(
                 lambda w=self._pos_poll_worker: self._on_poll_worker_finished(w)
             )
@@ -194,7 +212,11 @@ class POSMixin:
                 },
                 created_at=(detail.get("request", {}) or {}).get("created_at"),
             )
-        except Exception:
+        except Exception as exc:
+            _log.error(
+                "store upsert_fetched failed for pos_slip #%s — printing "
+                "without audit trail: %s", request_id, exc,
+            )
             job_id = None
 
         # CAS on the store row: fetched → printing. If another tick
@@ -214,6 +236,7 @@ class POSMixin:
             width_chars=self.pos_width_chars,
             qr_mode=self.pos_qr_mode,
             qr_module_px=self.pos_qr_module_px,
+            api_base_url=conn.api_base_url,
         )
         self.pos_print_job.completed.connect(
             lambda s, m, jid=job_id:
@@ -244,6 +267,13 @@ class POSMixin:
                 self.status_bar.showMessage(
                     f"POS slip #{request_id} printed (no connection to complete)"
                 )
+            # Drain the queue immediately rather than waiting for the
+            # next 5–15 s poll tick. The slip is still in
+            # conn.pos_in_flight_ids until /complete lands, so the new
+            # poll skips it and picks the next oldest — no reprint risk.
+            # A closing-time burst of 20 slips now takes ~40 s instead
+            # of 100–300 s.
+            self.poll_pos_slips()
         else:
             if job_id is not None:
                 try:
@@ -270,15 +300,43 @@ class POSMixin:
         self._http_workers.append(w)
         w.start()
 
+    # Upper bound on the per-connection completion retry set. If the
+    # backend is unreachable for a long time, ids otherwise accumulate
+    # without limit — a set of 100k ids burns memory and turns the first
+    # successful retry flush into a thundering-herd burst. 500 covers
+    # >8 h of end-of-day traffic on a busy store.
+    _POS_RETRY_SET_MAX = 500
+
     def _on_pos_complete_done(self, result: HttpResult, conn: StoreConnection, request_id: int):
-        if result.ok and result.status in (200, 400, 404):
+        # Explicit status handling — do NOT trust result.ok alone. In
+        # this codebase result.ok reflects transport success only (see
+        # audit H1); treating any "ok" response as success would
+        # silently discard retries on a backend 500.
+        if result.status in (200, 204, 404):
+            # 200/204: completed. 404: slip gone from the backend.
             conn.pos_completion_retry_ids.discard(request_id)
             conn.pos_in_flight_ids.discard(request_id)
             self.status_bar.showMessage(
                 f"POS slip #{request_id} printed and completed"
             )
+        elif result.status == 400:
+            # 400 = malformed completion request. That is a bug — log
+            # for review but discard so the retry set cannot grow
+            # unboundedly on a permanently broken request.
+            _log.warning(
+                "pos complete #%s -> HTTP 400 (discarding; flag for review)",
+                request_id,
+            )
+            conn.pos_completion_retry_ids.discard(request_id)
+            conn.pos_in_flight_ids.discard(request_id)
+            self.status_bar.showMessage(
+                f"POS slip #{request_id} printed; completion 400 — flagged"
+            )
         else:
+            # 5xx / network / unexpected — schedule a retry, capped.
             conn.pos_completion_retry_ids.add(request_id)
+            while len(conn.pos_completion_retry_ids) > self._POS_RETRY_SET_MAX:
+                conn.pos_completion_retry_ids.pop()
             self.status_bar.showMessage(
                 f"POS slip #{request_id} printed; completion retry scheduled"
             )
@@ -307,7 +365,11 @@ class POSMixin:
                 },
                 created_at=(detail.get("request", {}) or {}).get("created_at"),
             )
-        except Exception:
+        except Exception as exc:
+            _log.error(
+                "store upsert_fetched failed for pos_eod #%s — printing "
+                "without audit trail: %s", request_id, exc,
+            )
             job_id = None
 
         if job_id is not None and not self._store.mark_printing(job_id, pos_printer):
@@ -316,7 +378,10 @@ class POSMixin:
         conn.pos_eod_in_flight_ids.add(request_id)
         self.last_successful_pos_poll_at = datetime.now()
         self._update_pos_worker_status(f"Printing EOD via {conn.name}")
-        self.pos_eod_print_job = POSEODReportPrintJob(pos_printer, detail)
+        self.pos_eod_print_job = POSEODReportPrintJob(
+            pos_printer, detail,
+            width_chars=self.pos_width_chars,
+        )
         self.pos_eod_print_job.completed.connect(
             lambda s, m, jid=job_id:
             self._on_pos_eod_print_finished(s, m, request_id, connection_id, jid)
@@ -336,7 +401,15 @@ class POSMixin:
                     self._store.mark_completed(job_id)
                 except Exception:
                     pass
+            # Mirror the POS slip success path — record the print as
+            # a health heartbeat and clear any residual backoff. The
+            # previous code left last_successful_pos_print_at stale on
+            # EOD-only stores, which any fleet dashboard would flag as
+            # "no recent print".
+            self.last_successful_pos_print_at = datetime.now()
             if conn is not None:
+                conn.pos_backoff_seconds = 1
+                conn.pos_backoff_until = 0.0
                 self._dispatch_eod_complete(conn, request_id)
                 self.status_bar.showMessage(
                     f"POS EOD report #{request_id} printed; completing…"
@@ -371,14 +444,27 @@ class POSMixin:
         w.start()
 
     def _on_eod_complete_done(self, result: HttpResult, conn: StoreConnection, request_id: int):
-        if result.ok and result.status in (200, 400, 404):
+        # Same explicit status handling as _on_pos_complete_done.
+        if result.status in (200, 204, 404):
             conn.pos_eod_completion_retry_ids.discard(request_id)
             conn.pos_eod_in_flight_ids.discard(request_id)
             self.status_bar.showMessage(
                 f"POS EOD report #{request_id} printed and completed"
             )
+        elif result.status == 400:
+            _log.warning(
+                "pos eod complete #%s -> HTTP 400 (discarding; flag for review)",
+                request_id,
+            )
+            conn.pos_eod_completion_retry_ids.discard(request_id)
+            conn.pos_eod_in_flight_ids.discard(request_id)
+            self.status_bar.showMessage(
+                f"POS EOD report #{request_id} printed; completion 400 — flagged"
+            )
         else:
             conn.pos_eod_completion_retry_ids.add(request_id)
+            while len(conn.pos_eod_completion_retry_ids) > self._POS_RETRY_SET_MAX:
+                conn.pos_eod_completion_retry_ids.pop()
             self.status_bar.showMessage(
                 f"POS EOD report #{request_id} printed; completion retry scheduled"
             )
@@ -390,7 +476,10 @@ class POSMixin:
         if conn:
             conn.pos_backoff_seconds = 1
             conn.pos_backoff_until = 0.0
-        self._update_pos_worker_status("POS API connected")
+        if not self.printer_roles.get("pos_slip"):
+            self._update_pos_worker_status("POS API connected — printer unassigned")
+        else:
+            self._update_pos_worker_status("POS API connected")
 
     def _on_poll_error(self, connection_id: str, message: str, status_code: int):
         """Transient poll error for one connection — apply backoff to THAT connection only."""
@@ -414,6 +503,12 @@ class POSMixin:
             name = connection_id
         self._update_pos_worker_status(f"{name}: error {status_code}")
         self.status_bar.showMessage(f"POS worker stopped for {name}: {message}")
+
+    def _on_eod_ensure_attempted(self, connection_id: str):
+        """Hourly-gate bookkeeping — record when we last hit ensure-latest."""
+        conn = self.get_connection_by_id(connection_id)
+        if conn:
+            conn.last_eod_ensure_at = time.time()
 
     # ── Pending list handlers (queue display) ───────────────────────
 
