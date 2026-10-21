@@ -141,30 +141,49 @@ class VulaPrintApp(
         try:
             self._store = PrintStore(APP_DB_FILE)
         except Exception as _e:
-            _log.error("Failed to open store: %s", _e)
-            self._store = None
-
-        if self._store is not None:
+            # The store is the audit trail AND the double-print
+            # prevention layer. Printing without it means tax-relevant
+            # POS slips are produced with no record and no CAS guard
+            # against duplicates. Fail loudly rather than falling back
+            # to "print without audit". Surface the error to the
+            # operator, then exit so systemd can restart (and retry the
+            # DB open) or the user can intervene.
+            _log.critical("Print store failed to open: %s", _e)
             try:
-                migrated = migrate_legacy_connections_if_needed(
-                    self._store,
-                    APP_CONFIG_FILE,
-                    Path(__file__).parent / ".env",
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.critical(
+                    None,
+                    "Storage Failure",
+                    f"Cannot open print history database:\n"
+                    f"{APP_DB_FILE}\n\n"
+                    f"{_e}\n\n"
+                    "Printing is disabled until this is resolved.\n"
+                    "Check free disk space and directory permissions.",
                 )
-                if migrated:
-                    _log.info(
-                        "Imported %d legacy connection(s) into the DB",
-                        migrated,
-                    )
-            except Exception as _e:
-                _log.warning("Connection migration failed: %s", _e)
+            except Exception as _dlg_e:
+                _log.error("(Could not display error dialog: %s)", _dlg_e)
+            raise SystemExit(1)
 
-            _stale = self._store.mark_interrupted_on_startup()
-            if _stale:
-                _log.warning(
-                    "Marked %d interrupted print job(s) from previous session",
-                    _stale,
+        try:
+            migrated = migrate_legacy_connections_if_needed(
+                self._store,
+                APP_CONFIG_FILE,
+                Path(__file__).parent / ".env",
+            )
+            if migrated:
+                _log.info(
+                    "Imported %d legacy connection(s) into the DB",
+                    migrated,
                 )
+        except Exception as _e:
+            _log.warning("Connection migration failed: %s", _e)
+
+        _stale_ids = self._store.mark_interrupted_on_startup()
+        if _stale_ids:
+            _log.warning(
+                "Marked %d interrupted print job(s) from previous session: ids=%s",
+                len(_stale_ids), _stale_ids,
+            )
 
         self.load_settings()
 

@@ -97,8 +97,36 @@ class PrintStore:
         # WAL gives us resilience against abrupt termination — the .db
         # survives a SIGKILL mid-write without corruption.
         self._conn.execute("PRAGMA journal_mode = WAL")
+        # Tighten perms AFTER WAL is enabled — sqlite creates .db-wal
+        # and .db-shm on first write and they inherit the parent dir's
+        # umask. The connections table holds api_key in plaintext; all
+        # three files are credential-bearing.
+        self._secure_db_permissions()
         self._apply_schema()
         _log.info("PrintStore opened: %s (schema v%d)", self._path, _SCHEMA_VERSION)
+
+    def _secure_db_permissions(self) -> None:
+        """chmod the DB and its WAL/SHM side files to 0600.
+
+        The connections table stores api_key in plaintext. Debian
+        installs commonly have umask 0o002, so sqlite3.connect() creates
+        the files 0664 — group-readable and group-writable. Any other
+        local user on the POS box could then read the backend credential
+        for every store bound to this device. Idempotent and safe to
+        call on every open; corrects pre-existing looser modes too.
+        """
+        import os as _os
+        targets = [
+            self._path,
+            self._path.with_name(self._path.name + "-wal"),
+            self._path.with_name(self._path.name + "-shm"),
+        ]
+        for p in targets:
+            try:
+                if p.exists():
+                    _os.chmod(str(p), 0o600)
+            except Exception as exc:
+                _log.warning("could not chmod %s to 0600: %s", p, exc)
 
     # ── Schema ─────────────────────────────────────────────────────
 
@@ -223,10 +251,12 @@ class PrintStore:
         self._log_event_inline(job_id, "print_failed", str(error)[:1000], now)
         self._conn.commit()
 
-    def mark_interrupted_on_startup(self) -> int:
+    def mark_interrupted_on_startup(self) -> List[int]:
         """Sweep: any job left in 'printing' by the previous process is
-        marked 'interrupted'. Called once at app start. Returns the number
-        of rows affected.
+        marked 'interrupted'. Called once at app start. Returns the list
+        of affected job IDs so the caller can log them — a stuck
+        'printing' row on a POS box is otherwise invisible without a
+        direct DB query.
 
         We deliberately do NOT auto-resume interrupted jobs. A duplicate
         POS slip or A4 picking slip delivered to a customer is worse than
@@ -236,7 +266,7 @@ class PrintStore:
             "SELECT id FROM print_jobs WHERE status='printing'"
         ).fetchall()
         if not rows:
-            return 0
+            return []
         now = _now()
         ids = [int(r["id"]) for r in rows]
         placeholders = ",".join("?" * len(ids))
@@ -250,7 +280,7 @@ class PrintStore:
                 jid, "interrupted_on_startup", "App restarted during print", now,
             )
         self._conn.commit()
-        return len(ids)
+        return ids
 
     def log_event(self, job_id: int, event: str, detail: str = "") -> None:
         """Public hook for callers to record additional lifecycle events
