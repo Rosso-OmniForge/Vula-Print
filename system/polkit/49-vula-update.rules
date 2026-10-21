@@ -1,12 +1,15 @@
-// Allow local users to trigger the Vula update services without a password.
-// Needed so the GUI's "Update" button works without dropping to a terminal.
-// The action IDs are narrow — only the two specific units, not "all
-// systemd units" — so this cannot be used as a general privilege escalation.
-polkit.addRule(function(action, subject) {
-    if (action.id == "org.freedesktop.systemd1.manage-units" &&
-        subject.local &&
-        (action.lookup("unit") == "vula-update-manual.service" ||
-         action.lookup("unit") == "vula-update-local.service")) {
-        return polkit.Result.YES;
-    }
-});
+
+/*
+ * Vula! Print updater authorization
+ *
+ * Passwordless Polkit authorization is intentionally disabled.
+ *
+ * The updater services currently execute installer code from a
+ * user-writable checkout. Do not grant local users permission to
+ * start these privileged services until the updater trust boundary
+ * has been redesigned and verified.
+ *
+ * Administrative updates must currently be performed only by an
+ * authorized administrator. This file intentionally defines no
+ * authorization rules.
+ */

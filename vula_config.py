@@ -77,6 +77,12 @@ class StoreConnection:
 
     pos_backoff_seconds: int = 1
     pos_backoff_until: float = 0.0
+    # Wall-clock timestamp of the last EOD ensure-latest POST attempt
+    # for this connection. POSPollWorker gates the POST on this —
+    # otherwise every idle poll cycle (default 5s) hits the backend with
+    # ensure-latest, i.e. 12 000 req/min at 1000-client scale. Not
+    # persisted; hourly cadence across app restarts is acceptable.
+    last_eod_ensure_at: float = 0.0
 
     last_status: str = "Not tested"
     last_connected: bool = False

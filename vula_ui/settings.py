@@ -40,6 +40,13 @@ class SettingsMixin:
 
             with open(APP_CONFIG_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            # Upgrade path — tighten perms on legacy installs where
+            # settings.json may have been created under umask 0o002.
+            try:
+                import os as _os
+                _os.chmod(str(APP_CONFIG_FILE), 0o600)
+            except Exception:
+                pass
 
             # Connections come from the DB now. settings.json is only
             # consulted for UI preferences. Legacy installs are migrated
@@ -153,6 +160,11 @@ class SettingsMixin:
             }
             with open(APP_CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
+            try:
+                import os as _os
+                _os.chmod(str(APP_CONFIG_FILE), 0o600)
+            except Exception:
+                pass
             try:
                 from vula_device_io import set_serial_configs
                 set_serial_configs(getattr(self, "serial_config", {}) or {})
