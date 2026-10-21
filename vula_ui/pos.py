@@ -35,37 +35,6 @@ class POSMixin:
         except RuntimeError:
             return False
 
-    def _complete_pos_request(self, conn: StoreConnection, request_id: int) -> bool:
-        try:
-            response = requests.post(
-                f"{conn.api_base_url}/admin/api/pos-slips/complete",
-                headers=self._headers_for(conn, include_json=True),
-                json={"request_id": request_id},
-                timeout=10,
-            )
-            if response.status_code == 200:
-                return True
-            if response.status_code in (400, 404):
-                return True
-            return False
-        except Exception:
-            return False
-
-    def _complete_pos_eod_request(self, conn: StoreConnection, request_id: int) -> bool:
-        try:
-            response = requests.post(
-                f"{conn.api_base_url}/admin/api/pos-eod-reports/complete",
-                headers=self._headers_for(conn, include_json=True),
-                json={"request_id": request_id},
-                timeout=10,
-            )
-            if response.status_code == 200:
-                return True
-            if response.status_code in (400, 404):
-                return True
-            return False
-        except Exception:
-            return False
 
     def poll_pos_slips(self):
         """Advance the round-robin cursor and dispatch a POSPollWorker for the next

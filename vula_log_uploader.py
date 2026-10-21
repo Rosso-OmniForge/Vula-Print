@@ -202,7 +202,11 @@ class LogUploadCoordinator:
 
     def _on_done(self, result, conn: StoreConnection, line_count: int, trigger_reason: str):
         from vula_http import HttpResult  # noqa: F401
-        if result.ok and result.status == 200:
+        # Any 2xx means the upload succeeded. Previously this was
+        # narrowed to status == 200, so a 204 No Content (a valid
+        # success for an upload endpoint) was misclassified as a
+        # transient failure.
+        if result.ok:
             _log.info(
                 "log upload ok: %s (%d lines, trigger=%s)",
                 conn.name, line_count, trigger_reason,

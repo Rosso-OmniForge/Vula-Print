@@ -185,7 +185,10 @@ class LabelQueueMixin:
                 self._pending_fetch_accum.append(item)
         else:
             name = conn.name if conn else connection_id
-            if not result.ok:
+            # transport_ok = did a response arrive? A server 500 must
+            # surface as "HTTP 500", not as "connection failed" with an
+            # empty error string.
+            if not result.transport_ok:
                 self._pending_fetch_errors.append(f"{name}: {result.error}")
             else:
                 self._pending_fetch_errors.append(f"{name}: HTTP {result.status}")
@@ -427,7 +430,9 @@ class LabelQueueMixin:
             return
 
         if not (result.ok and result.status == 200):
-            if not result.ok:
+            # Same rationale as _on_label_pending_fetched — preserve the
+            # status code in the message for any server-side response.
+            if not result.transport_ok:
                 self.details_text.setText(f"Error loading details: {result.error}")
             else:
                 self.details_text.setText(f"Error loading details: HTTP {result.status}")

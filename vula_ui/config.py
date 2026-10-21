@@ -10,7 +10,7 @@ from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QProcess
@@ -202,7 +202,11 @@ class ConfigMixin:
                 )
         else:
             conn.last_connected = False
-            if not result.ok:
+            # transport_ok (not ok): we want "was there a response at
+            # all?" here. `ok` is now 2xx-only, so a backend 500 would
+            # otherwise fall into "Connection failed" and lose the
+            # status code the operator needs to diagnose.
+            if not result.transport_ok:
                 conn.last_status = "Connection failed"
             elif result.status == 401:
                 conn.last_status = "Invalid API key"
@@ -252,8 +256,36 @@ class ConfigMixin:
         relative = self.logo_dark_url or self.logo_light_url
         if not relative or not conn.api_base_url:
             return
+
+        # ── SSRF guard (audit N24) ───────────────────────────────
+        # logo_dark_url / logo_light_url come from the backend's
+        # printer-app/config response. urljoin() silently discards the
+        # base when the second argument is absolute — a compromised
+        # backend could set logo_dark_url = "http://169.254.169.254/…"
+        # and every client would fetch it on every config poll (60 s
+        # cadence, plus on startup before any user action). Reject
+        # absolute URLs before urljoin can act on them.
+        _parsed_rel = urlparse(relative)
+        if _parsed_rel.scheme or _parsed_rel.netloc:
+            print(
+                f"Warning: brand logo URL rejected (must be relative "
+                f"to API base): {relative!r}"
+            )
+            return
+
         relative = relative.lstrip("/")
         url = urljoin(conn.api_base_url.rstrip("/") + "/", relative)
+
+        # Belt-and-braces — verify the resolved URL shares the API
+        # base's origin, in case urljoin behaviour ever changes.
+        _api = urlparse(conn.api_base_url)
+        _url = urlparse(url)
+        if _url.scheme != _api.scheme or _url.netloc != _api.netloc:
+            print(
+                f"Warning: brand logo resolved origin differs from "
+                f"API base — refusing fetch: {url}"
+            )
+            return
         w = HttpWorker(
             tag=f"logo:{conn.connection_id}",
             method="GET",
@@ -270,13 +302,25 @@ class ConfigMixin:
         if not result.ok or result.status != 200 or not result.content:
             return
         try:
+            # Validate as an image before persisting. QPixmap can load
+            # more formats than the receipt path allows; if we save
+            # first and load second, a malformed body can crash the
+            # Qt image loader after we've already written the file.
+            # Load-then-save is safer and idempotent.
+            pixmap = QPixmap()
+            if not pixmap.loadFromData(result.content):
+                print(
+                    "Warning: brand logo response is not a loadable "
+                    "image — ignoring"
+                )
+                return
+
             logo_file = Path.home() / ".config" / "vula_print" / "brand_logo.png"
             logo_file.parent.mkdir(parents=True, exist_ok=True)
             logo_file.write_bytes(result.content)
             self.brand_logo_path = str(logo_file)
             self.save_settings()
             if hasattr(self, "logo_label"):
-                pixmap = QPixmap(self.brand_logo_path)
                 if not pixmap.isNull():
                     self.logo_label.setPixmap(
                         pixmap.scaledToWidth(
@@ -284,8 +328,8 @@ class ConfigMixin:
                             Qt.TransformationMode.SmoothTransformation,
                         )
                     )
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Warning: could not persist brand logo: {e}")
 
     def _ack_printer_config_async(self, conn: StoreConnection, config_version: int):
         w = HttpWorker(
@@ -432,13 +476,16 @@ class ConfigMixin:
             ok = True
         else:
             conn.last_connected = False
-            if not result.ok:
+            # transport_ok (not ok): we want "was there a response at
+            # all?" here. `ok` is now 2xx-only, so a backend 500 would
+            # otherwise fall into "Connection failed" and lose the
+            # status code the operator needs to diagnose.
+            if not result.transport_ok:
                 conn.last_status = "Connection failed"
             elif result.status == 401:
                 conn.last_status = "Invalid API key"
             else:
                 conn.last_status = f"HTTP {result.status}"
-            ok = False
 
         self._test_all_results.append((conn.name, ok, conn.last_status))
         self._test_all_pending = max(0, self._test_all_pending - 1)
