@@ -351,6 +351,7 @@ REAL_USER=$REAL_USER
 REAL_HOME=$REAL_HOME
 SOURCE_DIR=$SCRIPT_DIR
 VULA_VERSION=$VULA_VERSION
+VULA_UPDATE_BRANCH=$(cd "$SCRIPT_DIR" && git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
 ENV_EOF
     )
     chown root:root /etc/vula/install.env

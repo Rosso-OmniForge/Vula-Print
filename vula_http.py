@@ -94,6 +94,18 @@ class HttpWorker(QThread):
         self.method = method.upper()
         self.url = url
         self.headers = dict(headers or {})
+        # ── Fleet telemetry (audit N62): every request carries the
+        # client build. The backend can then answer "which devices are
+        # on version X?" from the poll log alone — no extra endpoint.
+        # Only injected if the caller hasn't set it explicitly, so a
+        # caller that needs to override (e.g. a test that asserts a
+        # specific build) still can.
+        if "X-Client-Version" not in self.headers:
+            try:
+                from vula_config import APP_VERSION_SHORT
+                self.headers["X-Client-Version"] = APP_VERSION_SHORT
+            except Exception:
+                pass
         self.json_body = json_body
         self.timeout = timeout
 

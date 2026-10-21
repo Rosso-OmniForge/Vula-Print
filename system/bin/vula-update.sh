@@ -122,6 +122,7 @@ if [ ! -f "$SOURCE_DIR/install.sh" ]; then
 fi
 log "source dir: $SOURCE_DIR"
 log "real user : $REAL_USER"
+log "local branch: $(cd "$SOURCE_DIR" && as_user git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
 
 REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
 REAL_UID=$(id -u "$REAL_USER")
@@ -235,24 +236,69 @@ if [ "$LOCAL" = "0" ] && [ -d "$SOURCE_DIR/.git" ]; then
         exit 1
     fi
 
-    LOCAL_SHA=$(cd "$SOURCE_DIR" && as_user git rev-parse HEAD 2>/dev/null)
-    REMOTE_SHA=$(cd "$SOURCE_DIR" && as_user git rev-parse origin/main 2>/dev/null || \
-                 cd "$SOURCE_DIR" && as_user git rev-parse origin/master 2>/dev/null || echo "")
-    if [ -z "$REMOTE_SHA" ]; then
-        log "ERROR: could not resolve origin/main or origin/master"
+    # ── Branch resolution (audit N72) ───────────────────────────
+    # The previous code was:
+    #   REMOTE_SHA=$(rev-parse origin/main 2>/dev/null || \
+    #                rev-parse origin/master 2>/dev/null || echo "")
+    # This silently produced an unusable value on repos whose only
+    # remote-tracking ref is origin/main (i.e. any repo created after
+    # GitHub's 2020 default-branch rename). The merge step then failed
+    # with "origin/master - not something we can merge" — a symptom
+    # that was never surfaced, only logged, and the device stopped
+    # updating silently for weeks.
+    #
+    # New logic: explicit `rev-parse --verify` (fails on missing ref,
+    # unlike plain rev-parse) against each candidate in order, then
+    # trim whitespace, then assert the result is a 40-char hex SHA —
+    # so a bad value can never reach `git merge`.
+
+    LOCAL_SHA=$(cd "$SOURCE_DIR" && as_user git rev-parse HEAD 2>/dev/null | tr -d '[:space:]')
+
+    _resolve_remote() {
+        local _ref
+        for _ref in \
+            "$(cd "$SOURCE_DIR" && as_user git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null)" \
+            "origin/main" \
+            "origin/master"; do
+            [ -n "$_ref" ] || continue
+            local _sha
+            _sha=$(cd "$SOURCE_DIR" && as_user git rev-parse --verify "${_ref}^{commit}" 2>/dev/null | tr -d '[:space:]')
+            if [[ "$_sha" =~ ^[0-9a-f]{40}$ ]]; then
+                echo "${_ref}|${_sha}"
+                return 0
+            fi
+        done
+        return 1
+    }
+
+    _resolved=$(_resolve_remote) || {
+        log "ERROR: could not resolve any usable remote branch."
+        log "  Tried: origin/HEAD, origin/main, origin/master"
+        log "  Check:  sudo -u ${REAL_USER} git -C ${SOURCE_DIR} branch -r"
+        exit 1
+    }
+    REMOTE_REF="${_resolved%%|*}"
+    REMOTE_SHA="${_resolved##*|}"
+
+    if [ -z "$LOCAL_SHA" ] || [ -z "$REMOTE_SHA" ]; then
+        log "ERROR: LOCAL_SHA='$LOCAL_SHA' REMOTE_SHA='$REMOTE_SHA' — cannot proceed"
         exit 1
     fi
 
     log "── git merge ──"
-    log "  ${LOCAL_SHA:0:12} -> ${REMOTE_SHA:0:12}"
+    log "  local  HEAD        = ${LOCAL_SHA:0:12}"
+    log "  remote ${REMOTE_REF} = ${REMOTE_SHA:0:12}"
 
     if [ "$LOCAL_SHA" != "$REMOTE_SHA" ]; then
+        # Merge by SHA, never by ref name. A SHA cannot be ambiguous.
         if ! (cd "$SOURCE_DIR" && as_user git merge --ff-only "$REMOTE_SHA" 2>&1 | tee -a "$LOG"); then
-            log "ERROR: fast-forward merge failed (local changes?)"
+            log "ERROR: fast-forward merge failed"
+            log "  Local HEAD may have diverged from ${REMOTE_REF}."
+            log "  Inspect: sudo -u $REAL_USER git -C $SOURCE_DIR status"
             exit 1
         fi
     else
-        log "  already up-to-date"
+        log "  already up-to-date (local == ${REMOTE_REF})"
     fi
 elif [ "$LOCAL" = "1" ]; then
     log "── --local: skipping git pull ──"
@@ -299,9 +345,62 @@ if [ -f /etc/vula/creds.env ]; then
     API_URL="${PRINTER_API_BASE_URL:-}"
     API_KEY="${PRINTER_API_KEY:-}"
 fi
+
+# Self-heal (audit N70). creds.env is only ever written by
+# `install.sh --phase=print_app`. If it goes missing — manual delete,
+# disk corruption, a partial reinstall that errored between phases —
+# the updater has been permanently stuck: it needs creds.env to run
+# install.sh --phase=print_app, but only --phase=print_app writes it.
+# That catch-22 turns one bad file into a device that never updates
+# again without a human on site.
+#
+# The DB conn_1 row always holds the last-known-good creds (every
+# successful install seeds it and save_settings keeps it in sync).
+# Read from there. Best-effort — if the DB is also unreachable, fail
+# with the original error rather than a confusing secondary one.
 if [ -z "$API_URL" ] || [ -z "$API_KEY" ]; then
-    log "ERROR: /etc/vula/creds.env missing or incomplete"
-    exit 1
+    log "WARN: /etc/vula/creds.env missing or incomplete — attempting recovery from DB"
+    _recovered=""
+    if [ -x "$SOURCE_DIR/venv/bin/python3" ]; then
+        _recovered=$(sudo -u "$REAL_USER" env HOME="$REAL_HOME" \
+            "$SOURCE_DIR/venv/bin/python3" -c "
+import sys
+try:
+    sys.path.insert(0, '$SOURCE_DIR')
+    from vula_store import PrintStore
+    from vula_config import APP_DB_FILE
+    for c in PrintStore(APP_DB_FILE).list_connections():
+        if c.get('connection_id') == 'conn_1' and c.get('api_base_url') and c.get('api_key'):
+            print(f\"{c['api_base_url']}|{c['api_key']}\")
+            break
+except Exception as e:
+    print(f'RECOVERY_ERROR: {e}', file=sys.stderr)
+" 2>/dev/null || true)
+    fi
+    case "$_recovered" in
+        RECOVERY_ERROR*)
+            log "  DB recovery raised: ${_recovered#RECOVERY_ERROR: }"
+            _recovered=""
+            ;;
+    esac
+    if [ -n "$_recovered" ] && [ "$_recovered" != "" ]; then
+        API_URL="${_recovered%%|*}"
+        API_KEY="${_recovered##*|}"
+        install -d -m 0750 /etc/vula
+        (
+            umask 077
+            printf 'PRINTER_API_BASE_URL=%s\nPRINTER_API_KEY=%s\n' \
+                "$API_URL" "$API_KEY" > /etc/vula/creds.env
+        )
+        chown root:root /etc/vula/creds.env
+        chmod 0600 /etc/vula/creds.env
+        log "RECOVERED: /etc/vula/creds.env rebuilt from DB conn_1"
+    else
+        log "ERROR: creds.env missing AND DB recovery failed — cannot proceed"
+        log "  Fix manually:  sudo bash $SOURCE_DIR/install.sh --phase=print_app \\"
+        log "                    --api-url=<url> --api-key=<key>"
+        exit 1
+    fi
 fi
 
 # ── Re-run install.sh ───────────────────────────────────────────
