@@ -1,5 +1,205 @@
 # Changelog
 
+
+
+## [1.1.875] - 2026-10-22
+
+Sprint continuation. Closes every item from 1.1.874's "Known
+outstanding" list — including H11/H12 (the receipt price-column bug
+1.1.874 shipped unfixed), the log-file privacy items, and the
+log-upload consent gap. Adds a diagnostic audit script for field use.
+Rollback anchor: `pre-sprint-20261021`.
+
+**Caveats up front:** hardware verification (Phase 12.2/12.3) still
+has not been run. The receipt-renderer fixes are unit-tested and
+verified against the algorithm, but have not been exercised against a
+physical ESC/POS printer. Deploy to one staging device and run
+`print_audit.sh` before promoting to fleet.
+
+### Added
+- `print_audit.sh` — read-only diagnostic collector. Gathers system,
+  install state, printer devices, app state, update history, config,
+  and logs into a single tarball with all credentials redacted. Auto-
+  flags a summary of issues (stuck update counter, creds perms,
+  log perms, timer state, missing origin/main, etc.). Ships to field
+  via git; safe to email back. `--full` also captures `lsusb`/`dmesg`.
+- `X-Client-Version` header on every `HttpWorker` request, sourced
+  from `vula_config.APP_VERSION_SHORT`. Backend can answer "which
+  devices are on which build?" from the poll log alone — no extra
+  endpoint. `POSPollWorker` retains its own injection (direct
+  `requests`); both paths carry the header.
+- `_history_reprint_job` persistent reference on `VulaPrintApp` —
+  the reprint worker's QThread wrapper now outlives the C++ thread.
+  See Fixed below for the bug this closes.
+- Busy-file self-heal in `vula-update.sh`. `/tmp/vula-print-busy`
+  older than 3600 s is removed before proceeding; a crashed print
+  no longer permanently blocks updates.
+- Consecutive-failure tracker in `vula-update.sh`. Increments
+  `/var/lib/vula/update-failure-count` on failure, resets on success,
+  logs an ALERT at 3+. Surfaces silently-stuck devices — the previous
+  update path had no way to distinguish "working, nothing to do" from
+  "has been failing silently for weeks".
+- `install.sh --no-log-upload`. Writes `/etc/vula/log-upload-disabled`
+  (root-owned, 0644). App refuses to upload logs while present;
+  override requires `sudo rm`. Deliberately separate from the UI
+  toggle so a customer who declined at install cannot be silently
+  opted in by a later UI action.
+- Dirty-tree check in `install.sh`. Refuses to run if `install.sh`,
+  `uninstall.sh`, or `system/*` are dirty in git. Closes the gap
+  between `vula-update.sh --local` (which already refused) and direct
+  `sudo bash install.sh` (which did not). `--force-install` bypass
+  documented as the deliberate escape hatch.
+- Query-timer state in `install.sh` summary. Replaces a bare `list-
+  timers` line with per-timer enabled/active status and a description.
+  An installer that silently failed to enable `vula-print-update.timer`
+  is now flagged red in the summary instead of "all phases completed".
+- `desc_budget - 1` ellipsis in `POSSlipPrintJob._build_receipt_bytes`
+  item titles. Truncated titles now end in `…` instead of mid-character.
+
+### Changed
+- **`_col2` rewritten to fit-with-ellipsis** in both `POSSlipPrintJob`
+  and `POSEODReportPrintJob`. The previous version produced a line
+  wider than `width_chars` when `len(left) + len(right) + 1` exceeded
+  it, which `_txt` then truncated from the right — silently chopping
+  the money column off the receipt. The new version ellipsizes the
+  left column to make room for the right and never drops a price.
+  See Fixed below for the bug context.
+- `_col2`, `_line_sep`, and `_txt` in both receipt workers now truncate
+  on the fitted `_col2` output, not the raw pre-join string. A 32-char
+  58 mm receipt with a `R 123456.78` total prints intact.
+- **Log file chmod 0600 at open**, both fresh-install and legacy-upgrade
+  paths. `setup_logging` chmods the directory to 0700 and the file to
+  0600 idempotently; a pre-existing 0664 file from a prior install is
+  tightened on next launch. Logs contain device fingerprints and
+  backend 4xx response snippets.
+- **Auto-updater now runs `vula-update.sh`, not
+  `vula-print-update.sh`.** The latter had no health probe, no rollback,
+  and swallowed `pip install` failures — exactly the safety net 1.1.874
+  added to `vula-update.sh` but never wired to the timer. The daily
+  service now runs the path that self-rolls-back on failure.
+  `vula-print-update.sh` is retained for one release cycle for manual
+  callers and marked deprecated in its header.
+- `install.sh` phase order: `update_helpers` runs before `updater`.
+  The new `vula-print-update.service` points at `vula-update.sh`, which
+  is installed by `update_helpers`; reordering ensures a
+  `--phase=updater`-only run finds the binary.
+- App-update timer jitter increased from 5 m to 30 m. At 1000+ devices,
+  5 m meant the fleet converged on a single window — no time to abort a
+  bad commit before it hit everything. 30 m spreads rollout at zero
+  cost per-device.
+- `_on_exit` trap in `vula-update.sh` returns the original `$_rc`
+  explicitly. An `if` body that runs on the 3rd+ failure was implicitly
+  returning 0 — the shell would exit 0 despite a failed update, hiding
+  the exact failure the alert was trying to surface.
+- `--check` mode in `vula-update.sh` no longer resets the failure
+  counter. Diagnostic runs by an operator investigating a stuck device
+  were erasing the evidence of how long it had been stuck.
+- Busy-file check gains per-print "age ≥ 3600 s" self-heal. Without
+  it, a single SIGKILL'd print meant the device never updated again.
+- `install.sh` summary prints per-timer descriptions and severity:
+  green ✓ for active, yellow ! for enabled-but-inactive, dim ○ for
+  not-enabled. The single "auto-update WILL NOT run" line fired on
+  the AnyDesk handshake timer during a `--phase=preflight`-only run,
+  which is both wrong (AnyDesk ≠ auto-update) and alarming for a
+  legitimate partial-phase install.
+- `LogUploadCoordinator` suppression is now **per-connection**, keyed
+  by `connection_id`, not fleet-wide. One store returning 404
+  (backend endpoint not deployed) no longer silences uploads to a
+  healthy store on the same device.
+- Clamscan target list expanded from `$REAL_HOME` only to
+  `$REAL_HOME` + `/usr/local/bin` + `/usr/local/sbin` + `/etc/vula`.
+  A malware drop in a root-run script (e.g. a hook into
+  `vula-update.sh`) was previously scanned by nothing.
+
+### Fixed
+- **Reprint crash.** `_reprint_by_job_id` created the reprint worker
+  as a local variable with no persistent reference. When the slot
+  returned, Python dropped the last reference to the QThread wrapper
+  while the C++ thread was still running — Qt calls
+  `qFatal("QThread: Destroyed while thread is still running")` and
+  the whole app aborts. Symptom: click Reprint in History tab, UI
+  drops, manual restart required, reprint never completes. Fix keeps
+  a persistent `self._history_reprint_job` and adds a busy guard
+  against double-click. This bug was not in the original audit.
+- **History dialog reprint overwrites a running print.** Same class
+  of bug as above, on `_on_reprint_detail_fetched` in `vula_ui/history.py`.
+  Guarded by `_thread_alive(self.print_job)` check before assigning.
+- **`_start_label_print_from_cached` overwrites a running print.**
+  Same class again, on the label-print path in
+  `vula_ui/actions.py`. Guard runs *before* `mark_printing()` so a
+  lost CAS is not left stuck in `printing` status.
+- **`.isRunning()` on deleted C++ objects** replaced with the safe
+  `_thread_alive()` helper in 4 slots: `_on_poll_slip_ready`,
+  `_on_poll_eod_slip_ready`, `print_test_pos_slip`, `calibrate_printer`.
+  A previous thread that silently died left the wrapper pointing at a
+  destroyed C++ object; `.isRunning()` raised `RuntimeError` inside a
+  slot, which the excepthook logged but the Qt event loop continued
+  past — leaving the "A POS slip is already printing" busy state
+  permanently stuck.
+- **H11/H12 receipt price-column corruption.** `desc_budget` reserved
+  14 chars for the price but a `R 1234.56`-style total is 9; a wide
+  title + qty prefix + line total could exceed `width_chars` and
+  `_txt` truncated the price. Now `_col2` guarantees fit by ellipsizing
+  the left column (never the price) and `desc_budget` reserves 12 with
+  an explicit `…`. Verified against a synthetic 32-char test: all
+  wide-money lines fit and end in the intact price string.
+- **Log upload fleet-wide suppression.** `_suppress_until_ts` was a
+  single scalar; one store's 404 silenced uploads to every store. Now
+  keyed by `connection_id`. Multi-store devices keep uploading to
+  healthy backends during a partial-outage.
+- **Clamscan excludes never matched.** `clamscan --exclude-dir` matches
+  basenames, not paths. `^/proc`, `^/sys`, `^/dev`, `^/run`, and
+  `.config/vula_print` were syntactically valid and completely dead.
+  Removed; only the basenames (`venv`, `.cache`, `.mozilla`) that
+  actually fire are kept.
+- **udev rule `usb` line was dead.** Removed. Only `usbmisc` fires on
+  modern kernels; the parallel `usb` rule was cosmetic. A future
+  maintainer reading the rule file is no longer misled.
+- **`install.sh` header summary pointed at the deprecated command.**
+  Now prints `sudo /usr/local/bin/vula-update.sh`.
+- **`vula-print-update.service` `ExecStart=` referenced
+  `vula-print-update.sh` with `\${VAR}` args.** Replaced with an
+  unparameterised call to `vula-update.sh` (which sources install.env
+  itself). Eliminates the word-splitting hazard structurally rather
+  than by escaping.
+
+### Security
+- No new security surface introduced. The log-upload consent toggle
+  and the install-time hard-off file add an opt-out that did not
+  previously exist; they do not weaken any existing access control.
+- The dirty-tree check in `install.sh` restores the invariant that
+  `vula-update.sh --local` already enforced: privileged files cannot
+  be promoted to root paths from an uncommitted working tree.
+- Version reporting via `X-Client-Version` is non-sensitive (public
+  release number) and reachable only on already-authenticated
+  requests.
+
+### Known outstanding
+- **N72** — `vula-update.sh` merge step falls back to `origin/master`
+  on repos that only have `origin/main`. Manifests on this dev box
+  as "origin/master - not something we can merge" and a silent 13-day
+  update failure; would not affect fresh clones. Fix (SHA-validated
+  merge, `rev-parse --verify` per candidate, per-branch logging) is
+  designed and ready; must be applied and tested on one clean-clone
+  device **before** any stable fleet rollout.
+- **N70** — creds.env self-heal is in `vula-update.sh` (recovers from
+  `print_jobs.db` conn_1 if the file is missing). Exercised by `--check`
+  mode only on `--check` exit, so has not been end-to-end verified
+  against a full update. Will self-verify on the next real cycle.
+- **N71** — `vula-update.sh` health probe is a fixed 30 s window
+  requiring 15 s consecutive. Adequate for the PyQt app's ~2 s boot
+  time; may be tuned down in Phase 4 to reduce fleet update time.
+- **Design ready, not implemented** — Phase 4.2 force-update
+  (backend `GET /update-check` + 6 h timer), Phase 4.3 release
+  channels (`main` → `beta` → `stable` with backend promotion),
+  Phase 4.4 fleet version dashboard (backend work only, client
+  already reports via `X-Client-Version`).
+- **Hardware verification** — Phase 12.2 (USB printer-class, USB
+  serial @ 9600/115200, CUPS raw, 58 mm ESC/POS, 80 mm ESC/POS) and
+  Phase 12.3 (3-device staging dry-run) still not exercised against
+  physical hardware. `print_audit.sh` is the collection tool; run it
+  on one real client and ship the tarball before any fleet rollout.
+
 ## [1.1.874] - 2026-10-22
 
 Sprint: print-reliability + security hardening. Closes every fleet-blocking
