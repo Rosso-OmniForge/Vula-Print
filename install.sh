@@ -1722,6 +1722,16 @@ SHUTSVC_EOF
 
     cat > /usr/local/bin/vula-print-update.sh <<'APPUP_SCRIPT'
 #!/bin/bash
+# ═══════════════════════════════════════════════════════════════
+# DEPRECATED (Phase 3c, audit N68) — this script is no longer called
+# by vula-print-update.service. The daily timer now runs
+# /usr/local/bin/vula-update.sh, which has the same pull-and-apply
+# logic PLUS a health probe, automatic rollback, dirty-tree check, and
+# consecutive-failure tracking.
+#
+# Retained for one release cycle for operators with manual scripts
+# that invoke it. Scheduled for removal in the next major version.
+# ═══════════════════════════════════════════════════════════════
 # Pull the latest Vula Print source from GitHub and restart the service
 # if the HEAD commit changed. Refuses to run while a print job is in
 # flight (signalled by /tmp/vula-print-busy).
@@ -1803,15 +1813,16 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-# EnvironmentFile supplies REAL_USER and SOURCE_DIR to the script.
-# Using \${VAR} (not \$VAR) in ExecStart makes systemd pass the value
-# through as a single argument regardless of any spaces — fixes the
-# word-splitting hazard identified in audit H20. The "=" without "-"
-# would fail hard if the file is missing; "-" tolerates missing files
-# so a broken install.env surfaces as a clear error in the script's
-# own log rather than as a systemd unit-load failure.
-EnvironmentFile=-/etc/vula/install.env
-ExecStart=/usr/local/bin/vula-print-update.sh \${REAL_USER} \${SOURCE_DIR}
+# Runs vula-update.sh, not vula-print-update.sh (audit N68). The
+# difference matters: vula-update.sh performs a health probe after
+# restart and auto-rolls-back to last-known-good on failure.
+# vula-print-update.sh had neither, so a bad commit that started then
+# crashed became a permanent daily restart loop with no recovery.
+#
+# vula-update.sh sources /etc/vula/install.env itself (REAL_USER,
+# SOURCE_DIR) — no EnvironmentFile needed, no \${VAR} expansion in
+# ExecStart, so the word-splitting hazard (audit H20) cannot recur.
+ExecStart=/usr/local/bin/vula-update.sh
 Nice=19
 IOSchedulingClass=idle
 TimeoutStartSec=900
@@ -1823,7 +1834,13 @@ Description=Daily Vula Print source update at 04:05
 
 [Timer]
 OnCalendar=*-*-* 04:05:00
-RandomizedDelaySec=5m
+# 30m jitter (audit N66). With 1000+ devices and 5m jitter, the whole
+# fleet converges on the same 5-minute window: a bad commit hits every
+# device within 5m (no time to notice and abort), and any backend
+# dependency (version-tracking endpoint, package mirror) sees a burst.
+# 30m spreads the fleet over a reasonable window at zero cost to any
+# individual device.
+RandomizedDelaySec=30m
 Persistent=true
 
 [Install]
@@ -1900,8 +1917,13 @@ run_phase preflight "Preflight checks"          phase_preflight || FAILED=1
 [ "$FAILED" = "0" ] && { run_phase print_app "Print application"        phase_print_app || FAILED=1; }
 [ "$FAILED" = "0" ] && { run_phase anydesk   "AnyDesk remote access"    phase_anydesk   || FAILED=1; }
 [ "$FAILED" = "0" ] && { run_phase firefox   "Firefox provisioning"     phase_firefox   || FAILED=1; }
-[ "$FAILED" = "0" ] && { run_phase updater   "Auto-updater setup"       phase_updater   || FAILED=1; }
+# update_helpers runs BEFORE updater (audit N68). phase_updater writes
+# vula-print-update.service with ExecStart=/usr/local/bin/vula-update.sh,
+# which is installed by phase_update_helpers. Without this ordering, a
+# `--phase=updater`-only run would leave the timer pointing at a binary
+# that doesn't exist yet.
 [ "$FAILED" = "0" ] && { run_phase update_helpers "Manual update helpers" phase_update_helpers || FAILED=1; }
+[ "$FAILED" = "0" ] && { run_phase updater   "Auto-updater setup"       phase_updater   || FAILED=1; }
 
 # ── Summary ──────────────────────────────────────────────────
 section "Installation Summary"
@@ -1917,25 +1939,36 @@ echo "  Config:    /etc/vula/install.env  /etc/vula/creds.env"
 echo "  Restart:   systemctl --user restart vula-print    (as $REAL_USER)"
 echo "  Status:    systemctl --user status vula-print"
 echo "  App log:   journalctl --user -u vula-print -f"
-echo "  Update:    sudo /usr/local/bin/vula-print-update.sh $REAL_USER $SCRIPT_DIR"
+echo "  Update:    sudo /usr/local/bin/vula-update.sh"
 echo
 echo "  Timers (system):"
+# Per-timer description and severity (audit C.4 follow-up). A
+# partial-phase install (--phase=preflight) correctly shows some
+# timers as not-enabled — that is not an error, and labelling every
+# not-enabled timer as "auto-update WILL NOT run" was misleading
+# (the AnyDesk handshake timer has nothing to do with auto-update).
+# Yellow for enabled-but-inactive (unusual), dim for not-enabled
+# (often expected on partial installs), red only if the specific
+# timer is one this install SHOULD have enabled.
 for _t in vula-apt-upgrade.timer vula-clamscan.timer vula-print-update.timer vula-anydesk-handshake.timer; do
-    # Query actual state instead of just listing names (audit C.4).
-    # A prior version printed the names, which read as confirmation
-    # even when a timer had failed to install — the operator
-    # discovered the gap only when the fleet stopped updating.
+    case "$_t" in
+        vula-apt-upgrade.timer)       _desc="daily apt upgrade" ;;
+        vula-clamscan.timer)          _desc="daily ClamAV scan" ;;
+        vula-print-update.timer)      _desc="app auto-update" ;;
+        vula-anydesk-handshake.timer) _desc="AnyDesk handshake retry" ;;
+        *)                            _desc="timer" ;;
+    esac
     if [ "$DRY_RUN" = "1" ]; then
-        echo "    (dry) $_t"
+        echo "    (dry) $_t ($_desc)"
     elif systemctl is-enabled --quiet "$_t" 2>/dev/null; then
         _state=$(systemctl is-active "$_t" 2>/dev/null || echo unknown)
         if [ "$_state" = "active" ]; then
-            echo -e "    ${GREEN}✓${NC} $_t — enabled, active"
+            echo -e "    ${GREEN}✓${NC} $_t — enabled, active ($_desc)"
         else
-            echo -e "    ${YELLOW}!${NC} $_t — enabled, state=$_state (will activate on next boot)"
+            echo -e "    ${YELLOW}!${NC} $_t — enabled, state=$_state ($_desc)"
         fi
     else
-        echo -e "    ${RED}✗${NC} $_t — NOT ENABLED — auto-update WILL NOT run"
+        echo -e "    ${DIM}○${NC} $_t — not enabled ($_desc)"
     fi
 done
 echo

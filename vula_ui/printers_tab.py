@@ -110,6 +110,81 @@ class PrintersTabMixin:
         rescan_btn.clicked.connect(self.scan_for_printers)
         layout.addWidget(rescan_btn, alignment=Qt.AlignmentFlag.AlignLeft)
 
+        # ── Diagnostics & Privacy (audit B.1 / M1 / M36) ─────────
+        # Log-upload consent. Off by default for new consent flows,
+        # on for backwards compat (existing installs keep uploading
+        # until the operator explicitly opts out — flagging that
+        # change on the next session, but that's a fleet decision,
+        # not a code one).
+        privacy_card = QFrame()
+        privacy_card.setStyleSheet(f"""
+            QFrame {{
+                background:{self.C_SURFACE};
+                border:1px solid {self.C_BORDER};
+                border-radius:10px;
+            }}
+        """)
+        privacy_layout = QVBoxLayout(privacy_card)
+        privacy_layout.setContentsMargins(16, 12, 16, 12)
+        privacy_layout.setSpacing(6)
+
+        privacy_title = QLabel("Diagnostics & Privacy")
+        privacy_title.setStyleSheet(
+            f"color:{self.C_TEXT}; font-size:13px; font-weight:700;"
+        )
+        privacy_layout.addWidget(privacy_title)
+
+        privacy_sub = QLabel(
+            "When enabled, the app uploads its log file to the backend "
+            "at startup, every 6 hours, and on crash. Logs contain "
+            "diagnostic data — printer state, HTTP response codes, "
+            "device fingerprints — but no customer data. A hashed "
+            "device ID is sent so support can correlate uploads "
+            "without knowing store names."
+        )
+        privacy_sub.setWordWrap(True)
+        privacy_sub.setStyleSheet(f"color:{self.C_TEXT_DIM}; font-size:11px;")
+        privacy_layout.addWidget(privacy_sub)
+
+        # Install-time hard-off warning, if applicable.
+        from vula_config import LOG_UPLOAD_INSTALL_DISABLED
+        if LOG_UPLOAD_INSTALL_DISABLED:
+            warn_lbl = QLabel(
+                "ⓘ  Log upload is disabled by install policy and cannot "
+                "be changed here. To re-enable, run: "
+                "sudo rm /etc/vula/log-upload-disabled"
+            )
+            warn_lbl.setWordWrap(True)
+            warn_lbl.setStyleSheet(
+                f"color:{self.C_WARNING}; font-size:11px; font-weight:600;"
+            )
+            privacy_layout.addWidget(warn_lbl)
+
+        log_upload_row = QHBoxLayout()
+        log_upload_row.setSpacing(6)
+        log_upload_row.setContentsMargins(0, 4, 0, 0)
+
+        log_upload_lbl = QLabel("Send logs to backend")
+        log_upload_lbl.setStyleSheet(
+            f"color:{self.C_TEXT_DIM}; font-size:11px; font-weight:600;"
+        )
+        log_upload_btn = QPushButton("—")
+        log_upload_btn.setMinimumHeight(28)
+        log_upload_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        log_upload_btn.setCheckable(True)
+        log_upload_btn.setEnabled(not LOG_UPLOAD_INSTALL_DISABLED)
+        log_upload_btn.clicked.connect(self._toggle_log_upload)
+
+        log_upload_row.addWidget(log_upload_lbl)
+        log_upload_row.addWidget(log_upload_btn)
+        log_upload_row.addStretch()
+        privacy_layout.addLayout(log_upload_row)
+
+        self._log_upload_btn = log_upload_btn
+        self._refresh_log_upload_toggle()
+
+        layout.addWidget(privacy_card)
+
         # Start probe timer
         self._printer_probe_timer = QTimer()
         self._printer_probe_timer.timeout.connect(self._refresh_printer_status)
@@ -180,6 +255,76 @@ class PrintersTabMixin:
                 "Auto-print is OFF. Click to drain queued labels automatically. "
                 "Pauses on first failure."
             )
+
+    # ── Log upload consent toggle (audit B.1 / M1 / M36) ────────
+
+    def _toggle_log_upload(self) -> None:
+        """Flip the log-upload consent preference and persist it."""
+        from vula_config import LOG_UPLOAD_INSTALL_DISABLED
+        if LOG_UPLOAD_INSTALL_DISABLED:
+            QMessageBox.information(
+                self, "Disabled by Install",
+                "Log upload is disabled by install policy and cannot "
+                "be re-enabled from the UI.\n\n"
+                "To re-enable, run:\n"
+                "  sudo rm /etc/vula/log-upload-disabled"
+            )
+            return
+        self.log_upload_enabled = not getattr(self, "log_upload_enabled", True)
+        self.save_settings()
+        self._refresh_log_upload_toggle()
+        if self.log_upload_enabled:
+            self.status_bar.showMessage("Log upload enabled.")
+        else:
+            self.status_bar.showMessage("Log upload disabled.")
+
+    def _refresh_log_upload_toggle(self) -> None:
+        """Update the button's text/style to match the current value
+        of self.log_upload_enabled (or the install-time hard-off)."""
+        btn = getattr(self, "_log_upload_btn", None)
+        if btn is None:
+            return
+        from vula_config import LOG_UPLOAD_INSTALL_DISABLED
+        if LOG_UPLOAD_INSTALL_DISABLED:
+            btn.setChecked(False)
+            btn.setText("DISABLED")
+            btn.setStyleSheet(
+                f"QPushButton {{"
+                f"  background:{self.C_SURFACE2}; color:{self.C_TEXT_DIM};"
+                f"  border:1px solid {self.C_BORDER};"
+                f"  border-radius:5px; padding:5px 14px;"
+                f"  font-size:11px; font-weight:700;"
+                f"}}"
+            )
+            btn.setToolTip(
+                "Log upload is disabled by install policy. "
+                "Remove /etc/vula/log-upload-disabled to re-enable."
+            )
+            return
+        on = bool(getattr(self, "log_upload_enabled", True))
+        btn.setChecked(on)
+        btn.setText("ON" if on else "OFF")
+        if on:
+            btn.setStyleSheet(
+                f"QPushButton {{"
+                f"  background:{self.C_ORANGE}; color:#000; border:none;"
+                f"  border-radius:5px; padding:5px 14px;"
+                f"  font-size:11px; font-weight:700;"
+                f"}}"
+                f"QPushButton:hover {{ background:{self.C_ORANGE_HI}; }}"
+            )
+            btn.setToolTip("Log upload is ON. Click to disable.")
+        else:
+            btn.setStyleSheet(
+                f"QPushButton {{"
+                f"  background:{self.C_SURFACE2}; color:{self.C_TEXT_DIM};"
+                f"  border:1px solid {self.C_BORDER};"
+                f"  border-radius:5px; padding:5px 14px;"
+                f"  font-size:11px; font-weight:700;"
+                f"}}"
+                f"QPushButton:hover {{ border-color:{self.C_ORANGE}; color:{self.C_TEXT}; }}"
+            )
+            btn.setToolTip("Log upload is OFF. Click to enable.")
 
     # ── Card ────────────────────────────────────────────────────
 

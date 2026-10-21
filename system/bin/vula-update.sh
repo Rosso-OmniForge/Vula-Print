@@ -50,6 +50,50 @@ touch "$LOG"
 
 log() { echo "$(date -Iseconds) $*" | tee -a "$LOG"; }
 
+# ── Failure tracking (audit N60) ────────────────────────────────
+# If the update exits non-zero, the device didn't complete this cycle.
+# Track CONSECUTIVE failures. A single failure is a transient hiccup
+# (network, mirror); 3+ consecutive failures means the device is
+# permanently stuck — e.g. dirty tree, bad creds.env, corrupted venv.
+# Without this, the timer retries every 24h forever and nobody knows.
+# The trap fires on every exit path, including the explicit `exit 1`
+# sites below.
+_STATE_DIR=/var/lib/vula
+_FAILURE_FILE=$_STATE_DIR/update-failure-count
+mkdir -p "$_STATE_DIR" 2>/dev/null || true
+
+_on_exit() {
+    local _rc=$?
+    # --check mode is diagnostic only — it doesn't attempt an update,
+    # so it must not reset the consecutive-failure counter. An operator
+    # investigating a stuck device runs --check; a subsequent update
+    # attempt should still be counted as the Nth consecutive failure.
+    if [ "$CHECK_ONLY" = "1" ]; then
+        return "$_rc"
+    fi
+    if [ "$_rc" -eq 0 ]; then
+        # Success resets the counter — this cycle ended cleanly.
+        echo 0 > "$_FAILURE_FILE" 2>/dev/null || true
+        return 0
+    fi
+    local _n
+    _n=$(cat "$_FAILURE_FILE" 2>/dev/null || echo 0)
+    case "$_n" in (*[!0-9]*|'') _n=0 ;; esac
+    _n=$((_n + 1))
+    echo "$_n" > "$_FAILURE_FILE" 2>/dev/null || true
+    if [ "$_n" -ge 3 ]; then
+        log "ALERT: $_n consecutive update failures — this device is stuck."
+        log "  Investigate:  tail -100 $LOG"
+        log "  Git state:    sudo -u ${REAL_USER:-?} git -C ${SOURCE_DIR:-?} status"
+        log "  Auth check:   sudo /usr/local/bin/vula-update.sh --check"
+    fi
+    # Explicitly return the original rc — without this, the `if` above
+    # returns 0 when its body runs (i.e. on the 3rd+ failure), which
+    # would silently make the shell exit 0 despite a failed update.
+    return "$_rc"
+}
+trap '_on_exit' EXIT
+
 log "════════════════════════════════════════════════════"
 log "Update started (LOCAL=$LOCAL CHECK=$CHECK_ONLY NO_APT=$NO_APT)"
 log "════════════════════════════════════════════════════"
@@ -153,6 +197,28 @@ if [ "$CHECK_ONLY" = "1" ]; then
         log "not a git checkout — cannot check for updates"
     fi
     exit 0
+fi
+
+# ── Busy-file check (audit N61) ─────────────────────────────────
+# The app sets /tmp/vula-print-busy while a job is printing. Without
+# this check, an update can SIGTERM the service mid-print — the job
+# aborts, the operator reprints manually, wasted labels.
+#
+# Self-heal: if the app crashes (or is SIGKILL'd) while busy, the file
+# never gets cleared. Without a stale-check, the device would never
+# update again — silently, forever. 3600s is generous — no real print
+# job on a POS terminal runs longer than a few minutes. Beyond that,
+# assume the flag is orphaned and proceed.
+if [ -e /tmp/vula-print-busy ]; then
+    _busy_mtime=$(stat -c %Y /tmp/vula-print-busy 2>/dev/null || echo 0)
+    _busy_age=$(($(date +%s) - _busy_mtime))
+    if [ "$_busy_age" -gt 3600 ]; then
+        log "WARN: /tmp/vula-print-busy is ${_busy_age}s old (stale) — removing and proceeding"
+        rm -f /tmp/vula-print-busy
+    else
+        log "SKIP: print in progress (/tmp/vula-print-busy, ${_busy_age}s old) — refusing to update"
+        exit 0
+    fi
 fi
 
 # ── Stop printer service ────────────────────────────────────────

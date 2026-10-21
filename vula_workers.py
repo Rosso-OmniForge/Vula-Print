@@ -1140,7 +1140,17 @@ class POSPollWorker(QThread):
         self.finished.connect(self.deleteLater)
 
     def _headers(self) -> Dict[str, str]:
-        headers = {"X-Printer-API-Key": self._api_key}
+        # Client version header (audit N62). The backend needs to know
+        # which build each device is running so fleet rollout is
+        # verifiable — otherwise a bad update that rolls back per-device
+        # is invisible at the fleet level. Cheap to send per-poll;
+        # expensive to reconstruct from 6-hourly log uploads (or
+        # impossible if the operator disabled log upload).
+        from vula_config import APP_VERSION_SHORT
+        headers = {
+            "X-Printer-API-Key": self._api_key,
+            "X-Client-Version": APP_VERSION_SHORT,
+        }
         if self._user_id:
             headers["X-Printer-User-Id"] = str(self._user_id)
         return headers
