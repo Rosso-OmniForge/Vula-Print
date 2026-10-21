@@ -108,6 +108,12 @@ class ActionsMixin:
         return False if the job isn't in a pre-print state, and this
         method then bails silently (with a status-bar note).
         """
+        # Guard against overwriting a running self.print_job. Must run
+        # BEFORE mark_printing() — if we won the CAS and then bailed on
+        # the busy guard, the job would be stuck in 'printing' forever.
+        if self._thread_alive(getattr(self, "print_job", None)):
+            self.status_bar.showMessage("A print is already in progress")
+            return
         job_id = int(cached_row["id"])
         label_printer = self.printer_roles.get("label") or ""
 
@@ -204,7 +210,7 @@ class ActionsMixin:
             QMessageBox.warning(self, "No Printer", "Please select a printer first.")
             return
 
-        if self.calibration_job and self.calibration_job.isRunning():
+        if self._thread_alive(self.calibration_job):
             QMessageBox.information(self, "Calibration In Progress", "Calibration is already running.")
             return
 
@@ -400,7 +406,7 @@ class ActionsMixin:
         if not pos_printer:
             QMessageBox.warning(self, "No POS Printer", "Please select a POS slip printer first.")
             return
-        if self.pos_print_job and self.pos_print_job.isRunning():
+        if self._thread_alive(self.pos_print_job):
             QMessageBox.information(self, "POS Print Busy", "A POS slip is already printing.")
             return
 

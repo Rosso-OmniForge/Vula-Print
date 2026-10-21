@@ -153,7 +153,7 @@ class POSMixin:
         conn = self.get_connection_by_id(connection_id)
         if not conn:
             return
-        if self.pos_print_job is not None and self.pos_print_job.isRunning():
+        if self._thread_alive(self.pos_print_job):
             return
         pos_printer = self.printer_roles.get("pos_slip")
         if not pos_printer:
@@ -313,7 +313,7 @@ class POSMixin:
         conn = self.get_connection_by_id(connection_id)
         if not conn:
             return
-        if self.pos_eod_print_job is not None and self.pos_eod_print_job.isRunning():
+        if self._thread_alive(self.pos_eod_print_job):
             return
         pos_printer = self.printer_roles.get("pos_slip")
         if not pos_printer:

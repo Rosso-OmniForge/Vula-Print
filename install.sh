@@ -52,6 +52,13 @@ SKIP_ANYDESK=0
 SKIP_UPDATER=0
 APT_ON_SHUTDOWN=0
 ALLOW_SSH=0
+# Privacy (audit B.1/M36): opt out of log upload at install time.
+# Creates /etc/vula/log-upload-disabled (root 0644). The app refuses
+# to upload logs while that file exists — see vula_config.py and
+# vula_log_uploader.py. Removing the file requires sudo, so an
+# operator cannot silently re-enable uploads for a customer who
+# declined them at install.
+SKIP_LOG_UPLOAD=0
 
 for arg in "$@"; do
     case "$arg" in
@@ -71,6 +78,7 @@ for arg in "$@"; do
         --no-updater)       SKIP_UPDATER=1 ;;
         --apt-on-shutdown)  APT_ON_SHUTDOWN=1 ;;
         --allow-ssh)        ALLOW_SSH=1 ;;
+        --no-log-upload)    SKIP_LOG_UPLOAD=1 ;;
         --help|-h)
             awk '
                 /^# ═{10,}/ { if (seen) exit; seen=1; next }
@@ -259,6 +267,38 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 VULA_VERSION=$(cat "$SCRIPT_DIR/VERSION" 2>/dev/null | tr -d '[:space:]')
 [ -n "$VULA_VERSION" ] || VULA_VERSION="unknown"
 
+# ── Dirty-tree check (audit C.3) ────────────────────────────────
+# install.sh copies $SCRIPT_DIR/{install.sh,uninstall.sh,system/} to
+# root-owned paths. If those files have uncommitted changes, an
+# unprivileged user can promote arbitrary code to root. vula-update.sh
+# --local already refuses this; the direct `sudo bash install.sh`
+# path did not — close the gap here.
+#
+# Skipped when:
+#   * --force-install — explicit override (e.g. mid-conflict recovery)
+#   * --dry-run — dry-run must always walk the full path
+#   * not a git checkout — no way to check
+#
+# App code (vula_*.py, requirements_app.txt, etc.) is NOT checked —
+# only the privileged-install paths. Deploying a bugfix via
+# `bash install.sh --phase=print_app` on a running box remains
+# permitted, same rationale as vula-update.sh --local.
+if [ "$FORCE_INSTALL" != "1" ] && [ "$DRY_RUN" != "1" ] && [ -d "$SCRIPT_DIR/.git" ]; then
+    _priv_dirty=$(sudo -u "$REAL_USER" git -C "$SCRIPT_DIR" status --porcelain -- \
+        install.sh uninstall.sh system/ 2>/dev/null || true)
+    if [ -n "$_priv_dirty" ]; then
+        err "Privileged-install paths are dirty — refusing to continue:"
+        printf '%s\n' "$_priv_dirty" | while IFS= read -r _ln; do err "  $_ln"; done
+        err ""
+        err "These files are copied to root-owned paths. Commit, stash, or revert first:"
+        err "  sudo -u $REAL_USER git -C $SCRIPT_DIR stash push -- install.sh uninstall.sh system/"
+        err "  sudo -u $REAL_USER git -C $SCRIPT_DIR checkout -- install.sh uninstall.sh system/"
+        err ""
+        err "Or bypass with --force-install (not recommended — breaks the invariant)."
+        exit 1
+    fi
+fi
+
 # ── system/ tree helpers ──────────────────────────────────────────
 # Every file install.sh places under /usr/local/bin, /etc/systemd,
 # /etc/polkit-1, or /etc/udev comes from $SCRIPT_DIR/system/. The
@@ -403,6 +443,33 @@ fi
 # vula-update.sh (systemd, no TTY) reads this to know who the
 # operator user is before it can re-invoke install.sh.
 write_install_env
+
+# ── Privacy: install-time log-upload opt-out ───────────────────
+# Written BEFORE any phase runs so it's in place by the time the app
+# first launches (phase_print_app starts vula-print.service). Removing
+# the file is a sudo operation — this is a customer-facing
+# confidentiality contract, not a UI preference.
+if [ "$SKIP_LOG_UPLOAD" = "1" ]; then
+    if [ "$DRY_RUN" = "1" ]; then
+        dim "DRY: touch /etc/vula/log-upload-disabled"
+    else
+        install -d -m 0750 /etc/vula
+        cat > /etc/vula/log-upload-disabled <<'LOG_OFF_EOF'
+# Present => vula-print refuses to upload logs to any backend.
+# Created by `install.sh --no-log-upload`.
+# Remove with:  sudo rm /etc/vula/log-upload-disabled
+LOG_OFF_EOF
+        chown root:root /etc/vula/log-upload-disabled
+        chmod 0644 /etc/vula/log-upload-disabled
+        ok "Log upload disabled (/etc/vula/log-upload-disabled)"
+    fi
+elif [ -f /etc/vula/log-upload-disabled ]; then
+    # Reinstall without --no-log-upload: do NOT silently re-enable.
+    # The operator ran the opt-out once; a routine reinstall should
+    # not undo it. Explicit removal is a deliberate action.
+    warn "Log upload is currently disabled (/etc/vula/log-upload-disabled)."
+    warn "  To re-enable:  sudo rm /etc/vula/log-upload-disabled"
+fi
 
 # ── Banner ───────────────────────────────────────────────────────
 echo
@@ -816,18 +883,27 @@ fi
     echo "════════════════════════════════════════════════════"
 } >> "$LOG"
 
+# Scan targets — defence in depth (audit A.5):
+#   * $REAL_HOME — user config + app data.
+#   * /usr/local/bin, /usr/local/sbin — root-owned scripts that the
+#     auto-updater invokes; a drop in one of these was previously
+#     scanned by nothing.
+#   * /etc/vula — installer-written configs and credentials.
+scan_targets=( "$REAL_HOME" /usr/local/bin /usr/local/sbin /etc/vula )
+
+# NOTE (audit N48): clamscan's --exclude-dir matches BASENAMES, not
+# paths. The old patterns (^/proc, \.config/vula_print) never matched
+# anything because the anchor or slash was wrong. The dead path
+# patterns are removed; the basename patterns that actually work are
+# kept. --exclude-dir='proc' would be added back if we ever expand to
+# a full-FS scan.
 nice -n 19 ionice -c3 clamscan \
     --recursive=yes \
     --infected \
-    --exclude-dir='^/proc' \
-    --exclude-dir='^/sys' \
-    --exclude-dir='^/dev' \
-    --exclude-dir='^/run' \
     --exclude-dir='venv' \
     --exclude-dir='\.cache' \
     --exclude-dir='\.mozilla' \
-    --exclude-dir='\.config/vula_print' \
-    "$REAL_HOME" >> "$LOG" 2>&1
+    "${scan_targets[@]}" >> "$LOG" 2>&1
 
 echo "Scan finished: $(date -Iseconds)" >> "$LOG"
 CLAM_SCRIPT_EOF
@@ -1755,9 +1831,17 @@ WantedBy=timers.target
 APPUPTIMER_EOF
 
     run systemctl daemon-reload
-    run systemctl enable --now vula-print-update.timer >/dev/null 2>&1 || \
-        warn "Could not start app-update timer."
-    ok "App auto-update scheduled (daily 04:05)."
+    if ! run systemctl enable --now vula-print-update.timer >/dev/null 2>&1; then
+        warn "Could not enable vula-print-update.timer — auto-update is DISABLED on this device."
+        warn "  Fix:  sudo systemctl enable --now vula-print-update.timer"
+        warn "  The Installation Summary below will flag this as NOT ENABLED."
+        # Deliberately not a hard fail: the app itself works fine; only
+        # future updates are affected. The summary at the bottom of the
+        # install makes this visible so the operator can fix it before
+        # shipping the device.
+    else
+        ok "App auto-update scheduled (daily 04:05)."
+    fi
 
     return 0
 }
@@ -1836,7 +1920,24 @@ echo "  App log:   journalctl --user -u vula-print -f"
 echo "  Update:    sudo /usr/local/bin/vula-print-update.sh $REAL_USER $SCRIPT_DIR"
 echo
 echo "  Timers (system):"
-echo "    systemctl list-timers vula-apt-upgrade.timer vula-clamscan.timer vula-print-update.timer vula-anydesk-handshake.timer"
+for _t in vula-apt-upgrade.timer vula-clamscan.timer vula-print-update.timer vula-anydesk-handshake.timer; do
+    # Query actual state instead of just listing names (audit C.4).
+    # A prior version printed the names, which read as confirmation
+    # even when a timer had failed to install — the operator
+    # discovered the gap only when the fleet stopped updating.
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "    (dry) $_t"
+    elif systemctl is-enabled --quiet "$_t" 2>/dev/null; then
+        _state=$(systemctl is-active "$_t" 2>/dev/null || echo unknown)
+        if [ "$_state" = "active" ]; then
+            echo -e "    ${GREEN}✓${NC} $_t — enabled, active"
+        else
+            echo -e "    ${YELLOW}!${NC} $_t — enabled, state=$_state (will activate on next boot)"
+        fi
+    else
+        echo -e "    ${RED}✗${NC} $_t — NOT ENABLED — auto-update WILL NOT run"
+    fi
+done
 echo
 echo "  ⚠  IMPORTANT — first install only:"
 echo "     Group memberships (lp, dialout, lpadmin, video, audio) added"

@@ -453,10 +453,27 @@ class POSSlipPrintJob(QThread):
         return ch * self.width_chars
 
     def _col2(self, left: str, right: str) -> str:
+        """Two-column layout. Guarantees the result fits within
+        width_chars by truncating the LEFT column (with an ellipsis) —
+        NEVER the right. Without this, a long left column (long
+        product title + qty) plus a long right column (large-rand
+        line total) produced a line wider than width_chars, which
+        _txt then hard-truncated from the right, silently chopping
+        the money column off the receipt (audit H11)."""
         l = str(left or "")
         r = str(right or "")
-        space = max(1, self.width_chars - len(l) - len(r))
-        return f"{l}{' ' * space}{r}"
+        if len(r) >= self.width_chars:
+            # Right column alone fills/exceeds the line. Give it the
+            # whole line — left dropped, price preserved.
+            return r[: self.width_chars]
+        avail = self.width_chars - len(r) - 1  # one separator space
+        if len(l) > avail:
+            if avail >= 2:
+                l = l[: avail - 1] + "…"
+            else:
+                l = l[:avail]
+        pad = self.width_chars - len(l) - len(r)
+        return f"{l}{' ' * pad}{r}"
 
     def _txt(self, text: str = "") -> bytes:
         # Strip control bytes (ESC/POS injection vectors) but preserve
@@ -767,19 +784,25 @@ class POSSlipPrintJob(QThread):
         out += self._esc(ESC, 0x45, 0x00)
         out += self._txt(self._line_sep())
 
-        # Per-item description budget: total width minus qty prefix (4) and
-        # price column (14). Clamped to at least 8 chars.
-        desc_budget = max(8, self.width_chars - 4 - 14)
+        # Per-item description budget: soft cap on the title column so
+        # the layout stays visually consistent across prices. The _col2
+        # helper does the definitive fit (and ellipsis) based on the
+        # actual price width. Without both, long titles either truncated
+        # mid-word (audit H12) or pushed the price off the receipt
+        # (audit H11 — 5+ rand-digit line totals on 58 mm receipts).
+        desc_budget = max(8, self.width_chars - 4 - 12)
 
         for item in items:
             qty = int(item.get("qty", 0) or 0)
             title = str(item.get("title", ""))
+            if len(title) > desc_budget:
+                title = title[: desc_budget - 1] + "…"
             variant = str(item.get("variant_label", ""))
             sku = str(item.get("sku", ""))
             unit_price = f"{cur} {self._cents_to_amount(item.get('unit_price_cents', 0) or 0)}"
             line_total = f"{cur} {self._cents_to_amount(item.get('line_total_cents', 0) or 0)}"
 
-            out += self._txt(self._col2(f"{qty} x {title[:desc_budget]}", line_total))
+            out += self._txt(self._col2(f"{qty} x {title}", line_total))
             if variant:
                 out += self._txt(f"  {variant[: self.width_chars - 2]}")
             if sku:
@@ -933,10 +956,27 @@ class POSEODReportPrintJob(QThread):
         return ch * self.width_chars
 
     def _col2(self, left: str, right: str) -> str:
+        """Two-column layout. Guarantees the result fits within
+        width_chars by truncating the LEFT column (with an ellipsis) —
+        NEVER the right. Without this, a long left column (long
+        product title + qty) plus a long right column (large-rand
+        line total) produced a line wider than width_chars, which
+        _txt then hard-truncated from the right, silently chopping
+        the money column off the receipt (audit H11)."""
         l = str(left or "")
         r = str(right or "")
-        space = max(1, self.width_chars - len(l) - len(r))
-        return f"{l}{' ' * space}{r}"
+        if len(r) >= self.width_chars:
+            # Right column alone fills/exceeds the line. Give it the
+            # whole line — left dropped, price preserved.
+            return r[: self.width_chars]
+        avail = self.width_chars - len(r) - 1  # one separator space
+        if len(l) > avail:
+            if avail >= 2:
+                l = l[: avail - 1] + "…"
+            else:
+                l = l[:avail]
+        pad = self.width_chars - len(l) - len(r)
+        return f"{l}{' ' * pad}{r}"
 
     def _txt(self, text: str = "") -> bytes:
         # Same control-byte strip + non-ASCII preservation as

@@ -119,6 +119,9 @@ class VulaPrintApp(
         self._selected_request: Optional[Dict[str, Any]] = None   # tracks table selection
         self._current_print_request: Optional[Dict[str, Any]] = None  # for history
         self._current_print_job_id: Optional[int] = None  # store row for in-flight job
+        # HistoryTabMixin reprint worker — persistent ref so the QThread
+        # wrapper outlives the C++ thread (Qt aborts if not).
+        self._history_reprint_job = None
 
         self.logo_dark_url = ""
         self.logo_light_url = ""

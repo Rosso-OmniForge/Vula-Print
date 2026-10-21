@@ -178,6 +178,17 @@ class HistoryMixin:
             QMessageBox.warning(self, "No Printer", "Please select a printer first.")
             return
 
+        # Guard against overwriting a running self.print_job. Without this,
+        # clicking Reprint while a label print is in flight drops the old
+        # wrapper's only Python reference while its QThread is still
+        # running -> Qt aborts ("QThread: Destroyed while thread is still
+        # running").
+        if self._thread_alive(getattr(self, "print_job", None)):
+            QMessageBox.information(
+                self, "Busy", "A print is already in progress.",
+            )
+            return
+
         confirm = QMessageBox.question(
             self, "Confirm Reprint",
             f"Reprint request #{request_id} ({conn.name})?\n"

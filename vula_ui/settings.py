@@ -87,6 +87,12 @@ class SettingsMixin:
             self.pos_qr_module_px = int(data.get("pos_qr_module_px", 4) or 4)
             self.serial_config = data.get("serial_config") or {}
             self.printer_role_fingerprints = data.get("printer_role_fingerprints") or {}
+            # Privacy: log upload consent (audit B.1 / M1 / M36).
+            # Default True for backwards compatibility — existing
+            # installs keep uploading until the operator explicitly
+            # opts out via the settings toggle. New installs can also
+            # be pre-disabled at install time (--no-log-upload).
+            self.log_upload_enabled = bool(data.get("log_upload_enabled", True))
 
             from vula_config import DEFAULT_LABEL_LAYOUT
             layout_from_disk = data.get("label_layout") or {}
@@ -156,6 +162,9 @@ class SettingsMixin:
                 ),
                 "label_layout": dict(
                     getattr(self, "label_layout", {}) or {}
+                ),
+                "log_upload_enabled": bool(
+                    getattr(self, "log_upload_enabled", True)
                 ),
             }
             with open(APP_CONFIG_FILE, "w", encoding="utf-8") as f:

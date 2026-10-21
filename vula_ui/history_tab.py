@@ -402,6 +402,16 @@ class HistoryTabMixin:
     # ── Reprint ─────────────────────────────────────────────────
 
     def _reprint_by_job_id(self, job_id: int) -> None:
+        # QThread lifetime: the wrapper must outlive the running C++ thread,
+        # or Qt calls qFatal("QThread: Destroyed while thread is still
+        # running") and the whole app aborts. Keep a persistent reference on
+        # self and let the next reprint overwrite it — do NOT clear in the
+        # completion handler, which runs while the thread is still alive.
+        if self._thread_alive(getattr(self, "_history_reprint_job", None)):
+            QMessageBox.information(
+                self, "Reprint", "A reprint is already in progress.",
+            )
+            return
         job = self._store.get_job(int(job_id))
         if not job:
             QMessageBox.warning(self, "Reprint", "Job no longer in store.")
@@ -467,6 +477,10 @@ class HistoryTabMixin:
             lambda s, m, jid=int(job_id), dc=doc_class:
             self._on_history_reprint_finished(s, m, jid, dc)
         )
+        # Persistent ref — see comment at the top of this method. The local
+        # `job_obj` drops on function return, and the worker's own stack
+        # may not yet hold `self` — that window is the crash.
+        self._history_reprint_job = job_obj
         job_obj.start()
         self.status_bar.showMessage(
             f"Reprinting {doc_class} #{job.get('request_id')}..."

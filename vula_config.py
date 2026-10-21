@@ -56,6 +56,15 @@ DEFAULT_LABEL_LAYOUT = {
 APP_CONFIG_FILE = Path.home() / ".config" / "vula_print" / "settings.json"
 APP_HISTORY_FILE = Path.home() / ".config" / "vula_print" / "print_history.json"
 APP_DB_FILE = Path.home() / ".config" / "vula_print" / "print_jobs.db"
+# Install-time hard-off for log upload (audit B.1 / M36). Written by
+# install.sh --no-log-upload. Readable by the app (0644 root:root);
+# when present, uploads are disabled regardless of the UI toggle.
+# Deliberately separate from settings.json — settings.json lives under
+# $REAL_HOME and is user-editable; this file is root-owned so an
+# operator cannot silently re-enable uploads for a customer who
+# declined them at install time. Removing it requires sudo.
+LOG_UPLOAD_INSTALL_DISABLED_FILE = Path("/etc/vula/log-upload-disabled")
+LOG_UPLOAD_INSTALL_DISABLED = LOG_UPLOAD_INSTALL_DISABLED_FILE.exists()
 MAX_STORE_CONNECTIONS = 4
 PRINTER_ROLES = ("label", "pos_slip", "a4")
 

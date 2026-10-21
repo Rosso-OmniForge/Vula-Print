@@ -1,4 +1,7 @@
-# v2 — Vula! Print. Covers both kernel subsystems that have hosted
-# USB printer-class nodes across recent Debian releases.
-SUBSYSTEM=="usb",     KERNEL=="lp[0-9]*", GROUP="lp", MODE="0660"
+# v3 — Vula! Print. Only the usbmisc subsystem.
+#
+# The `SUBSYSTEM=="usb"` line was removed (audit C2): modern kernels
+# (5.14+) moved USB printer-class nodes from /sys/class/usb/ to
+# /sys/class/usbmisc/. The usb rule was dead — never matched on any
+# Debian 13 install. Keeping it was harmless but confusing.
 SUBSYSTEM=="usbmisc", KERNEL=="lp[0-9]*", GROUP="lp", MODE="0660"

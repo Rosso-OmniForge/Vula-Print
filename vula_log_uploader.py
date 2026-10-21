@@ -114,7 +114,12 @@ class LogUploadCoordinator:
     def __init__(self, app):
         self._app = app
         self._last_upload_ts: float = 0.0
-        self._suppress_until_ts: float = 0.0
+        # Per-connection suppression (audit N52). Was a single scalar,
+        # which meant one store's 404 (endpoint not deployed) silenced
+        # uploads to ALL stores for 24 h — including stores whose
+        # backend had been updated. Keyed on connection_id now so
+        # each store's suppression is independent.
+        self._suppress_until_by_conn: Dict[str, float] = {}
         self._last_trigger: str = ""
 
     # ── Public API ───────────────────────────────────────────────────
@@ -125,12 +130,29 @@ class LogUploadCoordinator:
         Safe to call from the Qt main thread. Upload is off-thread via
         HttpWorker (same mechanism the rest of the app uses).
         """
-        now = time.monotonic()
-        if now < self._suppress_until_ts:
+        # Privacy gate (audit B.1 / M1 / M36). Two independent checks:
+        #   1. Install-time hard-off file (root-owned). If the operator
+        #      ran `install.sh --no-log-upload`, this is present and
+        #      cannot be overridden from the UI.
+        #   2. Per-user settings toggle. Defaults to True for backwards
+        #      compatibility with existing installs.
+        from vula_config import LOG_UPLOAD_INSTALL_DISABLED
+        if LOG_UPLOAD_INSTALL_DISABLED:
             _log.debug(
-                "log upload suppressed for %.0fs (trigger=%s)",
-                self._suppress_until_ts - now, trigger_reason,
+                "log upload disabled at install time (trigger=%s)",
+                trigger_reason,
             )
+            return
+        if not getattr(self._app, "log_upload_enabled", True):
+            _log.debug(
+                "log upload disabled in settings (trigger=%s)",
+                trigger_reason,
+            )
+            return
+
+        now = time.monotonic()
+        active = getattr(self._app, "active_connections", []) or []
+        if not active:
             return
 
         content, line_count = _tail_log()
@@ -138,8 +160,15 @@ class LogUploadCoordinator:
             _log.debug("log upload skipped — no content (trigger=%s)", trigger_reason)
             return
 
-        active = getattr(self._app, "active_connections", []) or []
-        if not active:
+        eligible = [
+            c for c in active
+            if now >= self._suppress_until_by_conn.get(c.connection_id, 0.0)
+        ]
+        if not eligible:
+            _log.debug(
+                "log upload suppressed for all %d connection(s) (trigger=%s)",
+                len(active), trigger_reason,
+            )
             return
 
         self._last_upload_ts = now
@@ -151,7 +180,7 @@ class LogUploadCoordinator:
             "trigger": trigger_reason,
         }
 
-        for conn in active:
+        for conn in eligible:
             self._post_one(conn, content, line_count, trigger_reason, meta)
 
     # ── Internals ────────────────────────────────────────────────────
@@ -167,8 +196,21 @@ class LogUploadCoordinator:
         # Import here so the module can be loaded without PyQt available
         # (e.g. from a pure-python test harness).
         from vula_http import HttpWorker
+        # Privacy (audit B.2 / M35): raw hostnames (e.g.
+        # "sandton-store-pos-02") identify a specific device in every
+        # uploaded log. A truncated SHA-256 is:
+        #   * stable per device — an admin can correlate uploads
+        #     across the fleet without seeing the location name;
+        #   * non-identifying — cannot be reversed without the
+        #     preimage, and store names are not in a searchable list.
+        # 16 hex chars = 64 bits of collision resistance, ample for
+        # per-store correlation.
         try:
-            hostname = socket.gethostname()[:128]
+            import hashlib as _hashlib
+            raw_host = socket.gethostname()
+            hostname = _hashlib.sha256(
+                raw_host.encode("utf-8", errors="replace")
+            ).hexdigest()[:16]
         except Exception:
             hostname = ""
 
@@ -214,6 +256,8 @@ class LogUploadCoordinator:
             return
         # 404 = endpoint not deployed yet. Suppress for a long time so we
         # don't spam the log on every tick. 401 = bad key — also long.
+        # Suppression is per-connection (audit N52) so one store's
+        # stale backend does not silence uploads to healthy stores.
         if result.status in (401, 403, 404):
             _log.warning(
                 "log upload disabled for %d h: %s returned HTTP %d (trigger=%s). "
@@ -221,7 +265,9 @@ class LogUploadCoordinator:
                 SUPPRESS_AFTER_404_SECONDS // 3600,
                 conn.name, result.status, trigger_reason,
             )
-            self._suppress_until_ts = time.monotonic() + SUPPRESS_AFTER_404_SECONDS
+            self._suppress_until_by_conn[conn.connection_id] = (
+                time.monotonic() + SUPPRESS_AFTER_404_SECONDS
+            )
             return
         # Transient error — log once, caller will retry on next tick.
         _log.info(
