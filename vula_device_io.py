@@ -128,14 +128,50 @@ def write_to_device(path: str, data: bytes) -> None:
 
 def _write_file(path: str, data: bytes) -> None:
     log = logging.getLogger("vula.device")
+
+    # ── Why no fsync (audit N84) ────────────────────────────────
+    # A 1.1.875 fix added os.fsync() after flush() to "detect a
+    # device that closed mid-write." That was wrong. Character
+    # devices do not universally implement fsync. Concretely:
+    #
+    #   * kernel 6.12 (Debian 13) — usblp returns EINVAL from fsync
+    #     on EVERY call, regardless of payload size. Every print
+    #     after 1.1.875 was reported as failed despite the printer
+    #     receiving the bytes. Verified on Vendor 2026-10-22:
+    #     `write(3323b)+flush+fsync` → EINVAL; `write(3323b)+flush`
+    #     → PASS. Adapter is Prolific 067b:2305 PL2305.
+    #   * kernel 6.17 (Ubuntu 25.10) — similar class of failure
+    #     reported on byatdbn client; chunked writes appeared to
+    #     work, but that test also used fsync, so we cannot
+    #     distinguish "fsync bug" from "write bug" there yet. The
+    #     chunking below covers both cases.
+    #
+    # Correct safety mechanism: after write() + flush() returns,
+    # the data is in the kernel/driver buffer. The select() probe
+    # below detects a driver that actually failed to accept the
+    # write (closed device, EOF). That probe works on any driver
+    # regardless of fsync support.
+
+    # ── Chunked writes (audit N83) ──────────────────────────────
+    # Some USB-to-parallel adapters (067b:2305 and relatives) reject
+    # single write() calls above ~500b on newer kernels. Chunk into
+    # 512b with a small inter-chunk delay. Small payloads take the
+    # single-write fast path with no added latency.
+    _CHUNK = 512
+    _DELAY = 0.02
+
     with open(path, "wb") as f:
-        f.write(data)
-        f.flush()
-        # Force the kernel to push the entire buffer to the USB device
-        # before returning. flush() only empties Python's userspace
-        # buffer — the kernel may still hold the tail of the receipt.
-        # fsync surfaces driver-level write failures that flush() hides.
-        os.fsync(f.fileno())
+        if len(data) <= _CHUNK:
+            f.write(data)
+            f.flush()
+        else:
+            import time as _ct
+            for _off in range(0, len(data), _CHUNK):
+                f.write(data[_off:_off+_CHUNK])
+                f.flush()
+                if _off + _CHUNK < len(data):
+                    _ct.sleep(_DELAY)
+
         # Non-blocking probe for the "device closed mid-write" case.
         # On usblp, select() reports readable if the underlying USB
         # device was disconnected (EOF) or queued a status byte. EOF
