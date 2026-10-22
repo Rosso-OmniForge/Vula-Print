@@ -336,7 +336,18 @@ install_system_tree() {
 # files can stay static (no per-install substitution) and remain
 # diffable against the repo.
 write_install_env() {
-    install -d -m 0750 /etc/vula
+    # 0751 (traverse-only for non-root) instead of 0750 (no access).
+    # Audit N79: the app runs as the desktop user, not root. It must
+    # be able to stat /etc/vula/log-upload-disabled to honour the
+    # install-time privacy opt-out — with 0750 the .exists() check
+    # raises PermissionError inside vula_config.py's import chain,
+    # which crashes the entire app on startup. With 0751 the stat
+    # works, the flag's own 0644 perms still gate content access,
+    # and the sensitive files inside (creds.env 0600, anydesk.json
+    # 0600, install.env 0640) remain unreadable to non-root.
+    # Directory listing is blocked for non-root, so a local user
+    # cannot even enumerate what files exist.
+    install -d -m 0751 /etc/vula
     if [ "$DRY_RUN" = "1" ]; then
         dim "DRY: write /etc/vula/install.env"
         return 0
@@ -606,7 +617,38 @@ SRCLIST_EOF
         DEBIAN_FRONTEND=noninteractive apt-get install -y debian-archive-keyring || return 1
     fi
 
-    run apt-get update -qq || return 1
+    # Wait for the apt lock to clear (audit N80). A fresh Ubuntu
+    # install (or any system with unattended-upgrades enabled) can
+    # have the lock held for 20-40s at boot. The previous version
+    # failed the entire system phase on first-lock-hit, cascading
+    # into: no curl, no firefox-esr, no clamav, no gpg — every
+    # downstream phase that needed a package then failed too. On
+    # byatdbn this cascade produced "curl: command not found",
+    # "could not set x-www-browser", and "Could not start
+    # clamav-freshclam" on a client that would otherwise have
+    # installed cleanly.
+    if ! run apt-get update -qq; then
+        warn "apt-get update failed — waiting up to 60s for lock to clear"
+        _apt_wait=0
+        while [ "$_apt_wait" -lt 60 ]; do
+            if fuser /var/lib/apt/lists/lock >/dev/null 2>&1; then
+                sleep 5
+                _apt_wait=$((_apt_wait + 5))
+                dim "  still locked (${_apt_wait}s)..."
+                continue
+            fi
+            if run apt-get update -qq; then
+                ok "  apt-get update succeeded after ${_apt_wait}s wait"
+                break
+            fi
+            sleep 5
+            _apt_wait=$((_apt_wait + 5))
+        done
+        if [ "$_apt_wait" -ge 60 ]; then
+            err "apt lock still held after 60s — skipping system phase"
+            return 1
+        fi
+    fi
 
     info "Installing base packages (this may take several minutes)..."
     DEBIAN_FRONTEND=noninteractive run apt-get install -y --no-install-recommends \
@@ -1074,13 +1116,18 @@ sys.path.insert(0, script_dir)
 try:
     from vula_store import PrintStore
     from vula_config import APP_DB_FILE
+except PermissionError as e:
+    # vula_config imports /etc/vula/log-upload-disabled state. If the
+    # parent dir denies traversal (0750 with non-root caller), the
+    # import raises PermissionError here. v1.1.877 fixed vula_config
+    # to tolerate this, so this branch should never fire on an
+    # up-to-date checkout — kept as a clear diagnostic if it does.
+    print(f"  PermissionError importing store modules: {e}")
+    print(f"  Fix: sudo chmod 0751 /etc/vula  (then re-run install.sh)")
+    sys.exit(1)
 except Exception as e:
     print(f"  Could not import store modules: {e}")
     # Exit non-zero so the shell's `|| warn` fires (audit N75).
-    # The previous `sys.exit(0)` masked the failure — install.sh
-    # printed "[+ ] Store connection seeded." even though nothing
-    # was written. App would then fail migration on first launch
-    # with no diagnostic.
     sys.exit(1)
 
 url = os.environ.get("VULA_API_URL", "").strip()
@@ -1246,6 +1293,24 @@ phase_anydesk() {
         err "Missing /etc/vula/creds.env — run the print_app phase first:"
         err "  sudo bash install.sh --phase=print_app"
         err "  sudo bash install.sh --phase=anydesk"
+        return 1
+    fi
+
+    # 0c. Sanity-check for tools the phase needs (audit N81). If the
+    # system phase failed (apt lock, missing repo, etc.) these are
+    # absent and the AnyDesk phase should say so clearly instead of
+    # producing "curl: command not found / gpg: no valid OpenPGP
+    # data found" cascades.
+    if ! command -v curl >/dev/null 2>&1; then
+        err "curl is not installed — AnyDesk phase requires it."
+        err "  Fix:  sudo apt-get install -y curl gpg"
+        err "  Then re-run:  sudo bash install.sh --phase=anydesk"
+        return 1
+    fi
+    if ! command -v gpg >/dev/null 2>&1; then
+        err "gpg is not installed — AnyDesk phase requires it."
+        err "  Fix:  sudo apt-get install -y curl gpg"
+        err "  Then re-run:  sudo bash install.sh --phase=anydesk"
         return 1
     fi
 

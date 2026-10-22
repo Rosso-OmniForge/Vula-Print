@@ -64,7 +64,40 @@ APP_DB_FILE = Path.home() / ".config" / "vula_print" / "print_jobs.db"
 # operator cannot silently re-enable uploads for a customer who
 # declined them at install time. Removing it requires sudo.
 LOG_UPLOAD_INSTALL_DISABLED_FILE = Path("/etc/vula/log-upload-disabled")
-LOG_UPLOAD_INSTALL_DISABLED = LOG_UPLOAD_INSTALL_DISABLED_FILE.exists()
+
+
+def _install_log_upload_disabled() -> bool:
+    """Check for the install-time log-upload opt-out flag.
+
+    Audit N79: v1.1.875/v1.1.876 crashed the ENTIRE app on startup
+    because Path.exists() raises PermissionError when the parent
+    directory denies traversal — and /etc/vula is 0750 root:root.
+    Every module that imports vula_config (vula_app, vula_http,
+    vula_store, vula_log_uploader, everything) died at module load.
+    The DB seed in install.sh failed with the same exception, so
+    conn_1 was never written. A fresh client (Ubuntu, first install)
+    was completely bricked: no app, no DB seed, no error visible to
+    the operator beyond "app not opening."
+
+    Two fixes applied together:
+      1. install.sh now chmods /etc/vula to 0751 (traverse-only for
+         non-root) so the .exists() call succeeds on well-behaved
+         installs — the check works as intended.
+      2. This try/except is defense-in-depth: if a future change
+         reverts the perms, or a filesystem does something unusual,
+         we default to "not disabled" instead of bricking the app.
+         The UI toggle still governs log upload in that case.
+    """
+    try:
+        return LOG_UPLOAD_INSTALL_DISABLED_FILE.exists()
+    except OSError:
+        # PermissionError is a subclass of OSError. If we can't stat
+        # the file (unreadable parent dir, exotic fs, race), default
+        # to "not disabled" — the UI toggle remains the authority.
+        return False
+
+
+LOG_UPLOAD_INSTALL_DISABLED = _install_log_upload_disabled()
 MAX_STORE_CONNECTIONS = 4
 PRINTER_ROLES = ("label", "pos_slip", "a4")
 
