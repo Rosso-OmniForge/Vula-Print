@@ -443,6 +443,37 @@ class PrintStore:
             )
         self._conn.commit()
 
+    # ── Maintenance ────────────────────────────────────────────────
+    # count_by_status and prune_older_than_days were originally
+    # defined *inside* migrate_legacy_connections_if_needed, after
+    # its `return 0` statement — dead code that no caller could reach.
+    # Hoisted back into the class here so history-tab cleanup, the
+    # smoke test, and any future retention timer all resolve them.
+
+    def count_by_status(self) -> Dict[str, int]:
+        rows = self._conn.execute(
+            "SELECT status, COUNT(*) AS n FROM print_jobs GROUP BY status"
+        ).fetchall()
+        return {r["status"]: int(r["n"]) for r in rows}
+
+    def prune_older_than_days(self, days: int = 90) -> int:
+        """Delete terminal jobs older than N days. Kept out of the
+        startup path for now — call from a future maintenance timer.
+        Returns number of jobs deleted (events cascade)."""
+        cutoff = (
+            datetime.now().replace(microsecond=0)
+            - __import__("datetime").timedelta(days=int(days))
+        ).isoformat(timespec="seconds")
+        cur = self._conn.execute(
+            "DELETE FROM print_jobs "
+            "WHERE status IN ('completed', 'failed', 'interrupted') "
+            "AND COALESCE(finished_at, fetched_at) < ?",
+            (cutoff,),
+        )
+        n = cur.rowcount
+        self._conn.commit()
+        return n
+
 
 def migrate_legacy_connections_if_needed(
     store: "PrintStore",
@@ -533,32 +564,6 @@ def migrate_legacy_connections_if_needed(
 
     return 0
 
-    def count_by_status(self) -> Dict[str, int]:
-        rows = self._conn.execute(
-            "SELECT status, COUNT(*) AS n FROM print_jobs GROUP BY status"
-        ).fetchall()
-        return {r["status"]: int(r["n"]) for r in rows}
-
-    # ── Maintenance ────────────────────────────────────────────────
-
-    def prune_older_than_days(self, days: int = 90) -> int:
-        """Delete terminal jobs older than N days. Kept out of the
-        startup path for now — call from a future maintenance timer.
-        Returns number of jobs deleted (events cascade)."""
-        cutoff = (
-            datetime.now().replace(microsecond=0)
-            - __import__("datetime").timedelta(days=int(days))
-        ).isoformat(timespec="seconds")
-        cur = self._conn.execute(
-            "DELETE FROM print_jobs "
-            "WHERE status IN ('completed', 'failed', 'interrupted') "
-            "AND COALESCE(finished_at, fetched_at) < ?",
-            (cutoff,),
-        )
-        n = cur.rowcount
-        self._conn.commit()
-        return n
-
 
 # ── Smoke test ─────────────────────────────────────────────────────
 # Run `python3 vula_store.py` to exercise the API against a temp DB.
@@ -599,8 +604,12 @@ if __name__ == "__main__":
             summary={"invoice_number": "INV-100"},
         )
         s.mark_printing(jid3, "/dev/usb/lp0")
-        n = s.mark_interrupted_on_startup()
-        assert n == 1, f"expected 1 interrupted, got {n}"
+        # mark_interrupted_on_startup returns a List[int] of the ids
+        # it transitioned (not a count). Assert on both: exactly one
+        # id was swept, and it was the one we just left in 'printing'.
+        swept_ids = s.mark_interrupted_on_startup()
+        assert len(swept_ids) == 1, f"expected 1 interrupted, got {swept_ids}"
+        assert jid3 in swept_ids, f"expected jid3 ({jid3}) in swept set {swept_ids}"
         assert s.get_job(jid3)["status"] == "interrupted"
 
         print("counts:", s.count_by_status())

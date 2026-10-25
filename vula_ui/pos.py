@@ -52,7 +52,15 @@ class POSMixin:
         # print without a role but still record the pending list for
         # the operator.
 
-        eligible = [c for c in self.active_connections if c.printer_user_id]
+        # Poll whenever the connection has an API key, not on
+        # printer_user_id. Backend resolves identity from the API key
+        # (verify_printer_api_key sets request.state.printer_user_id +
+        # printer_registration_id from the registration row), so
+        # printer_user_id is redundant for polling and is None on a
+        # fresh device until the config fetch completes. Gating on
+        # printer_user_id silently disabled polling on new devices —
+        # POS slips sat in the queue forever with "Queued: 0".
+        eligible = [c for c in self.active_connections if c.api_key]
         if not eligible:
             self._update_pos_worker_status()
             return
@@ -63,12 +71,12 @@ class POSMixin:
                 for req_id in sorted(conn.pos_completion_retry_ids):
                     tasks.append((
                         conn.connection_id, conn.api_base_url, conn.api_key,
-                        conn.printer_user_id, "pos", req_id,
+                        int(conn.printer_user_id or 0), "pos", req_id,
                     ))
                 for req_id in sorted(conn.pos_eod_completion_retry_ids):
                     tasks.append((
                         conn.connection_id, conn.api_base_url, conn.api_key,
-                        conn.printer_user_id, "eod", req_id,
+                        int(conn.printer_user_id or 0), "eod", req_id,
                     ))
             if tasks:
                 self._pos_retry_worker = _RetryFlushWorker(tasks)
@@ -98,7 +106,7 @@ class POSMixin:
                 connection_id=conn.connection_id,
                 api_base=conn.api_base_url,
                 api_key=conn.api_key,
-                user_id=conn.printer_user_id,
+                user_id=int(conn.printer_user_id or 0),
                 in_flight_ids=frozenset(conn.pos_in_flight_ids),
                 eod_in_flight_ids=frozenset(conn.pos_eod_in_flight_ids),
                 do_eod_ensure=do_eod_ensure,
@@ -301,9 +309,14 @@ class POSMixin:
             )
         else:
             # 5xx / network / unexpected — schedule a retry, capped.
+            # Overflow policy: discard the *oldest* id, not an arbitrary
+            # one. The pre-fix code used set.pop() — which returns an
+            # arbitrary element — so a permanently-failing id could
+            # survive an overflow while the retry we just added was
+            # thrown away. min() on the id set is the correct FIFO.
             conn.pos_completion_retry_ids.add(request_id)
             while len(conn.pos_completion_retry_ids) > self._POS_RETRY_SET_MAX:
-                conn.pos_completion_retry_ids.pop()
+                conn.pos_completion_retry_ids.remove(min(conn.pos_completion_retry_ids))
             self.status_bar.showMessage(
                 f"POS slip #{request_id} printed; completion retry scheduled"
             )
@@ -385,6 +398,11 @@ class POSMixin:
                 self.status_bar.showMessage(
                     f"POS EOD report #{request_id} printed (no connection to complete)"
                 )
+            # Drain the queue immediately rather than waiting for the
+            # next 5s poll tick. Mirrors _on_pos_print_finished so a
+            # store that prints EOD followed by a burst of POS slips
+            # doesn't stall 5s per job.
+            self.poll_pos_slips()
         else:
             if job_id is not None:
                 try:
@@ -429,9 +447,14 @@ class POSMixin:
                 f"POS EOD report #{request_id} printed; completion 400 — flagged"
             )
         else:
+            # Overflow policy: discard the OLDEST id, not an arbitrary
+            # one. set.pop() returns an arbitrary element — a
+            # permanently-failing retry can survive overflow while the
+            # id we just added gets thrown away. min() on the id set is
+            # the correct FIFO, matching the POS path above.
             conn.pos_eod_completion_retry_ids.add(request_id)
             while len(conn.pos_eod_completion_retry_ids) > self._POS_RETRY_SET_MAX:
-                conn.pos_eod_completion_retry_ids.pop()
+                conn.pos_eod_completion_retry_ids.remove(min(conn.pos_eod_completion_retry_ids))
             self.status_bar.showMessage(
                 f"POS EOD report #{request_id} printed; completion retry scheduled"
             )

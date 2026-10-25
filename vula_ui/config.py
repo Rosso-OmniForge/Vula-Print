@@ -99,6 +99,55 @@ class ConfigMixin:
         else:
             self._set_connection_status(False)
 
+    def _maybe_warn_unassigned_roles(self) -> None:
+        """Surface a banner when a role is unassigned but the queue has work.
+
+        The old silent failure — the client polled successfully, then
+        refused to print — meant the queue grew invisibly for days.
+        This is the last chokepoint where we know the role state AND
+        have a moment to tell the operator.
+
+        Called after each config-fetch settles (i.e., once at startup
+        and on the 60 s refresh). Cheap; only shows the banner once
+        per (roles, queue) tuple change.
+        """
+        roles = getattr(self, "printer_roles", {}) or {}
+        unassigned = [r for r, dev in roles.items() if not dev]
+        if not unassigned:
+            return
+        # Only nag if there is actual work waiting.
+        queued = len(getattr(self, "pending_requests", []) or [])
+        queued_pos = sum(
+            len(v or [])
+            for v in (getattr(self, "_pos_pending_by_conn", {}) or {}).values()
+        )
+        if queued + queued_pos == 0:
+            return
+        fingerprint = (tuple(sorted(unassigned)), queued + queued_pos)
+        if getattr(self, "_last_unassigned_warning", None) == fingerprint:
+            return
+        self._last_unassigned_warning = fingerprint
+        labels = ", ".join(unassigned)
+        msg = (
+            f"⚠  Printer role(s) unassigned: {labels}  ·  "
+            f"{queued + queued_pos} item(s) waiting in queue.\n"
+            f"Open the Printers tab and assign a device for each role."
+        )
+        try:
+            self.status_bar.showMessage(msg)
+        except Exception:
+            pass
+        # Also open the Printers tab automatically on the very first
+        # startup where this fires — nudges the operator without a
+        # modal dialog.
+        if not getattr(self, "_auto_opened_printers_tab", False):
+            self._auto_opened_printers_tab = True
+            try:
+                if hasattr(self, "_switch_tab"):
+                    self._switch_tab("printers")
+            except Exception:
+                pass
+
     def ensure_onboarded(self):
         """First-run helper.
 
@@ -224,6 +273,7 @@ class ConfigMixin:
             self._refresh_connection_status_summary()
             self.fetch_pending_requests()
             self.upload_discovered_printers_if_ready()
+            self._maybe_warn_unassigned_roles()
 
     def _fetch_brand_css_async(self, conn: StoreConnection):
         w = HttpWorker(
