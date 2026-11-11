@@ -52,10 +52,15 @@ Source: "..\dist\VulaPrint\*"; DestDir: "{app}"; Flags: ignoreversion recursesub
 ; the Windows equivalent of /etc/vula (0751 root:root on Linux).
 Name: "{commonappdata}\Vula"; Permissions: admins-full system-full users-read
 
+[Tasks]
+Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional icons:"
+
 [Icons]
 ; Start Menu — launchable from the classic menu.
 Name: "{group}\Vula Print"; Filename: "{app}\VulaPrint.exe"
 Name: "{group}\Uninstall Vula Print"; Filename: "{uninstallexe}"
+; Desktop — user can uncheck on the Tasks page of the installer.
+Name: "{commondesktop}\Vula Print"; Filename: "{app}\VulaPrint.exe"; Tasks: desktopicon
 ; Autostart — machine-wide. This is the Windows equivalent of the
 ; systemd user service that autostarts VulaPrint on Linux.
 ; The lnk is removed by the uninstaller automatically (Inno Setup
