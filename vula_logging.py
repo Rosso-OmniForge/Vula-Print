@@ -19,9 +19,13 @@ import logging.handlers
 import os
 import sys
 from pathlib import Path
+from vula_platform import is_windows, logs_dir as _logs_dir
 
 
-LOG_DIR = Path.home() / ".config" / "vula_print" / "logs"
+# Per-user log directory, resolved via vula_platform:
+#   Linux:   ~/.config/vula_print/logs
+#   Windows: %APPDATA%\VulaPrint\logs
+LOG_DIR = _logs_dir()
 LOG_FILE = LOG_DIR / "vula-print.log"
 
 # Rotating file: 5 MB per file, 5 backups = 25 MB total.
@@ -57,13 +61,21 @@ def setup_logging(level: str | None = None) -> Path:
     # paths. On a shared POS terminal this must not be world-readable.
     # chmod both dir and file — idempotent, corrects pre-existing
     # 0755/0644 from prior installs that ran under a permissive umask.
-    try:
-        os.chmod(LOG_DIR, 0o700)
-        if LOG_FILE.exists():
-            os.chmod(LOG_FILE, 0o600)
-    except OSError as _e:
-        print(f"vula_logging: could not tighten {LOG_DIR} / {LOG_FILE}: {_e}",
-              file=sys.stderr)
+    # Security (audit A.4/M20/L33): on Linux, the log file contains
+    # device fingerprints, backend 4xx response snippets, and redacted
+    # URL paths — must not be world-readable. On Windows, os.chmod()
+    # only toggles the read-only bit and does not touch ACLs; the real
+    # ACL story for Windows is handled by the installer (Phase H) and
+    # by DPAPI-encrypting the sensitive column in print_jobs.db
+    # (Phase D). Skipping the call here keeps the intent explicit.
+    if not is_windows():
+        try:
+            os.chmod(LOG_DIR, 0o700)
+            if LOG_FILE.exists():
+                os.chmod(LOG_FILE, 0o600)
+        except OSError as _e:
+            print(f"vula_logging: could not tighten {LOG_DIR} / {LOG_FILE}: {_e}",
+                  file=sys.stderr)
 
     # Root logger — everything under 'vula.' inherits from here.
     root = logging.getLogger()
@@ -86,15 +98,15 @@ def setup_logging(level: str | None = None) -> Path:
         fh.setLevel(numeric_level)
         fh.setFormatter(formatter)
         root.addHandler(fh)
-        # Security (audit A.4/M20/L33): the handler opens the file
-        # with the process umask (0644 on Debian default). chmod to
-        # 0600 now that the file exists — this is the fresh-install
-        # case; 3a above only fixed pre-existing files.
-        try:
-            os.chmod(LOG_FILE, 0o600)
-        except OSError as _e:
-            print(f"vula_logging: could not chmod {LOG_FILE} to 0600: {_e}",
-                  file=sys.stderr)
+        # Security (audit A.4/M20/L33): on Linux, tighten the fresh
+        # file from umask default (0644) to 0600. On Windows the call
+        # is skipped for the same reason as above.
+        if not is_windows():
+            try:
+                os.chmod(LOG_FILE, 0o600)
+            except OSError as _e:
+                print(f"vula_logging: could not chmod {LOG_FILE} to 0600: {_e}",
+                      file=sys.stderr)
     except Exception as e:
         # If the log file can't be opened, keep going — stderr still works.
         print(f"vula_logging: could not open {LOG_FILE}: {e}", file=sys.stderr)

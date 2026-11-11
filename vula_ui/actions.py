@@ -11,6 +11,7 @@ from vula_http import HttpWorker
 from vula_workers import PrintJob, POSSlipPrintJob
 
 
+
 class ActionsMixin:
     """See vula_app.py for composition."""
 
@@ -230,8 +231,16 @@ class ActionsMixin:
             "CLS\n"
         )
         try:
-            from vula_device_io import write_to_device
-            write_to_device(label_printer, calibration_tspl.encode('utf-8'))
+            # Route through the same transport layer every other print
+            # path uses. Previously this called write_to_device() directly,
+            # which silently wrote to a file named "cups:Foo:raw" in the
+            # CWD when the label printer was assigned a CUPS queue, and
+            # would have raised on Windows for a spooler assignment.
+            from vula_printer_target import PrinterTarget, dispatch_print
+            target = PrinterTarget.from_assignment(label_printer)
+            dispatch_print(
+                target, calibration_tspl.encode('utf-8'), doc_class="label",
+            )
         except PermissionError:
             QMessageBox.critical(
                 self, "Permission Denied",

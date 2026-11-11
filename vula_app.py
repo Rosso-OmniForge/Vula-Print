@@ -210,3 +210,56 @@ class VulaPrintApp(
             lambda: self._log_uploader.upload_async("periodic")
         )
         self._log_upload_timer.start(6 * 60 * 60 * 1000)
+
+        # System tray icon — installed last so that the tray menu
+        # actions can immediately call the mixin methods they proxy
+        # (_do_update, _view_logs) without hitting a half-built self.
+        self._setup_tray()
+
+    def _setup_tray(self):
+        """Instantiate the system tray icon.
+
+        Called at the end of __init__, once the window is fully built.
+        If the tray is unavailable (headless session, GNOME without
+        the AppIndicator extension), log a warning and leave
+        self._tray = None — closeEvent in MiscMixin falls back to
+        minimize-to-taskbar in that case.
+        """
+        self._tray = None
+        self._close_tooltip_shown = False
+        try:
+            from PyQt6.QtWidgets import QSystemTrayIcon
+            if not QSystemTrayIcon.isSystemTrayAvailable():
+                _log.warning(
+                    "System tray is not available on this desktop — "
+                    "closeEvent will minimize to taskbar instead of tray"
+                )
+                return
+            from vula_ui.tray import VulaTrayIcon
+            self._tray = VulaTrayIcon(self, parent=self)
+            self._tray.show()
+            _log.info("System tray icon installed")
+        except Exception as e:
+            _log.warning("Could not install system tray icon: %s", e)
+            self._tray = None
+
+    def _quit_from_tray(self):
+        """Cleanly exit from the tray's Quit action.
+
+        Linux: a clean QApplication.quit() returns exit code 0, which
+        systemd's Restart=on-failure treats as "stop, do not restart".
+        We deliberately do NOT shell out to `systemctl --user stop` —
+        that would race our own shutdown.
+
+        Windows: no service manager — same QApplication.quit() path.
+        The autostart shortcut (written by the Phase H installer) is
+        what makes the app launch again at next login.
+        """
+        _log.info("Quit requested from tray")
+        try:
+            if self._tray is not None:
+                self._tray.hide()
+        except Exception:
+            pass
+        from PyQt6.QtWidgets import QApplication
+        QApplication.quit()

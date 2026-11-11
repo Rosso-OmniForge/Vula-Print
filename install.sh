@@ -1000,63 +1000,135 @@ phase_print_app() {
 
     # Fall back: if --api-url wasn't given, allow --store-url to double
     # as the API base for backwards compatibility, with a warning.
-    if [ -z "$API_URL" ]; then
-        if [ -n "$STORE_URL" ]; then
-            warn "--api-url not supplied; falling back to --store-url for the API base."
-            API_URL="$STORE_URL"
-        fi
-    fi
-    if [ -z "$API_URL" ]; then
-        if [ "$ASSUME_YES" = "1" ]; then
-            err "No --api-url (and no --store-url fallback) provided and --yes was set."
-            return 1
-        fi
-        read -rp "${CYAN}[?]${NC} Vula backend API URL (e.g. https://api.example.co.za): " API_URL
+    if [ -z "$API_URL" ] && [ -n "$STORE_URL" ]; then
+        warn "--api-url not supplied; falling back to --store-url for the API base."
+        API_URL="$STORE_URL"
     fi
 
-    if [ -z "$API_KEY" ]; then
-        if [ "$ASSUME_YES" = "1" ]; then
-            err "No --api-key provided and --yes was set."
-            return 1
-        fi
-        read -rsp "${CYAN}[?]${NC} Printer API key (vp_...): " API_KEY
+    # ── venv — created up front so the GUI wizard (choice 2 below) can
+    # use it. On a re-run this is a no-op.
+    if [ ! -d "$SCRIPT_DIR/venv" ]; then
+        info "Creating venv..."
+        run as_user python3 -m venv --system-site-packages "$SCRIPT_DIR/venv" || return 1
+        ok "venv created."
+    else
+        dim "  Existing venv found — reusing."
+    fi
+
+    info "Installing Python dependencies..."
+    run as_user "$SCRIPT_DIR/venv/bin/pip" install --quiet -r "$SCRIPT_DIR/requirements_app.txt" || return 1
+    ok "Python packages installed."
+
+    # ── Interactive onboarding: terminal / GUI wizard / defer ────
+    # Standard users find terminal prompts intimidating; the GUI
+    # wizard walks them through URL, key, and printer assignment.
+    # Only offered when: no --api-url/--api-key passed, not --yes
+    # (auto-update path), and a display is available.
+    _skip_connection_setup=0
+    if [ -z "$API_URL" ] && [ -z "$API_KEY" ] && \
+       [ "$ASSUME_YES" != "1" ] && [ -n "${DISPLAY:-}" ]; then
+
         echo
+        echo "  How would you like to configure the printer connection?"
+        echo "    1) Enter the URL and API key here (terminal)"
+        echo "    2) Open the GUI setup wizard now (recommended)"
+        echo "    3) Skip — I'll configure on first app launch"
+        read -rp "  Choice [2]: " _setup_choice
+        _setup_choice="${_setup_choice:-2}"
+
+        case "$_setup_choice" in
+            2)
+                info "Opening GUI setup wizard…"
+                if as_user env HOME="$REAL_HOME" DISPLAY="$DISPLAY" \
+                    "$SCRIPT_DIR/venv/bin/python3" \
+                    "$SCRIPT_DIR/vula_print_app.py" --onboard
+                then
+                    ok "Wizard completed."
+                    # Read the connection back from the DB so creds.env
+                    # (needed by the AnyDesk phase and updaters) still
+                    # gets written. The wizard runs as REAL_USER and
+                    # cannot touch /etc/vula itself.
+                    _creds=$(
+                        as_user env VULA_SCRIPT_DIR="$SCRIPT_DIR" \
+                            "$SCRIPT_DIR/venv/bin/python3" - <<'PYEOF'
+import os, sys
+sys.path.insert(0, os.environ["VULA_SCRIPT_DIR"])
+from vula_store import PrintStore
+from vula_config import APP_DB_FILE
+conns = PrintStore(APP_DB_FILE).list_connections()
+if not conns:
+    sys.exit(1)
+print(conns[0]["api_base_url"])
+print(conns[0]["api_key"])
+PYEOF
+                    )
+                    if [ -n "$_creds" ]; then
+                        API_URL=$(echo "$_creds" | sed -n '1p')
+                        API_KEY=$(echo "$_creds" | sed -n '2p')
+                    fi
+                else
+                    warn "Wizard cancelled or failed — falling back to terminal prompts."
+                fi
+                ;;
+            3)
+                info "Skipping connection setup — the app will prompt on first launch."
+                _skip_connection_setup=1
+                ;;
+            *)
+                # Fall through to the existing terminal prompts
+                ;;
+        esac
     fi
 
-    if [ -z "$API_URL" ] || [ -z "$API_KEY" ]; then
-        err "Both API_URL and API_KEY are required."
-        return 1
-    fi
-
-    _validate_url "$API_URL" "API URL" || return 1
-    if ! echo "$API_KEY" | grep -qE '^vp_'; then
-        warn "API key does not start with 'vp_' — is that correct?"
-        if [ "$ASSUME_YES" != "1" ]; then
-            if ! ask_yn "  Continue anyway?" n; then
+    # ── Terminal prompts + creds.env (skipped on choice 3) ───────
+    if [ "$_skip_connection_setup" = "0" ]; then
+        if [ -z "$API_URL" ]; then
+            if [ "$ASSUME_YES" = "1" ]; then
+                err "No --api-url (and no --store-url fallback) provided and --yes was set."
                 return 1
             fi
+            read -rp "${CYAN}[?]${NC} Vula backend API URL (e.g. https://api.example.co.za): " API_URL
         fi
-    fi
 
-    # Root-only copy for system services (AnyDesk handshake, updaters).
-    # Not owned by the desktop user — the app reads .env, system services
-    # read this. Same values, different ACLs.
-    #
-    # Use a subshell for the umask so it does not leak to later phases.
-    install -d -m 0750 /etc/vula
-    (
-        umask 077
-        cat > /etc/vula/creds.env <<CREDS_EOF
+        if [ -z "$API_KEY" ]; then
+            if [ "$ASSUME_YES" = "1" ]; then
+                err "No --api-key provided and --yes was set."
+                return 1
+            fi
+            read -rsp "${CYAN}[?]${NC} Printer API key (vp_...): " API_KEY
+            echo
+        fi
+
+        if [ -z "$API_URL" ] || [ -z "$API_KEY" ]; then
+            err "Both API_URL and API_KEY are required."
+            return 1
+        fi
+
+        _validate_url "$API_URL" "API URL" || return 1
+        if ! echo "$API_KEY" | grep -qE '^vp_'; then
+            warn "API key does not start with 'vp_' — is that correct?"
+            if [ "$ASSUME_YES" != "1" ]; then
+                if ! ask_yn "  Continue anyway?" n; then
+                    return 1
+                fi
+            fi
+        fi
+
+        # Root-only copy for system services (AnyDesk handshake, updaters).
+        install -d -m 0750 /etc/vula
+        (
+            umask 077
+            cat > /etc/vula/creds.env <<CREDS_EOF
 PRINTER_API_BASE_URL=$API_URL
 PRINTER_API_KEY=$API_KEY
 CREDS_EOF
-    )
-    chown root:root /etc/vula/creds.env
-    chmod 0600 /etc/vula/creds.env
-    ok "Root-only creds written to /etc/vula/creds.env"
+        )
+        chown root:root /etc/vula/creds.env
+        chmod 0600 /etc/vula/creds.env
+        ok "Root-only creds written to /etc/vula/creds.env"
+    fi
 
-    # Per-device stable identity. Do NOT rely on /etc/machine-id — it is
-    # baked into the base image and identical across cloned devices.
+    # ── Per-device stable identity (always runs) ────────────────
     if [ ! -s /etc/vula/device-id ]; then
         if command -v uuidgen >/dev/null 2>&1; then
             uuidgen > /etc/vula/device-id
@@ -1070,23 +1142,6 @@ CREDS_EOF
         dim "  Device ID already present: $(cat /etc/vula/device-id)"
     fi
 
-    # (install.env is written at the top of the script, before the
-    # phase runner, so it exists even when only a subset of phases
-    # is selected. Do not call write_install_env here.)
-
-    # ── venv ────────────────────────────────────────────────────
-    if [ -d "$SCRIPT_DIR/venv" ]; then
-        info "Existing venv found — reusing."
-    else
-        info "Creating venv..."
-        run as_user python3 -m venv --system-site-packages "$SCRIPT_DIR/venv" || return 1
-        ok "venv created."
-    fi
-
-    info "Installing Python dependencies..."
-    run as_user "$SCRIPT_DIR/venv/bin/pip" install --quiet -r "$SCRIPT_DIR/requirements_app.txt" || return 1
-    ok "Python packages installed."
-
     # ── Seed the store connection into the local DB ─────────────
     # Connections now live in print_jobs.db (see vula_store.py). We
     # seed here — AFTER the venv exists — so this python3 has the
@@ -1098,6 +1153,7 @@ CREDS_EOF
     # the seeding as REAL_USER so the file lands with the correct
     # ownership. If the DB already has connections, the helper no-ops:
     # re-running install.sh never clobbers an operator's configuration.
+    if [ -n "$API_URL" ] && [ -n "$API_KEY" ]; then
     info "Seeding store connection into the local database..."
     as_user env \
         VULA_API_URL="$API_URL" \
@@ -1182,6 +1238,9 @@ PYEOF
         ok "Store connection seeded."
     else
         warn "Store connection seed failed (rc=$_seed_rc) — app will attempt on first launch"
+    fi
+    else
+        info "No connection configured — skipping DB seed (app will prompt on first launch)."
     fi
 
     # ── systemd user service ────────────────────────────────────

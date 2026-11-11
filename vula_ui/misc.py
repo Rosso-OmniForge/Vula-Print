@@ -1,6 +1,7 @@
 """Mixin for VulaPrintApp — see vula_app.py for composition."""
 from __future__ import annotations
 
+import logging
 import subprocess
 from datetime import datetime as _dt
 from pathlib import Path
@@ -11,27 +12,52 @@ from PyQt6.QtWidgets import (
     QApplication, QDialog, QHBoxLayout, QLabel, QPushButton, QTextEdit, QVBoxLayout,
 )
 
+_log = logging.getLogger("vula.ui.misc")
+from vula_platform import is_windows, program_data_dir
 
 class MiscMixin:
     """See vula_app.py for composition."""
 
     def closeEvent(self, event):
-        """Always minimize instead of quitting.
+        """Hide to system tray instead of quitting.
 
-        The app runs as a systemd user service; quitting the window would
-        either orphan the service or trigger a restart — both of which have
-        historically caused duplicate processes competing for the same USB
-        printer devices. The only supported way to stop the app is:
+        The app is designed to run continuously — on Linux as a systemd
+        user service, on Windows as an autostart tray app. Closing the
+        window is a "hide to tray" gesture, not a "quit". The only
+        supported way to stop the app is the tray icon's Quit action.
 
-            systemctl --user stop vula-print
+        If the tray failed to install (no system tray on this desktop,
+        or QSystemTrayIcon.isSystemTrayAvailable() was False), fall
+        back to minimizing to taskbar — the previous behaviour — so
+        the app remains reachable.
         """
         event.ignore()
-        self.showMinimized()
-        self.status_bar.showMessage(
-            "Minimized to taskbar. To stop the app entirely: "
-            "systemctl --user stop vula-print",
-            8000,
-        )
+
+        if getattr(self, "_tray", None) is not None:
+            self.hide()
+            # One-time notification on first close so the operator
+            # knows where the app went. Subsequent closes just hide.
+            if not getattr(self, "_close_tooltip_shown", False):
+                self._close_tooltip_shown = True
+                try:
+                    self._tray.notify(
+                        "Vula! Print",
+                        "Still running in the tray. Click the tray "
+                        "icon to restore. Right-click → Quit to exit.",
+                        5000,
+                    )
+                except Exception:
+                    pass
+            self.status_bar.showMessage(
+                "Minimized to tray. Right-click the tray icon to quit.",
+                5000,
+            )
+        else:
+            # Tray unavailable — previous behaviour.
+            self.showMinimized()
+            self.status_bar.showMessage(
+                "Minimized to taskbar.", 5000,
+            )
 
     def _current_version(self) -> str:
         """Return the app version string read from the VERSION file."""
@@ -39,57 +65,22 @@ class MiscMixin:
         return APP_VERSION
 
     def _do_update(self):
-        """Show update status — automatic updates run via systemd timer."""
+        """Show update status.
+
+        Linux: automatic updates run daily via systemd timer. The
+        dialog surfaces the timer status and a tail of the update log.
+
+        Windows: there is no automatic update — updates are manual,
+        done by downloading and running a new installer. The dialog
+        shows the download URL configured at install time
+        (%ProgramData%\\Vula\\update-url.txt), if present.
+        """
         current = self._current_version()
 
-        log_path = Path("/var/log/vula/app-update.log")
-        last_run = "never"
-        last_result = "(no log yet)"
-
-        if log_path.exists():
-            try:
-                mtime = log_path.stat().st_mtime
-                last_run = _dt.fromtimestamp(mtime).strftime("%d %b %Y  %H:%M")
-                with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-                    tail = f.readlines()[-30:]
-                last_result = "".join(tail).strip() or "(empty log)"
-            except Exception as e:
-                last_result = "(could not read log: " + str(e) + ")"
-
-        timer_status = "unknown"
-        try:
-            r = subprocess.run(
-                ["systemctl", "is-active", "vula-print-update.timer"],
-                capture_output=True, text=True, timeout=3,
-            )
-            timer_status = r.stdout.strip() or "unknown"
-        except Exception:
-            pass
-
-        sep = "─" * 60
-        lines = [
-            "Current version:  " + str(current),
-            "",
-            "Automatic updates run daily at 04:05. The systemd timer pulls",
-            "the latest source from GitHub, refreshes Python dependencies,",
-            "and restarts the app — no operator action required.",
-            "",
-            "Timer status:  " + timer_status,
-            "Last update:   " + last_run,
-            "",
-            sep,
-            "Manual update (requires admin):",
-            "  sudo systemctl start vula-print-update.service",
-            "",
-            "View live logs:",
-            "  sudo tail -f /var/log/vula/app-update.log",
-            "  journalctl --user -u vula-print -f",
-            sep,
-            "Recent log tail:",
-            "",
-            last_result,
-        ]
-        body_text = chr(10).join(lines)
+        if is_windows():
+            body_text, copy_payload, copy_label = self._windows_update_body(current)
+        else:
+            body_text, copy_payload, copy_label = self._linux_update_body(current)
 
         dlg = QDialog(self)
         dlg.setWindowTitle("App Updates")
@@ -118,19 +109,18 @@ class MiscMixin:
 
         btn_row = QHBoxLayout()
 
-        copy_btn = QPushButton("Copy manual command")
-        copy_btn.setMinimumHeight(34)
-        copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        copy_btn.setStyleSheet(self._btn_secondary())
+        if copy_payload:
+            copy_btn = QPushButton(copy_label)
+            copy_btn.setMinimumHeight(34)
+            copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            copy_btn.setStyleSheet(self._btn_secondary())
 
-        def _copy_cmd():
-            QApplication.clipboard().setText(
-                "sudo systemctl start vula-print-update.service"
-            )
-            copy_btn.setText("Copied")
+            def _copy():
+                QApplication.clipboard().setText(copy_payload)
+                copy_btn.setText("Copied")
 
-        copy_btn.clicked.connect(_copy_cmd)
-        btn_row.addWidget(copy_btn)
+            copy_btn.clicked.connect(_copy)
+            btn_row.addWidget(copy_btn)
         btn_row.addStretch()
 
         close_btn = QPushButton("Close")
@@ -142,6 +132,112 @@ class MiscMixin:
 
         layout.addLayout(btn_row)
         dlg.exec()
+
+    def _windows_update_body(self, current: str):
+        """Return (body_text, copy_payload, copy_label) for the Windows dialog.
+
+        The installer writes %ProgramData%\\Vula\\update-url.txt at install
+        time (Phase H). If it is absent or empty, the dialog says so plainly
+        rather than pretending an update is available.
+        """
+        url = ""
+        url_file = program_data_dir() / "update-url.txt"
+        try:
+            if url_file.exists():
+                url = url_file.read_text(encoding="utf-8").strip()
+        except Exception:
+            url = ""
+
+        sep = "─" * 60
+        if url:
+            body_text = chr(10).join([
+                "Current version:  " + str(current),
+                "",
+                "Windows updates are manual. To update:",
+                "",
+                "  1. Download the latest installer from:",
+                "       " + url,
+                "  2. Double-click the downloaded file to install.",
+                "  3. The app will restart automatically.",
+                "",
+                sep,
+                "Questions? Contact your administrator.",
+            ])
+            return body_text, url, "Copy download URL"
+
+        body_text = chr(10).join([
+            "Current version:  " + str(current),
+            "",
+            "Windows updates are manual — there is no automatic",
+            "update in this build.",
+            "",
+            "No download URL is configured on this machine.",
+            "Ask your administrator for the installer, or visit",
+            "the download page provided with your installation.",
+            "",
+            sep,
+            "Configured update URL: (none)",
+        ])
+        return body_text, "", ""
+
+    def _linux_update_body(self, current: str):
+        """Return (body_text, copy_payload, copy_label) for the Linux dialog.
+
+        This is the original _do_update body, extracted verbatim so the
+        Linux behaviour is byte-identical to before Phase C.
+        """
+        log_path = Path("/var/log/vula/app-update.log")
+        last_run = "never"
+        last_result = "(no log yet)"
+
+        if log_path.exists():
+            try:
+                mtime = log_path.stat().st_mtime
+                last_run = _dt.fromtimestamp(mtime).strftime("%d %b %Y  %H:%M")
+                with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                    tail = f.readlines()[-30:]
+                last_result = "".join(tail).strip() or "(empty log)"
+            except Exception as e:
+                last_result = "(could not read log: " + str(e) + ")"
+
+        timer_status = "unknown"
+        try:
+            r = subprocess.run(
+                ["systemctl", "is-active", "vula-print-update.timer"],
+                capture_output=True, text=True, timeout=3,
+            )
+            timer_status = r.stdout.strip() or "unknown"
+        except Exception:
+            pass
+
+        sep = "─" * 60
+        body_text = chr(10).join([
+            "Current version:  " + str(current),
+            "",
+            "Automatic updates run daily at 04:05. The systemd timer pulls",
+            "the latest source from GitHub, refreshes Python dependencies,",
+            "and restarts the app — no operator action required.",
+            "",
+            "Timer status:  " + timer_status,
+            "Last update:   " + last_run,
+            "",
+            sep,
+            "Manual update (requires admin):",
+            "  sudo systemctl start vula-print-update.service",
+            "",
+            "View live logs:",
+            "  sudo tail -f /var/log/vula/app-update.log",
+            "  journalctl --user -u vula-print -f",
+            sep,
+            "Recent log tail:",
+            "",
+            last_result,
+        ])
+        return (
+            body_text,
+            "sudo systemctl start vula-print-update.service",
+            "Copy manual command",
+        )
 
     def _view_logs(self):
         """Open a read-only dialog showing the app log tail."""

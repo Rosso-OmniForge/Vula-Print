@@ -6,6 +6,15 @@
 # install_printer_app.sh and inherited by the venv through
 # --system-site-packages. Listing them here would cause pip to
 # re-download 80+ MB of Qt6 binaries unnecessarily.
+# On Windows, PyQt6 is not available as a system package — install it
+# explicitly. The marker keeps pip from re-downloading it on Linux,
+# where apt provides it via --system-site-packages.
+PyQt6>=6.4; sys_platform == 'win32'
+
+# Windows: pywin32 provides win32print (spooler submission — Phase B)
+# and win32crypt (DPAPI for API-key-at-rest — Phase D). Linux gets
+# neither, so the marker keeps pip from attempting the install there.
+pywin32>=306; sys_platform == 'win32'
 
 # HTTP Client
 requests>=2.31.0

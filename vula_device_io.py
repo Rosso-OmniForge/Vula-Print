@@ -1,18 +1,25 @@
 """Unified device I/O for printers.
 
-The app supports two physically different kinds of printer device:
+The app supports three physically different kinds of printer connection:
 
-  1. USB printer-class devices  ->  /dev/usb/lp0  (character device)
+  1. USB printer-class devices (Linux)   ->  /dev/usb/lp0  (char device)
      Write with a plain open(path, 'wb'). The kernel handles everything.
+     Not supported on Windows — use COM* or spooler instead.
 
-  2. USB-serial adapters        ->  /dev/ttyUSB0, /dev/ttyACM0, /dev/ttyS0,
-                                     /dev/serial/by-id/*
-     Write with pyserial, which sets termios (baud rate, parity, stop bits,
-     flow control) before writing. A raw open() on a serial port leaves the
-     port at whatever the last process set it to, usually producing garbage
-     at the printer.
+  2. USB-serial adapters (Linux)          ->  /dev/ttyUSB0, /dev/ttyACM0, ...
+     USB-serial adapters (Windows)        ->  COM1, COM2, COM3, ...
+     Write with pyserial, which sets the line discipline (baud rate,
+     parity, stop bits, flow control) before writing. A raw open() on a
+     serial port leaves the port at whatever the last process set it
+     to, usually producing garbage at the printer.
 
-This module centralises both cases behind one function: write_to_device().
+  3. Windows spooler queues               ->  spooler:<printer-name>
+     Write via win32print's RAW datatype — bytes passed to the printer
+     driver unfiltered, the same semantics as CUPS raw mode. Handled in
+     vula_printer_target, not here — write_to_device() is for direct
+     device I/O only.
+
+This module centralises direct device I/O behind write_to_device().
 
 Serial configuration is stored per device path in a module-level registry
 populated by the app once settings are loaded. See set_serial_configs().
@@ -26,19 +33,22 @@ import threading
 import time
 from typing import Any, Dict, Optional
 
-# Sensible defaults for old POS printers. 9600 8N1 with no flow control is
-# the universal compatibility mode — most serial receipt printers accept it,
-# and it is slow enough that even CH340 adapters with no RTS/CTS support
-# work reliably.
+from vula_platform import is_serial_device_name, is_windows
+
+
+_log = logging.getLogger("vula.device")
+
+
+# ── Serial defaults ──────────────────────────────────────────────────
+
 DEFAULT_SERIAL_CONFIG: Dict[str, Any] = {
     "baud": 9600,
     "bytesize": 8,
-    "parity": "N",         # N / E / O
-    "stopbits": 1,         # 1 / 2
-    "flow": "none",        # "none" / "xonxoff" / "rtscts"
+    "parity": "N",
+    "stopbits": 1,
+    "flow": "none",
 }
 
-# Allowed values, used by the settings dialog to validate input.
 BAUD_RATES = [1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200]
 PARITIES = {"N": "None", "E": "Even", "O": "Odd"}
 STOPBITS = {1: "1", 2: "2"}
@@ -48,13 +58,11 @@ FLOW_MODES = {
     "rtscts": "RTS/CTS (hardware)",
 }
 
-# Module-level registry — populated once by the app.
+
+# ── Runtime state ────────────────────────────────────────────────────
+
 _SERIAL_CONFIGS: Dict[str, Dict[str, Any]] = {}
 
-# Per-device write lock. A single physical printer must never receive two
-# concurrent write_to_device() calls — the second one gets EBUSY on the
-# file descriptor and the bytes are silently dropped. Serialising per
-# device path is the simplest correct fix.
 _DEVICE_LOCKS: Dict[str, threading.Lock] = {}
 _DEVICE_LOCKS_GUARD = threading.Lock()
 
@@ -87,15 +95,15 @@ def get_serial_config(path: str) -> Dict[str, Any]:
 
 
 def is_serial_device(path: str) -> bool:
-    """Heuristic: is this device path a serial port?"""
-    if not path:
-        return False
-    if path.startswith("/dev/serial/"):
-        return True
-    if path.startswith("/dev/tty") and not path.startswith("/dev/ttyprint"):
-        return True
-    return False
+    """Heuristic: is this device path a serial port?
 
+    Delegates to vula_platform.is_serial_device_name — the platform
+    branch lives there (POSIX: /dev/tty*, /dev/serial/*; Windows: COM*).
+    """
+    return is_serial_device_name(path)
+
+
+# ── Direct device I/O ────────────────────────────────────────────────
 
 def write_to_device(path: str, data: bytes) -> None:
     """Write raw bytes to a printer device.
@@ -105,8 +113,12 @@ def write_to_device(path: str, data: bytes) -> None:
 
     Raises whatever the underlying I/O layer raises — callers are
     expected to catch Exception and surface the message to the operator.
+
+    On Windows, use spooler:<queue> or COM* assignments. Raw file
+    writes to Linux-style paths raise a clear RuntimeError on Windows
+    — the caller should route spooler assignments through
+    vula_printer_target.dispatch_print instead.
     """
-    log = logging.getLogger("vula.device")
     kind = "serial" if is_serial_device(path) else "usb"
     size = len(data)
     t0 = time.monotonic()
@@ -119,40 +131,33 @@ def write_to_device(path: str, data: bytes) -> None:
                 _write_file(path, data)
         except Exception as e:
             elapsed_ms = (time.monotonic() - t0) * 1000
-            log.error("%s write %s failed: %db -> %s (%.0fms)",
-                      kind, path, size, type(e).__name__ + ": " + str(e), elapsed_ms)
+            _log.error("%s write %s failed: %db -> %s (%.0fms)",
+                       kind, path, size,
+                       type(e).__name__ + ": " + str(e), elapsed_ms)
             raise
     elapsed_ms = (time.monotonic() - t0) * 1000
-    log.info("%s write %s ok: %db (%.0fms)", kind, path, size, elapsed_ms)
+    _log.info("%s write %s ok: %db (%.0fms)", kind, path, size, elapsed_ms)
 
 
 def _write_file(path: str, data: bytes) -> None:
-    log = logging.getLogger("vula.device")
+    """Write bytes to a Linux character device (/dev/usb/lpN).
+
+    Not supported on Windows. See module docstring for alternatives.
+    """
+    if is_windows():
+        raise RuntimeError(
+            f"raw file writes are not supported on Windows: {path}. "
+            f"Assign this printer via its COM port or a spooler queue "
+            f"in the Printers tab."
+        )
 
     # ── Why no fsync (audit N84) ────────────────────────────────
-    # A 1.1.875 fix added os.fsync() after flush() to "detect a
-    # device that closed mid-write." That was wrong. Character
-    # devices do not universally implement fsync. Concretely:
+    # Character devices do not universally implement fsync: usblp on
+    # kernel 6.12 returns EINVAL on every call regardless of payload.
+    # See sprint.md for the full trace. Correct safety mechanism is
+    # the select() probe below.
     #
-    #   * kernel 6.12 (Debian 13) — usblp returns EINVAL from fsync
-    #     on EVERY call, regardless of payload size. Every print
-    #     after 1.1.875 was reported as failed despite the printer
-    #     receiving the bytes. Verified on Vendor 2026-10-22:
-    #     `write(3323b)+flush+fsync` → EINVAL; `write(3323b)+flush`
-    #     → PASS. Adapter is Prolific 067b:2305 PL2305.
-    #   * kernel 6.17 (Ubuntu 25.10) — similar class of failure
-    #     reported on byatdbn client; chunked writes appeared to
-    #     work, but that test also used fsync, so we cannot
-    #     distinguish "fsync bug" from "write bug" there yet. The
-    #     chunking below covers both cases.
-    #
-    # Correct safety mechanism: after write() + flush() returns,
-    # the data is in the kernel/driver buffer. The select() probe
-    # below detects a driver that actually failed to accept the
-    # write (closed device, EOF). That probe works on any driver
-    # regardless of fsync support.
-
-    # ── Chunked writes (audit N83) ──────────────────────────────
+    # ── Chunked writes (audit N83) ───────────────────────────────
     # Some USB-to-parallel adapters (067b:2305 and relatives) reject
     # single write() calls above ~500b on newer kernels. Chunk into
     # 512b with a small inter-chunk delay. Small payloads take the
@@ -165,18 +170,13 @@ def _write_file(path: str, data: bytes) -> None:
             f.write(data)
             f.flush()
         else:
-            import time as _ct
             for _off in range(0, len(data), _CHUNK):
-                f.write(data[_off:_off+_CHUNK])
+                f.write(data[_off:_off + _CHUNK])
                 f.flush()
                 if _off + _CHUNK < len(data):
-                    _ct.sleep(_DELAY)
+                    time.sleep(_DELAY)
 
         # Non-blocking probe for the "device closed mid-write" case.
-        # On usblp, select() reports readable if the underlying USB
-        # device was disconnected (EOF) or queued a status byte. EOF
-        # means our write was almost certainly lost — raise so the
-        # caller reports failure instead of a false "printed".
         try:
             r, _, _ = select.select([f.fileno()], [], [], 0.05)
             if r:
@@ -185,31 +185,27 @@ def _write_file(path: str, data: bytes) -> None:
                     raise RuntimeError(
                         f"printer device closed unexpectedly during write: {path}"
                     )
-                log.debug("printer status byte from %s: %r", path, probe)
+                _log.debug("printer status byte from %s: %r", path, probe)
         except (OSError, ValueError):
-            # fd not selectable (some kernel variants) or already closed.
-            # Not a failure of the write itself — do not raise.
             pass
 
 
 def _write_serial(path: str, data: bytes) -> None:
+    """Write bytes to a serial port via pyserial.
+
+    Works identically on Linux (/dev/tty*) and Windows (COM*). pyserial
+    handles the platform-specific line discipline and automatically
+    prepends ``\\\\.\\`` for COM ports >= 10 on Windows.
+    """
     try:
         import serial
     except ImportError:
         raise RuntimeError(
-            "pyserial is not installed. Install it with: "
-            "pip install pyserial"
+            "pyserial is not installed. Install it with: pip install pyserial"
         )
 
     cfg = get_serial_config(path)
     baud = int(cfg.get("baud", 9600))
-    # Scale write timeout to payload size. At `baud` bps with 10 bits per
-    # byte (8N1 + start/stop), a len(data)-byte payload takes
-    # len(data) * 10 / baud seconds on the wire. Add a 5 s floor (so a
-    # fully stuck port still eventually fails) and a 5 s margin (so a
-    # slow printer does not trip the timeout mid-receipt). The old fixed
-    # 5-second ceiling silently truncated long receipts on 9600-baud
-    # hardware — a real-POS slip with logo + QR regularly exceeds it.
     if baud > 0:
         wire_seconds = (len(data) * 10) / baud
     else:
@@ -230,179 +226,47 @@ def _write_serial(path: str, data: bytes) -> None:
 
     with serial.Serial(**kwargs) as s:
         s.write(data)
-        # pyserial's flush() calls tcdrain() — it blocks until the
-        # kernel has pushed every byte to the UART TX buffer. Correct
-        # semantics for receipt delivery: return only when the bytes
-        # have left both userspace and the kernel, and are on the wire.
+        # pyserial's flush() blocks until the kernel has pushed every
+        # byte to the UART TX buffer. Correct semantics for receipt
+        # delivery: return only when the bytes have left userspace.
         s.flush()
 
 
-# ---------------------------------------------------------------------------
-# Device identity — stable fingerprints for role persistence
-# ---------------------------------------------------------------------------
-
-_log = logging.getLogger("vula.device")
-
-
-def _read_sysfs(p) -> str:
-    """Read a single sysfs attribute, returning '' on any failure."""
-    try:
-        from pathlib import Path as _P
-        return _P(p).read_text(encoding="ascii", errors="replace").strip()
-    except Exception:
-        return ""
-
-
-def _usb_ids_from_dir(root) -> tuple:
-    """Given a directory that (maybe) holds USB descriptors, return
-    (vendor, product, serial, manufacturer, product_name) or None.
-
-    Walks up to 6 parents, because the descriptor we want may be one or
-    two levels above the class node (interface → device).
-    """
-    from pathlib import Path as _P
-    p = _P(root)
-    for _ in range(6):
-        vendor = _read_sysfs(p / "idVendor")
-        product = _read_sysfs(p / "idProduct")
-        if vendor and product:
-            return (
-                vendor,
-                product,
-                _read_sysfs(p / "serial"),
-                _read_sysfs(p / "manufacturer"),
-                _read_sysfs(p / "product"),
-            )
-        if p.parent == p:
-            break
-        p = p.parent
-    return None
-
-
-def _usb_printer_info(name: str):
-    """Return (vendor, product, serial, manufacturer, product_name) for a
-    /dev/usb/lpN device, or None.
-
-    Tries four strategies in order:
-      1. sysfs class walk from /sys/class/usbmisc/lpN/ and /sys/class/usb/lpN/
-      2. /sys/bus/usb/devices/*/ search for a usblp-bound interface
-      3. udevadm info -q property as a subprocess fallback
-
-    Logs which strategy succeeded so we can verify after deploy from the
-    app log alone, without shelling into the client machine.
-    """
-    from pathlib import Path as _P
-
-    # ── Strategy 1: sysfs class walk ────────────────────────────────
-    for base in (f"/sys/class/usbmisc/{name}", f"/sys/class/usb/{name}"):
-        base_p = _P(base)
-        if not base_p.exists():
-            continue
-        dev = base_p / "device"
-        if not dev.exists():
-            dev = base_p
-        info = _usb_ids_from_dir(dev)
-        if info:
-            _log.info("fingerprint strategy=class-walk %s -> %s:%s sn=%r",
-                      name, info[0], info[1], info[2])
-            return info
-
-    # ── Strategy 2: search bus for the usblp-bound interface ───────
-    try:
-        bus = _P("/sys/bus/usb/devices")
-        if bus.exists():
-            for iface in bus.iterdir():
-                if ":" not in iface.name:
-                    continue
-                drv_link = iface / "driver"
-                if not drv_link.exists():
-                    continue
-                try:
-                    drv = drv_link.resolve().name
-                except Exception:
-                    continue
-                if drv != "usblp":
-                    continue
-                # Does this interface own our lpN node?
-                owns = False
-                for sub in ("usbmisc", "usb"):
-                    if (iface / sub / name).exists():
-                        owns = True
-                        break
-                if not owns:
-                    continue
-                parent_name = iface.name.split(":", 1)[0]
-                info = _usb_ids_from_dir(bus / parent_name)
-                if info:
-                    _log.info("fingerprint strategy=bus-usblp %s -> %s:%s sn=%r",
-                              name, info[0], info[1], info[2])
-                    return info
-    except Exception as exc:
-        _log.debug("bus-usblp strategy failed for %s: %s", name, exc)
-
-    # ── Strategy 3: udevadm subprocess fallback ─────────────────────
-    try:
-        import subprocess
-        dev_path = f"/dev/usb/{name}"
-        r = subprocess.run(
-            ["udevadm", "info", "-q", "property", "-n", dev_path],
-            capture_output=True, text=True, timeout=2,
-        )
-        if r.returncode == 0 and r.stdout:
-            props = {}
-            for line in r.stdout.splitlines():
-                if "=" in line:
-                    k, v = line.split("=", 1)
-                    props[k.strip()] = v.strip()
-            vendor = props.get("ID_VENDOR_ID", "")
-            product = props.get("ID_MODEL_ID", "")
-            if vendor and product:
-                info = (
-                    vendor,
-                    product,
-                    props.get("ID_SERIAL_SHORT", "") or props.get("ID_SERIAL", ""),
-                    props.get("ID_VENDOR", "") or props.get("ID_VENDOR_FROM_DATABASE", ""),
-                    props.get("ID_MODEL", "") or props.get("ID_MODEL_FROM_DATABASE", ""),
-                )
-                _log.info("fingerprint strategy=udevadm %s -> %s:%s sn=%r",
-                          name, info[0], info[1], info[2])
-                return info
-    except Exception as exc:
-        _log.debug("udevadm strategy failed for %s: %s", name, exc)
-
-    _log.warning("fingerprint: no USB identity found for %s — falling back to path", name)
-    return None
-
+# ── Device identity ─────────────────────────────────────────────────
 
 def fingerprint_for_path(path: str) -> str:
     """Return a stable identity string for a printer device.
 
-    Persisting role assignments by this string instead of by raw /dev path
-    survives kernel re-enumeration (lp0 ⇄ lp2 swaps across reboots). If no
-    stable identity can be derived, returns 'path:<path>' — the resolver
-    treats this as "no fingerprint" and leaves the role alone, so we never
-    make a working assignment worse.
+    Persisting role assignments by this string instead of by raw device
+    path survives re-enumeration (lp0 ⇄ lp2 on Linux; COM3 ⇄ COM5 on
+    Windows). If no stable identity can be derived, returns
+    ``path:<path>`` — the resolver treats this as "no fingerprint" and
+    leaves the role alone, so we never make a working assignment worse.
+
+    Platform dispatch:
+      * Linux:   CUPS queue name, /dev/serial/by-id alias, or
+                 usb:<vid>:<pid>[:<serial>]
+      * Windows: spooler queue name or serial:<vid>:<pid>[:<serial>]
     """
     if not path:
         return ""
+    if is_windows():
+        return _fingerprint_windows(path)
+    return _fingerprint_posix(path)
 
-    # CUPS queue names are stable across reboots — the assignment string
-    # itself is a fine fingerprint. Strip the raw/driver suffix so that
-    # switching mode on the same queue keeps the role assignment valid
-    # (a printer that goes from raw to driver mode is still the same
-    # physical printer in the same CUPS queue).
+
+def _fingerprint_posix(path: str) -> str:
+    """Linux fingerprint: CUPS queue, by-id alias, or usb VID:PID[:serial]."""
     if path.startswith("cups:"):
         parts = path.split(":", 2)
         if len(parts) >= 2 and parts[1]:
             return f"cups:{parts[1]}"
         return path
 
-    # ── Serial by-id symlink — already stable ──────────────────────
     if path.startswith("/dev/serial/by-id/"):
         from pathlib import Path as _P
         return f"serial:{_P(path).name}"
 
-    # ── Bare tty — prefer the by-id alias ───────────────────────────
     if path.startswith("/dev/tty"):
         try:
             from pathlib import Path as _P
@@ -420,7 +284,6 @@ def fingerprint_for_path(path: str) -> str:
         from pathlib import Path as _P
         return f"tty:{_P(path).name}"
 
-    # ── USB printer-class device — /dev/usb/lpN ─────────────────────
     if path.startswith("/dev/usb/lp"):
         from pathlib import Path as _P
         name = _P(path).name
@@ -429,8 +292,6 @@ def fingerprint_for_path(path: str) -> str:
             vendor, product, serial, _mfr, _prod = info
             if serial:
                 return f"usb:{vendor}:{product}:{serial}"
-            # No serial — include the topology path so a device that stays
-            # in the same physical USB port keeps the same fingerprint.
             try:
                 bus = _P("/sys/bus/usb/devices")
                 if bus.exists():
@@ -448,17 +309,50 @@ def fingerprint_for_path(path: str) -> str:
     return f"path:{path}"
 
 
-def describe_device(path: str) -> str:
-    """Human-readable device description for the assignment dialog.
+def _fingerprint_windows(path: str) -> str:
+    """Windows fingerprint: spooler queue name or COM-port USB identity.
 
-    Falls back to the raw path if no metadata can be read.
+    Spooler queue names are stable across reboots. COM ports renumber
+    across reboots and re-plugs; for USB-serial adapters we use
+    VID:PID[:serial] so the fingerprint survives renumbering. Non-USB
+    serial ports fall back to the port name.
     """
+    if path.startswith("spooler:"):
+        queue = path[len("spooler:"):]
+        if queue:
+            return f"spooler:{queue}"
+        return path
+
+    if path.upper().startswith("COM"):
+        try:
+            from serial.tools.list_ports import comports
+            for port in comports():
+                if (port.device or "").upper() == path.upper():
+                    vid = f"{port.vid:04x}" if port.vid else ""
+                    pid = f"{port.pid:04x}" if port.pid else ""
+                    serial_num = port.serial_number or ""
+                    if vid and pid:
+                        if serial_num:
+                            return f"serial:{vid}:{pid}:{serial_num}"
+                        return f"serial:{vid}:{pid}"
+        except Exception:
+            pass
+        return f"serial:{path.upper()}"
+
+    return f"path:{path}"
+
+
+def describe_device(path: str) -> str:
+    """Human-readable device description for the assignment dialog."""
     if not path:
         return "(unassigned)"
+    if is_windows():
+        return _describe_windows(path)
+    return _describe_posix(path)
 
-    # CUPS queue assignments come as "cups:<queue>:raw" or
-    # "cups:<queue>:driver". Present them with a mode hint so the
-    # operator knows what they picked.
+
+def _describe_posix(path: str) -> str:
+    """Linux description: CUPS queue, serial alias, or usb VID:PID."""
     if path.startswith("cups:"):
         parts = path.split(":", 2)
         if len(parts) == 3:
@@ -502,3 +396,142 @@ def describe_device(path: str) -> str:
         return f"USB printer-class device  [{path}]"
 
     return f"Printer device  [{path}]"
+
+
+def _describe_windows(path: str) -> str:
+    """Windows description: spooler queue name or COM port with USB identity."""
+    if path.startswith("spooler:"):
+        queue = path[len("spooler:"):]
+        return f"Windows printer — {queue}  [{path}]"
+
+    if path.upper().startswith("COM"):
+        try:
+            from serial.tools.list_ports import comports
+            for port in comports():
+                if (port.device or "").upper() == path.upper():
+                    detail = port.description or port.hwid or ""
+                    if detail:
+                        return f"Serial printer — {path} ({detail})  [{path}]"
+                    break
+        except Exception:
+            pass
+        return f"Serial printer — {path}  [{path}]"
+
+    return f"Printer device  [{path}]"
+
+
+# ── Linux-only helpers: sysfs + udevadm USB identity ────────────────
+
+def _read_sysfs(p) -> str:
+    """Read a single sysfs attribute, returning '' on any failure."""
+    try:
+        from pathlib import Path as _P
+        return _P(p).read_text(encoding="ascii", errors="replace").strip()
+    except Exception:
+        return ""
+
+
+def _usb_ids_from_dir(root) -> tuple:
+    """Given a directory that (maybe) holds USB descriptors, return
+    (vendor, product, serial, manufacturer, product_name) or None.
+    """
+    from pathlib import Path as _P
+    p = _P(root)
+    for _ in range(6):
+        vendor = _read_sysfs(p / "idVendor")
+        product = _read_sysfs(p / "idProduct")
+        if vendor and product:
+            return (
+                vendor,
+                product,
+                _read_sysfs(p / "serial"),
+                _read_sysfs(p / "manufacturer"),
+                _read_sysfs(p / "product"),
+            )
+        if p.parent == p:
+            break
+        p = p.parent
+    return None
+
+
+def _usb_printer_info(name: str):
+    """Return (vendor, product, serial, manufacturer, product_name) for a
+    /dev/usb/lpN device, or None. Linux only.
+    """
+    from pathlib import Path as _P
+
+    for base in (f"/sys/class/usbmisc/{name}", f"/sys/class/usb/{name}"):
+        base_p = _P(base)
+        if not base_p.exists():
+            continue
+        dev = base_p / "device"
+        if not dev.exists():
+            dev = base_p
+        info = _usb_ids_from_dir(dev)
+        if info:
+            _log.info("fingerprint strategy=class-walk %s -> %s:%s sn=%r",
+                      name, info[0], info[1], info[2])
+            return info
+
+    try:
+        bus = _P("/sys/bus/usb/devices")
+        if bus.exists():
+            for iface in bus.iterdir():
+                if ":" not in iface.name:
+                    continue
+                drv_link = iface / "driver"
+                if not drv_link.exists():
+                    continue
+                try:
+                    drv = drv_link.resolve().name
+                except Exception:
+                    continue
+                if drv != "usblp":
+                    continue
+                owns = False
+                for sub in ("usbmisc", "usb"):
+                    if (iface / sub / name).exists():
+                        owns = True
+                        break
+                if not owns:
+                    continue
+                parent_name = iface.name.split(":", 1)[0]
+                info = _usb_ids_from_dir(bus / parent_name)
+                if info:
+                    _log.info("fingerprint strategy=bus-usblp %s -> %s:%s sn=%r",
+                              name, info[0], info[1], info[2])
+                    return info
+    except Exception as exc:
+        _log.debug("bus-usblp strategy failed for %s: %s", name, exc)
+
+    try:
+        import subprocess
+        dev_path = f"/dev/usb/{name}"
+        r = subprocess.run(
+            ["udevadm", "info", "-q", "property", "-n", dev_path],
+            capture_output=True, text=True, timeout=2,
+        )
+        if r.returncode == 0 and r.stdout:
+            props = {}
+            for line in r.stdout.splitlines():
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    props[k.strip()] = v.strip()
+            vendor = props.get("ID_VENDOR_ID", "")
+            product = props.get("ID_MODEL_ID", "")
+            if vendor and product:
+                info = (
+                    vendor,
+                    product,
+                    props.get("ID_SERIAL_SHORT", "") or props.get("ID_SERIAL", ""),
+                    props.get("ID_VENDOR", "") or props.get("ID_VENDOR_FROM_DATABASE", ""),
+                    props.get("ID_MODEL", "") or props.get("ID_MODEL_FROM_DATABASE", ""),
+                )
+                _log.info("fingerprint strategy=udevadm %s -> %s:%s sn=%r",
+                          name, info[0], info[1], info[2])
+                return info
+    except Exception as exc:
+        _log.debug("udevadm strategy failed for %s: %s", name, exc)
+
+    _log.warning("fingerprint: no USB identity found for %s — falling back to path", name)
+    return None

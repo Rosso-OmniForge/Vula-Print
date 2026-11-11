@@ -23,7 +23,69 @@ from vula_singleton import acquire_singleton_lock
 from vula_app import VulaPrintApp
 
 
+def _run_onboard() -> int:
+    """Standalone wizard entry point — for install.sh --onboard.
+
+    Acquires the same singleton lock as the main app so the wizard
+    cannot run at the same time as a running instance (which would
+    leave the running instance with a stale in-memory connection
+    cache).
+    """
+    from vula_logging import setup_logging
+    setup_logging()
+
+    import logging
+    _onboard_log = logging.getLogger("vula.onboard")
+
+    lock_fd = acquire_singleton_lock()
+    if lock_fd is None:
+        print(
+            "Vula! Print is already running — stop it before running the "
+            "onboarding wizard.",
+            file=sys.stderr,
+        )
+        from vula_platform import is_windows
+        if is_windows():
+            print(
+                "  Right-click the system tray icon and choose Quit.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "  systemctl --user stop vula-print",
+                file=sys.stderr,
+            )
+        return 1
+
+    from PyQt6.QtWidgets import QApplication, QDialog
+    from vula_ui.onboarding_wizard import OnboardingWizard
+
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+
+    try:
+        wizard = OnboardingWizard()
+        result = wizard.exec()
+    except Exception as exc:
+        _onboard_log.exception("wizard crashed")
+        print(f"Onboarding wizard failed: {exc}", file=sys.stderr)
+        return 1
+
+    if result == QDialog.DialogCode.Accepted:
+        _onboard_log.info("onboarding wizard completed — connection saved")
+        return 0
+    _onboard_log.info("onboarding wizard cancelled")
+    return 1
+
 def main():
+    # ── --onboard mode ────────────────────────────────────────────
+    # Standalone wizard, used by install.sh when the operator picks
+    # the GUI setup path. Creates the QApplication, runs the wizard,
+    # saves the connection to the DB, exits. No main window, no
+    # polling, no log-upload timer.
+    if "--onboard" in sys.argv:
+        sys.exit(_run_onboard())
+
     # ── Logging ──────────────────────────────────────────────────
     from vula_logging import setup_logging
     setup_logging()

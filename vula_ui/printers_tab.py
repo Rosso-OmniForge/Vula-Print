@@ -1,7 +1,7 @@
 """Printers tab — card-based role assignment with live device status.
 
 Three roles (Label / POS / A4), one card each. Below, a live list of all
-printer-class devices found under /dev/usb/.
+printer-class devices discovered by the platform-specific scanner.
 
 Status probe is intentionally passive: we only call Path.exists() and
 os.access(W_OK). Opening the device can reset the printer, so we never
@@ -20,6 +20,8 @@ from PyQt6.QtWidgets import (
     QPushButton, QVBoxLayout, QWidget,
 )
 
+from vula_platform import is_windows, program_data_dir
+
 
 # (role_key, display_name) — role_key is the dict key into
 # VulaPrintApp.printer_roles.
@@ -29,6 +31,32 @@ _ROLES = [
     ("a4",       "A4 Printer"),
 ]
 
+
+def _log_upload_disabled_path_str() -> str:
+    """Path string of the log-upload disabled flag, platform-appropriate."""
+    return str(program_data_dir() / "log-upload-disabled")
+
+
+def _log_upload_reenable_hint() -> str:
+    """Instructions for re-enabling log upload after a --no-log-upload install."""
+    path = _log_upload_disabled_path_str()
+    if is_windows():
+        return f"delete as Administrator:\n  {path}"
+    return f"sudo rm {path}"
+
+
+def _devices_location_hint() -> str:
+    """Short description of where device discovery looks, per platform."""
+    if is_windows():
+        return "COM ports and the Windows spooler"
+    return "/dev/usb/ (and /dev/tty* for serial)"
+
+
+def _serial_device_pattern() -> str:
+    """Glob-like description of what counts as a serial device, per platform."""
+    if is_windows():
+        return "COM*"
+    return "/dev/tty*"
 
 class PrintersTabMixin:
     """Card-based printer manager with live status."""
@@ -151,8 +179,8 @@ class PrintersTabMixin:
         if LOG_UPLOAD_INSTALL_DISABLED:
             warn_lbl = QLabel(
                 "ⓘ  Log upload is disabled by install policy and cannot "
-                "be changed here. To re-enable, run: "
-                "sudo rm /etc/vula/log-upload-disabled"
+                "be changed here. To re-enable, "
+                + _log_upload_reenable_hint()
             )
             warn_lbl.setWordWrap(True)
             warn_lbl.setStyleSheet(
@@ -266,8 +294,7 @@ class PrintersTabMixin:
                 self, "Disabled by Install",
                 "Log upload is disabled by install policy and cannot "
                 "be re-enabled from the UI.\n\n"
-                "To re-enable, run:\n"
-                "  sudo rm /etc/vula/log-upload-disabled"
+                "To re-enable, " + _log_upload_reenable_hint()
             )
             return
         self.log_upload_enabled = not getattr(self, "log_upload_enabled", True)
@@ -298,7 +325,7 @@ class PrintersTabMixin:
             )
             btn.setToolTip(
                 "Log upload is disabled by install policy. "
-                "Remove /etc/vula/log-upload-disabled to re-enable."
+                f"Re-enable: {_log_upload_reenable_hint()}"
             )
             return
         on = bool(getattr(self, "log_upload_enabled", True))
@@ -415,7 +442,8 @@ class PrintersTabMixin:
         )
         settings_btn.setEnabled(False)
         settings_btn.setToolTip(
-            "Serial device settings (available only for /dev/tty* devices)"
+            f"Serial device settings (available only for "
+            f"{_serial_device_pattern()} devices)"
         )
         actions.addWidget(settings_btn)
 
@@ -544,7 +572,9 @@ class PrintersTabMixin:
 
         devices = list(self.discovered_printers or [])
         if not devices:
-            item = QListWidgetItem("No USB printer devices detected under /dev/usb/")
+            item = QListWidgetItem(
+                f"No printer devices detected ({_devices_location_hint()})"
+            )
             item.setFlags(Qt.ItemFlag.NoItemFlags)
             self._discovered_list.addItem(item)
             return
@@ -582,9 +612,9 @@ class PrintersTabMixin:
         layout.addWidget(heading)
 
         sub = QLabel(
-            "Only devices present in /dev/usb/ are shown. "
-            "If your printer is missing, close this dialog, click Rescan, "
-            "and try again."
+            f"Only devices discovered via {_devices_location_hint()} "
+            "are shown. If your printer is missing, close this dialog, "
+            "click Rescan, and try again."
         )
         sub.setWordWrap(True)
         sub.setStyleSheet(f"color:{self.C_TEXT_DIM}; font-size:11px;")
@@ -686,12 +716,19 @@ class PrintersTabMixin:
 
         from vula_device_io import is_serial_device
         if not is_serial_device(path):
-            QMessageBox.information(
-                self, "Not a Serial Device",
-                f"{path} is a USB printer-class device — it has no serial "
-                "settings. Only /dev/tty* and /dev/serial/* devices have "
-                "configurable baud / parity / flow control."
-            )
+            if is_windows():
+                msg = (
+                    f"{path} is not a serial device — it has no serial "
+                    f"settings. Only {_serial_device_pattern()} devices "
+                    "have configurable baud / parity / flow control."
+                )
+            else:
+                msg = (
+                    f"{path} is a USB printer-class device — it has no "
+                    "serial settings. Only /dev/tty* and /dev/serial/* "
+                    "devices have configurable baud / parity / flow control."
+                )
+            QMessageBox.information(self, "Not a Serial Device", msg)
             return
 
         self._open_serial_settings_dialog(path, role_name)

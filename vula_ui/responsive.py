@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import subprocess
 from typing import Optional
+from vula_platform import is_windows
 
 
 # ── Emoji detection (cached for process lifetime) ───────────────
@@ -22,7 +23,13 @@ _EMOJI_OK_CACHE: Optional[bool] = None
 
 
 def _detect_emoji_support() -> bool:
-    """Return True if the system has an emoji font installed."""
+    """Return True if the system has an emoji font installed.
+
+    Windows 10+ ships Segoe UI Emoji by default — no need to shell out
+    to fc-list (which does not exist on Windows).
+    """
+    if is_windows():
+        return True
     try:
         result = subprocess.run(
             ["fc-list"],

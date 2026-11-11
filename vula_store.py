@@ -7,11 +7,11 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
+from vula_platform import is_windows
 
 _log = logging.getLogger("vula.store")
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 _VALID_DOC_CLASSES = frozenset({"label", "pos_slip", "pos_eod", "a4"})
 _VALID_STATUSES = frozenset({
@@ -67,13 +67,18 @@ CREATE INDEX IF NOT EXISTS idx_events_job         ON print_events(job_id, at);
 -- settings.json (runtime). Populated once by install.sh at install
 -- time, or by migrate_legacy_connections() on first launch after an
 -- update from a pre-migration build.
+-- key_encrypted: 0 = api_key stored plaintext (Linux, or a
+-- Windows row not yet re-saved); 1 = api_key stored as a base64
+-- DPAPI blob, decryptable only by the same Windows user account.
+-- See vula_secrets.py for the encryption layer.
 CREATE TABLE IF NOT EXISTS connections (
     connection_id   TEXT PRIMARY KEY,
     display_name    TEXT NOT NULL,
     api_base_url    TEXT NOT NULL,
     api_key         TEXT NOT NULL,
     printer_user_id INTEGER,
-    display_order   INTEGER NOT NULL DEFAULT 0
+    display_order   INTEGER NOT NULL DEFAULT 0,
+    key_encrypted   INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -103,18 +108,29 @@ class PrintStore:
         # three files are credential-bearing.
         self._secure_db_permissions()
         self._apply_schema()
+        self._encrypt_plaintext_rows_on_first_open()
         _log.info("PrintStore opened: %s (schema v%d)", self._path, _SCHEMA_VERSION)
 
     def _secure_db_permissions(self) -> None:
         """chmod the DB and its WAL/SHM side files to 0600.
 
-        The connections table stores api_key in plaintext. Debian
+        Linux: the connections table stores api_key in plaintext, so
+        0600 on the DB and its WAL/SHM side files is a real protection
+        against other local users reading the credential. Debian
         installs commonly have umask 0o002, so sqlite3.connect() creates
-        the files 0664 — group-readable and group-writable. Any other
-        local user on the POS box could then read the backend credential
-        for every store bound to this device. Idempotent and safe to
-        call on every open; corrects pre-existing looser modes too.
+        the files 0664 — group-readable and group-writable. Idempotent
+        and safe to call on every open; corrects pre-existing looser
+        modes too.
+
+        Windows: os.chmod() only toggles the read-only bit and does not
+        touch ACLs. The DB inherits the parent directory's per-user
+        profile ACLs, which are not world-readable on a default Windows
+        install. The api_key column is encrypted at rest with DPAPI
+        (Phase D — vula_secrets), which is the real protection on
+        Windows. Skip the no-op chmod here so the intent is honest.
         """
+        if is_windows():
+            return
         import os as _os
         targets = [
             self._path,
@@ -134,14 +150,85 @@ class PrintStore:
         cur = self._conn.execute("PRAGMA user_version")
         current = int(cur.fetchone()[0])
         if current >= _SCHEMA_VERSION:
+            # Even at the target version, run the idempotent column
+            # migration — it self-heals a DB that was tampered with,
+            # partially migrated, or restored from a mixed backup.
+            self._migrate_connections_add_key_encrypted()
             return
         # executescript is idempotent — all statements are IF NOT EXISTS —
         # so we can safely run the full schema regardless of the current
         # version and let the DDL skip what's already present.
         self._conn.executescript(_SCHEMA_SQL)
+        # Column-only migrations for DBs that predate this build.
+        self._migrate_connections_add_key_encrypted()
         self._conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
         self._conn.commit()
         _log.info("PrintStore schema applied (v%d → v%d)", current, _SCHEMA_VERSION)
+
+    def _migrate_connections_add_key_encrypted(self) -> None:
+        """Idempotent: add the key_encrypted column if it is missing.
+
+        Runs for every DB opened after Phase D, so it must be a no-op on
+        DBs that already have the column. Uses PRAGMA table_info rather
+        than attempting an ALTER that could throw.
+        """
+        cols = {row[1] for row in self._conn.execute(
+            "PRAGMA table_info(connections)"
+        ).fetchall()}
+        if "key_encrypted" not in cols:
+            self._conn.execute(
+                "ALTER TABLE connections "
+                "ADD COLUMN key_encrypted INTEGER NOT NULL DEFAULT 0"
+            )
+            _log.info(
+                "Added key_encrypted column to connections table "
+                "(existing rows default to 0 — plaintext)"
+            )
+
+    def _encrypt_plaintext_rows_on_first_open(self) -> None:
+        """One-time backfill: encrypt any plaintext api_key rows.
+
+        This covers the case where a DB with plaintext api_keys is
+        opened on Windows for the first time after upgrading to Phase D
+        — the operator does not need to re-save settings for the
+        credentials to become encrypted at rest.
+
+        Idempotent: once every row is key_encrypted=1, this is a no-op
+        query. Called from __init__ right after _apply_schema.
+        """
+        from vula_secrets import protect, should_encrypt
+        if not should_encrypt():
+            return
+
+        rows = self._conn.execute(
+            "SELECT connection_id, api_key FROM connections "
+            "WHERE key_encrypted = 0 AND api_key != ''"
+        ).fetchall()
+        if not rows:
+            return
+
+        encrypted_count = 0
+        for r in rows:
+            try:
+                encrypted = protect(r["api_key"])
+                self._conn.execute(
+                    "UPDATE connections SET api_key=?, key_encrypted=1 "
+                    "WHERE connection_id=?",
+                    (encrypted, r["connection_id"]),
+                )
+                encrypted_count += 1
+            except Exception as exc:
+                _log.warning(
+                    "could not encrypt api_key for connection %r "
+                    "(will retry on next open): %s",
+                    r["connection_id"], exc,
+                )
+        self._conn.commit()
+        if encrypted_count:
+            _log.info(
+                "Encrypted %d plaintext api_key row(s) with DPAPI "
+                "(Phase D backfill)", encrypted_count,
+            )
 
     def close(self) -> None:
         try:
@@ -376,11 +463,40 @@ class PrintStore:
     # ── Connections ────────────────────────────────────────────────
 
     def list_connections(self) -> List[Dict[str, Any]]:
+        """Return all connections with api_key decrypted to plaintext.
+
+        Phase D: rows with key_encrypted=1 are DPAPI-decrypted before
+        returning. Rows with key_encrypted=0 are returned as-is — they
+        are plaintext (Linux, or a Windows row not yet re-saved).
+
+        Decryption failure (moved Windows DB to Linux, or corrupted
+        blob) returns an empty api_key and logs at ERROR. The caller
+        treats "empty key" as "unconfigured", so the operator is
+        prompted to re-enter rather than the app silently failing auth
+        with a garbage key.
+        """
+        from vula_secrets import unprotect
+
         rows = self._conn.execute(
             "SELECT * FROM connections "
             "ORDER BY display_order ASC, connection_id ASC"
         ).fetchall()
-        return [dict(r) for r in rows]
+
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            if d.get("key_encrypted"):
+                try:
+                    d["api_key"] = unprotect(d["api_key"])
+                except Exception as exc:
+                    _log.error(
+                        "could not decrypt api_key for connection %r: %s "
+                        "— returning empty; operator must re-enter",
+                        d.get("connection_id"), exc,
+                    )
+                    d["api_key"] = ""
+            out.append(d)
+        return out
 
     def upsert_connection(
         self,
@@ -392,22 +508,32 @@ class PrintStore:
         printer_user_id: Optional[int] = None,
         display_order: int = 0,
     ) -> None:
+        from vula_secrets import protect, should_encrypt
+
+        if should_encrypt():
+            stored_key = protect(api_key)
+            key_encrypted = 1
+        else:
+            stored_key = api_key
+            key_encrypted = 0
+
         self._conn.execute(
             """
             INSERT INTO connections (
                 connection_id, display_name, api_base_url, api_key,
-                printer_user_id, display_order
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                printer_user_id, display_order, key_encrypted
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(connection_id) DO UPDATE SET
                 display_name    = excluded.display_name,
                 api_base_url    = excluded.api_base_url,
                 api_key         = excluded.api_key,
                 printer_user_id = excluded.printer_user_id,
-                display_order   = excluded.display_order
+                display_order   = excluded.display_order,
+                key_encrypted   = excluded.key_encrypted
             """,
             (
-                connection_id, name, api_base_url, api_key,
-                printer_user_id, int(display_order),
+                connection_id, name, api_base_url, stored_key,
+                printer_user_id, int(display_order), key_encrypted,
             ),
         )
         self._conn.commit()
@@ -422,23 +548,39 @@ class PrintStore:
     def replace_all_connections(self, connections: List[Dict[str, Any]]) -> None:
         """Replace the whole connections list in one transaction. Called
         from save_settings so DB state always matches the app's in-memory
-        list — add, edit, reorder, and delete all land as one write."""
+        list — add, edit, reorder, and delete all land as one write.
+
+        Phase D: on Windows, api_key is DPAPI-encrypted before storage
+        and key_encrypted is set to 1. Input dicts are always plaintext
+        — encryption is transparent at this boundary.
+        """
+        from vula_secrets import protect, should_encrypt
+        encrypt = should_encrypt()
+
         self._conn.execute("DELETE FROM connections")
         for i, c in enumerate(connections):
+            if encrypt:
+                stored_key = protect(c["api_key"])
+                key_encrypted = 1
+            else:
+                stored_key = c["api_key"]
+                key_encrypted = 0
+
             self._conn.execute(
                 """
                 INSERT INTO connections (
                     connection_id, display_name, api_base_url, api_key,
-                    printer_user_id, display_order
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    printer_user_id, display_order, key_encrypted
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     c["connection_id"],
                     c["name"],
                     c["api_base_url"],
-                    c["api_key"],
+                    stored_key,
                     c.get("printer_user_id"),
                     i,
+                    key_encrypted,
                 ),
             )
         self._conn.commit()

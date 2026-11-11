@@ -8,6 +8,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from vula_platform import (
+    app_dir as _app_dir,
+    log_upload_disabled_path as _log_upload_disabled_path,
+)
+
 
 def _load_env_file(env_file: Path) -> None:
     """Load simple KEY=VALUE pairs from .env into process environment."""
@@ -53,17 +58,24 @@ DEFAULT_LABEL_LAYOUT = {
     "barcode_narrow":   1,
     "barcode_wide":     2,
 }
-APP_CONFIG_FILE = Path.home() / ".config" / "vula_print" / "settings.json"
-APP_HISTORY_FILE = Path.home() / ".config" / "vula_print" / "print_history.json"
-APP_DB_FILE = Path.home() / ".config" / "vula_print" / "print_jobs.db"
+# Per-user state lives under vula_platform.app_dir():
+#   Linux:   ~/.config/vula_print/
+#   Windows: %APPDATA%\VulaPrint\
+# vula_platform owns the platform decision; nothing here hard-codes a
+# home-directory layout any more.
+APP_CONFIG_FILE = _app_dir() / "settings.json"
+APP_HISTORY_FILE = _app_dir() / "print_history.json"
+APP_DB_FILE = _app_dir() / "print_jobs.db"
+
 # Install-time hard-off for log upload (audit B.1 / M36). Written by
-# install.sh --no-log-upload. Readable by the app (0644 root:root);
-# when present, uploads are disabled regardless of the UI toggle.
-# Deliberately separate from settings.json — settings.json lives under
-# $REAL_HOME and is user-editable; this file is root-owned so an
-# operator cannot silently re-enable uploads for a customer who
-# declined them at install time. Removing it requires sudo.
-LOG_UPLOAD_INSTALL_DISABLED_FILE = Path("/etc/vula/log-upload-disabled")
+# install.sh --no-log-upload. Location is machine-scoped and owned by
+# an administrator, so a standard user cannot silently re-enable
+# uploads for a customer who declined them at install time:
+#   Linux:   /etc/vula/log-upload-disabled          (root:root 0644)
+#   Windows: %ProgramData%\Vula\log-upload-disabled (Administrators full,
+#                                                     Users read)
+# Removing it requires sudo / elevation.
+LOG_UPLOAD_INSTALL_DISABLED_FILE = _log_upload_disabled_path()
 
 
 def _install_log_upload_disabled() -> bool:

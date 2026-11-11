@@ -12,6 +12,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
+import logging
+_log = logging.getLogger("vula.ui.config")
+
 import requests
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QProcess
 from PyQt6.QtGui import (
@@ -152,9 +155,10 @@ class ConfigMixin:
         """First-run helper.
 
         * If connections are configured, kick off config fetch.
-        * Otherwise, open the connections dialog once so the operator can
-          add their first store. Does not auto-reopen on subsequent ticks —
-          uses self._onboarding_offered as a one-shot guard.
+        * Otherwise, launch the onboarding wizard once. Does not
+          auto-reopen on subsequent ticks — uses self._onboarding_offered
+          as a one-shot guard. If the operator dismisses the wizard,
+          they can still reach Manage Connections from the sidebar.
         """
         if self.active_connections:
             self.fetch_all_printer_configs(show_dialogs=False)
@@ -172,9 +176,58 @@ class ConfigMixin:
         self._onboarding_offered = True
         self.status_bar.showMessage("Welcome — configure a store to get started.")
 
-        # Open the connections dialog. It handles its own save + refresh.
         from PyQt6.QtCore import QTimer
-        QTimer.singleShot(300, self.show_connections_dialog)
+        QTimer.singleShot(300, self._show_onboarding_wizard)
+
+    def _show_onboarding_wizard(self):
+        """Launch the first-run wizard as a modal dialog.
+
+        On accept: refresh in-memory connections from the DB, load
+        the roles the wizard saved to settings.json, and kick off the
+        first config fetch. On dismiss: no-op — sidebar Manage
+        Connections still available, next launch re-offers.
+        """
+        from PyQt6.QtWidgets import QDialog
+        from vula_ui.onboarding_wizard import OnboardingWizard
+        from vula_config import StoreConnection
+
+        try:
+            dlg = OnboardingWizard(parent=self, store=self._store)
+        except Exception as exc:
+            _log.error("could not open onboarding wizard: %s", exc)
+            self.status_bar.showMessage(
+                "Could not open setup wizard — use Manage Connections "
+                "from the sidebar instead."
+            )
+            return
+
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            # Refresh in-memory connection list from the DB — the
+            # wizard wrote via PrintStore.upsert_connection().
+            try:
+                self.store_connections = [
+                    StoreConnection(
+                        connection_id=row["connection_id"],
+                        name=row["display_name"],
+                        api_base_url=row["api_base_url"],
+                        api_key=row["api_key"],
+                        printer_user_id=row.get("printer_user_id"),
+                    )
+                    for row in self._store.list_connections()
+                ]
+            except Exception as exc:
+                _log.error("could not reload connections after wizard: %s", exc)
+
+            # Re-read settings.json for roles the wizard just wrote.
+            self.load_settings()
+
+            self._refresh_connection_status_summary()
+            self.fetch_all_printer_configs(show_dialogs=False)
+        else:
+            self.status_bar.showMessage(
+                "Setup skipped — use Manage Connections from the sidebar "
+                "when ready."
+            )
 
     def _headers_for(self, conn: StoreConnection, include_json: bool = False) -> Dict[str, str]:
         headers = {"X-Printer-API-Key": conn.api_key}

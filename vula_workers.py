@@ -19,72 +19,134 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from vula_device_io import write_to_device
 
 
+# ── Device discovery — module-level so wizards and non-Qt callers
+# ── (e.g. install.sh, tests) can use the same logic as the thread.
+
+def _scan_devices_linux() -> List[str]:
+    """Linux device scan — /dev/usb/lp*, ttyUSB*/ttyACM*, /dev/serial/by-id,
+    and CUPS queues. Same logic as PrinterScanner, extracted so both the
+    threaded scanner and scan_devices_sync() share it."""
+    devices: List[str] = []
+    usb_dir = Path("/dev/usb")
+    if usb_dir.exists():
+        devices.extend(str(p) for p in usb_dir.glob("lp*"))
+
+    dev_dir = Path("/dev")
+    if dev_dir.exists():
+        devices.extend(str(p) for p in dev_dir.glob("ttyUSB*"))
+        devices.extend(str(p) for p in dev_dir.glob("ttyACM*"))
+
+    serial_by_id = Path("/dev/serial/by-id")
+    if serial_by_id.exists():
+        devices.extend(
+            str(p) for p in serial_by_id.iterdir() if p.is_symlink()
+        )
+
+    try:
+        from vula_printer_target import list_cups_queues
+        devices.extend(list_cups_queues())
+    except Exception as exc:
+        logging.getLogger("vula.scan").debug(
+            "CUPS enumeration failed: %s", exc
+        )
+
+    return _dedupe_sorted(devices)
+
+
+def _scan_devices_windows() -> List[str]:
+    """Windows device scan — COM ports via pyserial, spooler via win32print."""
+    devices: List[str] = []
+    try:
+        from serial.tools.list_ports import comports
+        for port in comports():
+            if port.device:
+                devices.append(port.device)
+    except Exception as exc:
+        logging.getLogger("vula.scan").debug(
+            "serial port enumeration failed: %s", exc
+        )
+
+    try:
+        from vula_printer_target import list_windows_spoolers
+        devices.extend(list_windows_spoolers())
+    except Exception as exc:
+        logging.getLogger("vula.scan").debug(
+            "Windows spooler enumeration failed: %s", exc
+        )
+
+    return _dedupe_sorted(devices)
+
+
+def _dedupe_sorted(devices: List[str]) -> List[str]:
+    seen = set()
+    unique = []
+    for d in devices:
+        if d not in seen:
+            seen.add(d)
+            unique.append(d)
+    return sorted(unique)
+
+
+def scan_devices_sync() -> List[str]:
+    """Synchronous one-shot device scan for non-threaded callers
+    (onboarding wizard, tests, CLI tools).
+
+    Blocks the calling thread — do NOT call from the Qt main thread
+    outside of a modal dialog. The wizard's printer-assignment page is
+    the intended caller: the dialog is modal, so blocking there is the
+    same as blocking in any other modal slot.
+
+    Returns the same list PrinterScanner emits. Empty list on any
+    enumeration failure — the caller shows an empty state.
+    """
+    from vula_platform import is_windows
+    try:
+        if is_windows():
+            return _scan_devices_windows()
+        return _scan_devices_linux()
+    except Exception as exc:
+        logging.getLogger("vula.scan").error(
+            "scan_devices_sync failed: %s", exc
+        )
+        return []
+
 class PrinterScanner(QThread):
     """Background thread to scan for printer devices.
 
-    Detects:
-      * USB printer-class devices under /dev/usb/  (lp0, lp1, ...)
-      * USB-serial adapters: /dev/ttyUSB*, /dev/ttyACM*
-      * Stable udev symlinks under /dev/serial/by-id/*
+    Platform dispatch:
+      * Linux:   /dev/usb/lp* (usb), /dev/ttyUSB*|ttyACM* (serial),
+                 /dev/serial/by-id/* (stable serial aliases),
+                 CUPS queues (raw + driver modes)
+      * Windows: COM* serial ports (via pyserial), Windows spooler
+                 queues (via win32print)
 
-    Both raw serial device paths and their by-id symlinks may appear in the
-    results. If a device is present via both, prefer the by-id symlink when
-    assigning roles — it is stable across reboots and re-plugs.
+    Both raw serial device paths and their stable aliases may appear in
+    the results. If a device is present via both, prefer the stable
+    alias when assigning roles — it is stable across reboots and
+    re-plugs.
 
     Fingerprinting and human-readable descriptions are computed here (on
     the worker thread) rather than in the slot that receives the result.
-    Both operations can walk sysfs and shell out to ``udevadm``, so doing
-    them on the Qt main thread caused a visible stutter on every scan tick
-    with multiple printers attached.
+    Both operations can be expensive — the Linux path walks sysfs and
+    may shell out to ``udevadm``; the Windows path queries the spooler
+    and each serial port. Doing them on the Qt main thread caused a
+    visible stutter on every scan tick with multiple printers attached.
     """
 
     # devices, {device_path: fingerprint}, {device_path: description}
     printers_found = pyqtSignal(list, dict, dict)
 
     def run(self):
-        devices = []
+        from vula_platform import is_windows
         try:
-            usb_dir = Path("/dev/usb")
-            if usb_dir.exists():
-                devices.extend(str(p) for p in usb_dir.glob("lp*"))
-
-            dev_dir = Path("/dev")
-            if dev_dir.exists():
-                devices.extend(str(p) for p in dev_dir.glob("ttyUSB*"))
-                devices.extend(str(p) for p in dev_dir.glob("ttyACM*"))
-
-            serial_by_id = Path("/dev/serial/by-id")
-            if serial_by_id.exists():
-                devices.extend(
-                    str(p) for p in serial_by_id.iterdir() if p.is_symlink()
-                )
-
-            # CUPS queues — enumerated from lpstat. Each queue yields two
-            # assignment strings (raw + driver) so the operator picks the
-            # mode in the role dialog. list_cups_queues() returns [] when
-            # CUPS isn't installed or has no queues.
-            try:
-                from vula_printer_target import list_cups_queues
-                devices.extend(list_cups_queues())
-            except Exception as exc:
-                logging.getLogger("vula.scan").debug(
-                    "CUPS enumeration failed: %s", exc
-                )
-
-            seen = set()
-            unique = []
-            for d in devices:
-                if d not in seen:
-                    seen.add(d)
-                    unique.append(d)
-            devices = sorted(unique)
+            if is_windows():
+                devices = self._scan_windows()
+            else:
+                devices = self._scan_linux()
         except Exception as e:
             print(f"Error scanning for printers: {e}")
+            devices = []
 
-        # Compute the fingerprint + description table here, off the UI
-        # thread. Both calls can be expensive for USB printer-class nodes
-        # (sysfs walk, possibly udevadm subprocess); the per-device cost is
-        # bounded but the aggregate was noticeable on multi-printer boxes.
         from vula_device_io import fingerprint_for_path, describe_device
 
         fingerprints: Dict[str, str] = {}
@@ -103,6 +165,12 @@ class PrinterScanner(QThread):
         slog.info("discovered %d device(s): %s",
                   len(devices), devices or "(none)")
         self.printers_found.emit(devices, fingerprints, descriptions)
+
+    def _scan_linux(self) -> List[str]:
+        return _scan_devices_linux()
+
+    def _scan_windows(self) -> List[str]:
+        return _scan_devices_windows()
 
 
 class PrintJob(QThread):
