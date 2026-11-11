@@ -39,22 +39,27 @@ def _run_onboard() -> int:
 
     lock_fd = acquire_singleton_lock()
     if lock_fd is None:
-        print(
-            "Vula! Print is already running — stop it before running the "
-            "onboarding wizard.",
-            file=sys.stderr,
-        )
-        from vula_platform import is_windows
-        if is_windows():
+        # Same console=False guard as main() — sys.stderr is None in
+        # windowed PyInstaller builds.
+        try:
+            from vula_platform import is_windows
             print(
-                "  Right-click the system tray icon and choose Quit.",
+                "Vula! Print is already running — stop it before running "
+                "the onboarding wizard.",
                 file=sys.stderr,
             )
-        else:
-            print(
-                "  systemctl --user stop vula-print",
-                file=sys.stderr,
-            )
+            if is_windows():
+                print(
+                    "  Right-click the system tray icon and choose Quit.",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "  systemctl --user stop vula-print",
+                    file=sys.stderr,
+                )
+        except Exception:
+            pass
         return 1
 
     from PyQt6.QtWidgets import QApplication, QDialog
@@ -124,11 +129,26 @@ def main():
     # Singleton guard — only one instance per desktop session.
     lock_fd = acquire_singleton_lock()
     if lock_fd is None:
-        print(
-            "Vula! Print is already running. "
-            "Stop the existing instance with: systemctl --user stop vula-print",
-            file=sys.stderr,
-        )
+        # sys.stderr is None in --windowed (console=False) PyInstaller
+        # builds. print(..., file=None) writes to sys.stdout, which is
+        # also None there, raising AttributeError — a silent crash on a
+        # Windows box with no console. Guard so the exit is clean.
+        try:
+            from vula_platform import is_windows
+            if is_windows():
+                msg = (
+                    "Vula! Print is already running. "
+                    "Right-click the tray icon and choose Quit."
+                )
+            else:
+                msg = (
+                    "Vula! Print is already running. "
+                    "Stop the existing instance with: "
+                    "systemctl --user stop vula-print"
+                )
+            print(msg, file=sys.stderr)
+        except Exception:
+            pass
         sys.exit(0)
 
     app = QApplication(sys.argv)

@@ -98,6 +98,12 @@ if (-not $SkipIcon) {
 # ---- PyInstaller -----------------------------------------------------
 Write-Host ""
 Write-Host "-- PyInstaller --" -ForegroundColor Yellow
+# Kill any running VulaPrint before rebuild — the exe holds its own
+# DLLs open in dist\VulaPrint\_internal\, which makes Remove-Item fail
+# with "Access to the path is denied". Harmless if no process exists.
+Get-Process -Name VulaPrint -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2
+
 if (Test-Path "build") { Remove-Item -Recurse -Force "build" }
 if (Test-Path "dist")  { Remove-Item -Recurse -Force "dist" }
 
