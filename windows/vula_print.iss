@@ -82,7 +82,7 @@ procedure CreateLogUploadDisabledFlag();
 var
   LogDir: string;
   LogFilePath: string;
-  Content: string;
+  CRLF: string;
 begin
   if ExpandConstant('{param:NoLogUpload|0}') <> '1' then
     exit;
@@ -91,10 +91,12 @@ begin
   LogFilePath := LogDir + '\log-upload-disabled';
   if not FileExists(LogFilePath) then
   begin
-    Content := 'Present => Vula Print refuses to upload logs to any backend.' + NewLine
-             + 'Created by the installer with /NoLogUpload.' + NewLine
-             + 'Remove with Administrator privileges to re-enable.' + NewLine;
-    SaveStringToFile(LogFilePath, Content, False);
+    CRLF := Chr(13) + Chr(10);
+    SaveStringToFile(LogFilePath,
+      'Present => Vula Print refuses to upload logs to any backend.' + CRLF +
+      'Created by the installer with /NoLogUpload.' + CRLF +
+      'Remove with Administrator privileges to re-enable.' + CRLF,
+      False);
   end;
 end;
 
@@ -103,7 +105,7 @@ var
   UpdateUrl: string;
   LogDir: string;
   UrlFile: string;
-  Content: string;
+  CRLF: string;
 begin
   UpdateUrl := ExpandConstant('{param:UpdateURL|}');
   if UpdateUrl = '' then
@@ -111,8 +113,8 @@ begin
   LogDir := ExpandConstant('{commonappdata}\Vula');
   ForceDirectories(LogDir);
   UrlFile := LogDir + '\update-url.txt';
-  Content := UpdateUrl + NewLine;
-  SaveStringToFile(UrlFile, Content, False);
+  CRLF := Chr(13) + Chr(10);
+  SaveStringToFile(UrlFile, UpdateUrl + CRLF, False);
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -127,9 +129,11 @@ end;
 function InitializeUninstall(): Boolean;
 var
   Reply: Integer;
+  CRLF: string;
 begin
   Result := True;
-  Reply := MsgBox('Also remove this user''s Vula Print settings and print history?' + NewLine + NewLine + 'Choose No to keep them (recommended when reinstalling).', mbConfirmation, MB_YESNO or MB_DEFBUTTON2);
+  CRLF := Chr(13) + Chr(10);
+  Reply := MsgBox('Also remove this user''s Vula Print settings and print history?' + CRLF + CRLF + 'Choose No to keep them (recommended when reinstalling).', mbConfirmation, MB_YESNO or MB_DEFBUTTON2);
   if Reply = IDYES then
   begin
     DelTree(ExpandConstant('{userappdata}\VulaPrint'), True, True, True);
