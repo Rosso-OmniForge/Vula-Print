@@ -50,7 +50,7 @@ Source: "..\dist\VulaPrint\*"; DestDir: "{app}"; Flags: ignoreversion recursesub
 ; The log-upload-disabled flag and (future) update-url.txt live here.
 ; Full control for Administrators + SYSTEM, read for Users. This is
 ; the Windows equivalent of /etc/vula (0751 root:root on Linux).
-Name: "{commonappdata}\Vula"; Permissions: admins-full system-full users-read
+Name: "{commonappdata}\Vula"; Permissions: admins-full system-full users-readexec
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional icons:"
