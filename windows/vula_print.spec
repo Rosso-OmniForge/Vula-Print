@@ -66,7 +66,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=True,           # TEMPORARY: shows crash traceback over SSH
+    console=False,           # TEMPORARY: shows crash traceback over SSH
     disable_windowed_traceback=False,
     icon=os.path.join(SPECPATH, "VulaPrint.ico"),
 )
