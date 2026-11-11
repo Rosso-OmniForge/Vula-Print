@@ -78,17 +78,11 @@ Filename: "{app}\VulaPrint.exe"; Description: "Launch Vula Print"; Flags: nowait
 Type: filesandordirs; Name: "{commonappdata}\Vula"
 
 [Code]
-// -- Log-upload opt-out at install time (--NoLogUpload parameter) ------
-//
-// Mirrors install.sh --no-log-upload. Creates
-// %ProgramData%\Vula\log-upload-disabled with the same security
-// property as /etc/vula/log-upload-disabled: the file is inside a
-// directory only Administrators can write to, so a standard user
-// cannot re-enable uploads for a client that declined them.
 procedure CreateLogUploadDisabledFlag();
 var
   LogDir: string;
   LogFilePath: string;
+  Content: string;
 begin
   if ExpandConstant('{param:NoLogUpload|0}') <> '1' then
     exit;
@@ -96,23 +90,20 @@ begin
   ForceDirectories(LogDir);
   LogFilePath := LogDir + '\log-upload-disabled';
   if not FileExists(LogFilePath) then
-    SaveStringToFile(LogFilePath,
-      '# Present => Vula Print refuses to upload logs to any backend.' + #13#10 +
-      '# Created by the installer with /NoLogUpload.' + #13#10 +
-      '# Remove with Administrator privileges to re-enable.' + #13#10,
-      False);
+  begin
+    Content := 'Present => Vula Print refuses to upload logs to any backend.' + NewLine
+             + 'Created by the installer with /NoLogUpload.' + NewLine
+             + 'Remove with Administrator privileges to re-enable.' + NewLine;
+    SaveStringToFile(LogFilePath, Content, False);
+  end;
 end;
 
-// -- Update URL (--UpdateURL parameter) -------------------------------
-//
-// Written to %ProgramData%\Vula\update-url.txt for the in-app update
-// dialog to read. If not supplied, no file is created and the dialog
-// shows "no update URL configured".
 procedure WriteUpdateUrl();
 var
   UpdateUrl: string;
   LogDir: string;
   UrlFile: string;
+  Content: string;
 begin
   UpdateUrl := ExpandConstant('{param:UpdateURL|}');
   if UpdateUrl = '' then
@@ -120,7 +111,8 @@ begin
   LogDir := ExpandConstant('{commonappdata}\Vula');
   ForceDirectories(LogDir);
   UrlFile := LogDir + '\update-url.txt';
-  SaveStringToFile(UrlFile, UpdateUrl + #13#10, False);
+  Content := UpdateUrl + NewLine;
+  SaveStringToFile(UrlFile, Content, False);
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -132,21 +124,12 @@ begin
   end;
 end;
 
-// -- Uninstall prompt -------------------------------------------------
-//
-// Per-user config (API key, print history, settings) lives at
-// %APPDATA%\VulaPrint. The uninstaller removes the program files,
-// autostart shortcut, and %ProgramData%\Vula automatically. It does
-// NOT remove the user's config by default — offer that as a choice.
 function InitializeUninstall(): Boolean;
 var
   Reply: Integer;
 begin
   Result := True;
-  Reply := MsgBox('Also remove this user''s Vula Print settings and print history?' +
-                  #13#10 + #13#10 +
-                  'Choose No to keep them (recommended when reinstalling).',
-                  mbConfirmation, MB_YESNO or MB_DEFBUTTON2);
+  Reply := MsgBox('Also remove this user''s Vula Print settings and print history?' + NewLine + NewLine + 'Choose No to keep them (recommended when reinstalling).', mbConfirmation, MB_YESNO or MB_DEFBUTTON2);
   if Reply = IDYES then
   begin
     DelTree(ExpandConstant('{userappdata}\VulaPrint'), True, True, True);
