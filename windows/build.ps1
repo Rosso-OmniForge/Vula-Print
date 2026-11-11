@@ -134,11 +134,24 @@ if ($SkipInstaller) {
 Write-Host ""
 Write-Host "-- Inno Setup --" -ForegroundColor Yellow
 
-$IsccCandidates = @(
-    "iscc.exe",
-    "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
-    "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
-)
+# Probe for iscc.exe. Order:
+#   1. iscc.exe on PATH (user may have added it)
+#   2. Any "Inno Setup *" directory under Program Files (newest wins)
+# Version-agnostic so this works for 6, 7, 8, ...
+$IsccCandidates = @("iscc.exe")
+foreach ($base in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+    if (-not $base -or -not (Test-Path $base)) { continue }
+    $isccDirs = Get-ChildItem $base -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -like "Inno Setup*" } |
+                Sort-Object Name -Descending
+    foreach ($dir in $isccDirs) {
+        $isccPath = Join-Path $dir.FullName "ISCC.exe"
+        if (Test-Path $isccPath) {
+            $IsccCandidates += $isccPath
+        }
+    }
+}
+
 $Iscc = $null
 foreach ($cand in $IsccCandidates) {
     if (Get-Command $cand -ErrorAction SilentlyContinue) {
@@ -151,7 +164,7 @@ foreach ($cand in $IsccCandidates) {
     }
 }
 if (-not $Iscc) {
-    Write-Error "iscc.exe (Inno Setup 6 compiler) not found. Install Inno Setup 6 and re-run."
+    Write-Error "iscc.exe (Inno Setup compiler) not found. Install Inno Setup 6 or later and re-run."
     exit 1
 }
 Write-Host "  iscc:      $Iscc"
