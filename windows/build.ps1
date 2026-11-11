@@ -1,23 +1,27 @@
-# Vula! Print — Windows build script.
+# Vula! Print - Windows build script.
 #
 # Run from the repo root:
 #     powershell -ExecutionPolicy Bypass -File windows\build.ps1
 #
+# Optional flags:
+#     -SkipInstaller   Build VulaPrint.exe only (skip Inno Setup)
+#     -SkipIcon        Reuse the existing VulaPrint.ico
+#
 # Produces:
-#     windows\Output\VulaPrint-<version>-Setup.exe
+#     dist\VulaPrint\VulaPrint.exe                          (portable)
+#     windows\Output\VulaPrint-<version>-Setup.exe          (installer)
 #
 # Prerequisites (see windows\README.md):
-#     * Python 3.11+ on PATH as `python`
-#     * PyInstaller:    pip install pyinstaller
-#     * Project deps:   pip install -r requirements_app.txt
-#     * Inno Setup 6:   https://jrsoftware.org/isdl.php  (iscc.exe on PATH)
+#     python 3.11+   on PATH
+#     pyinstaller    via:  pip install pyinstaller
+#     pillow         via:  pip install -r requirements_app.txt
+#     Inno Setup 6   from:  https://jrsoftware.org/isdl.php
 #
-# Optional env vars:
-#     VULA_CODE_SIGN_SUBJECT   — subject name of the code-signing cert.
-#                                If unset, the installer is left unsigned
-#                                (SmartScreen will warn on install; this
-#                                is deliberate — see README.md).
-#     VULA_SIGN_TIMESTAMP_URL  — RFC 3161 timestamp server URL.
+# Optional env var:
+#     VULA_CODE_SIGN_SUBJECT     subject name of the code-signing cert.
+#                                If unset, installer is unsigned
+#                                (SmartScreen will warn; see README.md).
+#     VULA_SIGN_TIMESTAMP_URL    RFC 3161 timestamp URL.
 #                                Default: http://timestamp.digicert.com
 
 [CmdletBinding()]
@@ -28,19 +32,17 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# ── Anchor everything to the repo root, regardless of where the
-#    script is invoked from ───────────────────────────────────────
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot  = Split-Path -Parent $ScriptDir
 Set-Location $RepoRoot
 
 Write-Host ""
-Write-Host "════════════════════════════════════════════════════════" -ForegroundColor Cyan
-Write-Host " Vula! Print — Windows build" -ForegroundColor Cyan
-Write-Host "════════════════════════════════════════════════════════" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host " Vula Print - Windows build" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host "  Repo root: $RepoRoot"
 
-# ── Read version ───────────────────────────────────────────────
+# ---- Version ---------------------------------------------------------
 $VersionFile = Join-Path $RepoRoot "VERSION"
 if (-not (Test-Path $VersionFile)) {
     Write-Error "VERSION file not found at $VersionFile"
@@ -53,7 +55,7 @@ if (-not $AppVersion) {
 }
 Write-Host "  Version:   $AppVersion"
 
-# ── Sanity: build prerequisites ────────────────────────────────
+# ---- Python sanity ---------------------------------------------------
 try {
     $pyVersion = & python --version 2>&1
     Write-Host "  Python:    $pyVersion"
@@ -74,21 +76,17 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-# ── Generate the .ico from assets/Vula_Logo.png ───────────────
+# ---- Generate .ico ---------------------------------------------------
 $IconPath = Join-Path $ScriptDir "VulaPrint.ico"
 if (-not $SkipIcon) {
     $LogoPath = Join-Path $RepoRoot "assets\Vula_Logo.png"
     if (-not (Test-Path $LogoPath)) {
-        Write-Error "assets\Vula_Logo.png not found — cannot generate .ico"
+        Write-Error "assets\Vula_Logo.png not found - cannot generate .ico"
         exit 1
     }
-    Write-Host "  Icon:      generating $IconPath from assets\Vula_Logo.png"
-    & python -c @"
-from PIL import Image
-img = Image.open(r'$LogoPath').convert('RGBA')
-img.save(r'$IconPath', format='ICO', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])
-print('ico written')
-"@
+    Write-Host "  Icon:      generating $IconPath"
+    $IconHelper = Join-Path $ScriptDir "build_icon.py"
+    & python $IconHelper $LogoPath $IconPath
     if ($LASTEXITCODE -ne 0) {
         Write-Error "Failed to generate VulaPrint.ico"
         exit 1
@@ -97,11 +95,11 @@ print('ico written')
     Write-Host "  Icon:      skipped (-SkipIcon)"
 }
 
-# ── PyInstaller ───────────────────────────────────────────────
+# ---- PyInstaller -----------------------------------------------------
 Write-Host ""
-Write-Host "── PyInstaller ──" -ForegroundColor Yellow
-if (Test-Path "build")         { Remove-Item -Recurse -Force "build" }
-if (Test-Path "dist")          { Remove-Item -Recurse -Force "dist" }
+Write-Host "-- PyInstaller --" -ForegroundColor Yellow
+if (Test-Path "build") { Remove-Item -Recurse -Force "build" }
+if (Test-Path "dist")  { Remove-Item -Recurse -Force "dist" }
 
 & pyinstaller --clean --noconfirm windows\vula_print.spec
 if ($LASTEXITCODE -ne 0) {
@@ -120,14 +118,16 @@ Write-Host "  VulaPrint.exe: $ExePath  ($ExeSize MB)"
 if ($SkipInstaller) {
     Write-Host ""
     Write-Host "Skipping Inno Setup (-SkipInstaller)" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Portable build ready. Try:"
+    Write-Host "  $ExePath"
     exit 0
 }
 
-# ── Inno Setup ────────────────────────────────────────────────
+# ---- Inno Setup ------------------------------------------------------
 Write-Host ""
-Write-Host "── Inno Setup ──" -ForegroundColor Yellow
+Write-Host "-- Inno Setup --" -ForegroundColor Yellow
 
-# Locate iscc.exe
 $IsccCandidates = @(
     "iscc.exe",
     "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
@@ -164,31 +164,37 @@ if (-not (Test-Path $InstallerPath)) {
 $SetupSize = [math]::Round((Get-Item $InstallerPath).Length / 1MB, 1)
 Write-Host "  Installer: $InstallerPath  ($SetupSize MB)"
 
-# ── Code signing (optional) ───────────────────────────────────
+# ---- Code signing (optional) ----------------------------------------
 Write-Host ""
-Write-Host "── Code signing ──" -ForegroundColor Yellow
-if ($env:VULA_CODE_SIGN_SUBJECT) {
-    $TimestampUrl = if ($env:VULA_SIGN_TIMESTAMP_URL) {
-        $env:VULA_SIGN_TIMESTAMP_URL
-    } else {
-        "http://timestamp.digicert.com"
+Write-Host "-- Code signing --" -ForegroundColor Yellow
+$SignSubject = $env:VULA_CODE_SIGN_SUBJECT
+if ($SignSubject) {
+    $TimestampUrl = $env:VULA_SIGN_TIMESTAMP_URL
+    if (-not $TimestampUrl) {
+        $TimestampUrl = "http://timestamp.digicert.com"
     }
-    Write-Host "  Signing with subject: $env:VULA_CODE_SIGN_SUBJECT"
-    & signtool sign /n $env:VULA_CODE_SIGN_SUBJECT /tr $TimestampUrl /td sha256 /fd sha256 $InstallerPath
+    Write-Host "  Signing with subject: $SignSubject"
+    & signtool sign /n $SignSubject /tr $TimestampUrl /td sha256 /fd sha256 $InstallerPath
     if ($LASTEXITCODE -ne 0) {
-        Write-Warning "signtool failed (exit $LASTEXITCODE) — installer is unsigned"
+        Write-Warning "signtool failed (exit $LASTEXITCODE) - installer is unsigned"
     }
 } else {
-    Write-Warning "VULA_CODE_SIGN_SUBJECT not set — installer will be UNSIGNED."
+    Write-Warning "VULA_CODE_SIGN_SUBJECT not set - installer will be UNSIGNED."
     Write-Warning "  SmartScreen will show 'Windows protected your PC' on install."
-    Write-Warning "  See windows\README.md 'Installing on Windows' for the user-facing steps."
+    Write-Warning "  See windows\README.md 'Installing on Windows'."
 }
 
-# ── Done ─────────────────────────────────────────────────────
+# ---- Done ------------------------------------------------------------
+if ($SignSubject) {
+    $SignLabel = "signed"
+} else {
+    $SignLabel = "UNSIGNED"
+}
+
 Write-Host ""
-Write-Host "════════════════════════════════════════════════════════" -ForegroundColor Green
+Write-Host "============================================================" -ForegroundColor Green
 Write-Host " Build complete" -ForegroundColor Green
-Write-Host "════════════════════════════════════════════════════════" -ForegroundColor Green
+Write-Host "============================================================" -ForegroundColor Green
 Write-Host "  Installer:  $InstallerPath"
-Write-Host "  Signature:  $(if ($env:VULA_CODE_SIGN_SUBJECT) {'signed'} else {'UNSIGNED'})"
+Write-Host "  Signature:  $SignLabel"
 Write-Host ""
