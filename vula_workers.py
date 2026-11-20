@@ -779,6 +779,15 @@ class POSSlipPrintJob(QThread):
         # Derived from width_chars: Font A is 12 dots per char.
         max_width_dots = self.width_chars * 12
 
+        # Marketing and the thank-you belong on slips a CUSTOMER receives. The
+        # same table and this same renderer also print web-order picking and
+        # packing slips (picking_slip.py writes them with print_type="pos_slip"
+        # and footer_note="WEB ORDER PICKING SLIP"), so this is an allowlist on
+        # `source` — never a check on `role`, which carries server_default="pos"
+        # on every row and would let marketing onto a picking slip.
+        # "voucher_sale" is deliberately absent; add it here to opt in.
+        is_customer_slip = str(req.get("source", "")) in {"pos_submit", "reprint"}
+
         out = bytearray()
         ESC, GS, LF = 0x1B, 0x1D, 0x0A
 
@@ -876,21 +885,47 @@ class POSSlipPrintJob(QThread):
             if sku:
                 out += self._txt(f"  SKU: {sku[: self.width_chars - 7]}")
             out += self._txt(f"  @ {unit_price}")
+            disc_cents = int(item.get("discount_cents", 0) or 0)
+            if disc_cents > 0:
+                # Why this line is cheaper than the shelf price. The label
+                # names the campaign ("Black Friday (15% off)") or says the
+                # discount was issued by a person — the customer is entitled
+                # to know which, and to see the amount. _txt() already strips
+                # control bytes, so an admin-entered campaign name cannot
+                # inject ESC/POS here.
+                disc_label = str(item.get("discount_label", "") or "Discount")
+                out += self._txt(self._col2(
+                    f"  {disc_label[: max(4, desc_budget - 2)]}",
+                    f"-{cur} {self._cents_to_amount(disc_cents)}",
+                ))
 
         # ── Totals ──────────────────────────────────────────────────
         out += self._txt(self._line_sep())
+        # "Goods total", not "Subtotal before disc": the order's
+        # subtotal_before_discount_cents is the sum of line totals AFTER
+        # per-line specials, so the old label was false.
         out += self._txt(self._col2(
-            "Subtotal before disc:",
+            "Goods total:",
             f"{cur} {self._cents_to_amount(totals.get('subtotal_before_discount_cents', 0) or 0)}",
         ))
-        out += self._txt(self._col2(
-            "Manual discount:",
-            f"{cur} {self._cents_to_amount(totals.get('manual_discount_cents', 0) or 0)}",
-        ))
-        out += self._txt(self._col2(
-            "Voucher discount:",
-            f"{cur} {self._cents_to_amount(totals.get('voucher_discount_cents', 0) or 0)}",
-        ))
+
+        # One row per discount that actually happened. A sale with no discount
+        # must not print "-R 0.00" rows implying one existed.
+        issued_cents = int(totals.get("manual_discount_cents", 0) or 0)
+        if issued_cents > 0:
+            issued_label = str(totals.get("manual_discount_label", "") or "Issued")
+            out += self._txt(self._col2(
+                f"{issued_label[: max(4, self.width_chars - 16)]}:",
+                f"-{cur} {self._cents_to_amount(issued_cents)}",
+            ))
+
+        promo_cents = int(totals.get("ambassador_discount_cents", 0) or 0)
+        if promo_cents > 0:
+            out += self._txt(self._col2(
+                "Promo:",
+                f"-{cur} {self._cents_to_amount(promo_cents)}",
+            ))
+
         out += self._txt(self._col2(
             "Subtotal:",
             f"{cur} {self._cents_to_amount(totals.get('subtotal_cents', 0) or 0)}",
@@ -901,6 +936,16 @@ class POSSlipPrintJob(QThread):
             vat_label,
             f"{cur} {self._cents_to_amount(totals.get('tax_cents', 0) or 0)}",
         ))
+
+        # The voucher is deducted from the gross total, not from the subtotal,
+        # so it prints BELOW VAT. Above it, the column could never reconcile.
+        voucher_cents = int(totals.get("voucher_discount_cents", 0) or 0)
+        if voucher_cents > 0:
+            out += self._txt(self._col2(
+                "Voucher:",
+                f"-{cur} {self._cents_to_amount(voucher_cents)}",
+            ))
+
         out += self._txt(self._line_sep())
         out += self._esc(ESC, 0x45, 0x01)
         out += self._txt(self._col2(
@@ -908,6 +953,17 @@ class POSSlipPrintJob(QThread):
             f"{cur} {self._cents_to_amount(totals.get('total_cents', 0) or 0)}",
         ))
         out += self._esc(ESC, 0x45, 0x00)
+
+        savings_cents = int(totals.get("savings_cents", 0) or 0)
+        if savings_cents > 0:
+            out += self._txt(self._line_sep())
+            out += self._esc(ESC, 0x61, 0x01)     # center
+            out += self._esc(ESC, 0x45, 0x01)     # bold on
+            out += self._txt(
+                f"You Saved {cur} {self._cents_to_amount(savings_cents)} Today"
+            )
+            out += self._esc(ESC, 0x45, 0x00)     # bold off
+            out += self._esc(ESC, 0x61, 0x00)     # left
 
         # ── Footer note ─────────────────────────────────────────────
         footer_note = str(self.detail_payload.get("footer_note", "") or "").strip()
@@ -944,6 +1000,30 @@ class POSSlipPrintJob(QThread):
                     out += self._txt(website_url[: self.width_chars])
                 out += self._esc(ESC, 0x61, 0x00)     # left
 
+        # ── Marketing (live first, then upcoming) ───────────────────
+        # Word-wrapped, not sliced: the footer note above wraps with textwrap
+        # for the same reason — slicing cuts mid-word and reads as a broken
+        # receipt. _txt() strips C0/C1/DEL, so an admin-entered campaign title
+        # cannot inject ESC/POS here.
+        if is_customer_slip:
+            import textwrap as _tw
+            for raw in (self.detail_payload.get("marketing_lines") or [])[:3]:
+                text = str(raw or "").strip()
+                if not text:
+                    continue
+                out += self._txt(self._line_sep())
+                out += self._esc(ESC, 0x61, 0x01)     # center
+                out += self._esc(ESC, 0x45, 0x01)     # bold on
+                for line in _tw.wrap(
+                    text,
+                    width=self.width_chars,
+                    break_long_words=True,
+                    break_on_hyphens=False,
+                ):
+                    out += self._txt(line)
+                out += self._esc(ESC, 0x45, 0x00)     # bold off
+                out += self._esc(ESC, 0x61, 0x00)     # left
+
         # ── Loyalty note ────────────────────────────────────────────
         out += self._txt(self._line_sep())
         out += self._esc(ESC, 0x61, 0x01)
@@ -954,6 +1034,16 @@ class POSSlipPrintJob(QThread):
         ):
             out += self._txt(line[: self.width_chars])
         out += self._esc(ESC, 0x61, 0x00)
+
+        # ── Thank you ───────────────────────────────────────────────
+        # Same wording pos_slip_preview.html already prints, so the paper and
+        # the on-screen preview agree. Skipped on picking/packing slips for the
+        # same reason the marketing block is.
+        if is_customer_slip:
+            out += self._txt(self._line_sep())
+            out += self._esc(ESC, 0x61, 0x01)     # center
+            out += self._txt("Thank you for your purchase")
+            out += self._esc(ESC, 0x61, 0x00)     # left
 
         out += bytes([LF, LF, LF])
         out += self._esc(GS, 0x56, 0x41, 0x00)        # full cut

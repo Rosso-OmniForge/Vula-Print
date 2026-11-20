@@ -430,6 +430,21 @@ class PrintersTabMixin:
             layout_btn.clicked.connect(self._open_label_layout_dialog)
             actions.addWidget(layout_btn)
 
+        # POS-only: the slip layout tuner. Same idiom as the label Layout
+        # button above — the dialog writes pos_width_chars / pos_qr_mode /
+        # pos_qr_module_px to settings.json on every change, so the next slip
+        # picks them up without a restart.
+        if role_key == "pos_slip":
+            slip_layout_btn = QPushButton("Slip layout…")
+            slip_layout_btn.setMinimumHeight(32)
+            slip_layout_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            slip_layout_btn.setStyleSheet(self._btn_secondary())
+            slip_layout_btn.setToolTip(
+                "Set the receipt paper width and QR size for POS slips"
+            )
+            slip_layout_btn.clicked.connect(self._open_pos_slip_layout_dialog)
+            actions.addWidget(slip_layout_btn)
+
         # Settings button — enabled only for serial devices. State is
         # refreshed by _update_card_status() on every probe tick.
         settings_btn = QPushButton("Settings")

@@ -6,7 +6,11 @@ from typing import List, Optional
 
 from vula_config import (
     APP_CONFIG_FILE,
-    DEFAULT_POS_POLL_INTERVAL_SECONDS, StoreConnection,
+    DEFAULT_POS_POLL_INTERVAL_SECONDS,
+    DEFAULT_SLIP_WIDTH_CHARS,
+    MAX_SLIP_WIDTH_CHARS,
+    MIN_SLIP_WIDTH_CHARS,
+    StoreConnection,
 )
 
 
@@ -82,7 +86,19 @@ class SettingsMixin:
                 data.get("pos_poll_interval_seconds", DEFAULT_POS_POLL_INTERVAL_SECONDS)
                 or DEFAULT_POS_POLL_INTERVAL_SECONDS
             )
-            self.pos_width_chars = int(data.get("pos_width_chars", 32) or 32)
+            # Clamped on load: settings.json is plain text and hand-editable, and
+            # an out-of-range width wraps every line and pushes the money column
+            # off the paper. Fail to the nearest usable value, not to garbage.
+            self.pos_width_chars = max(
+                MIN_SLIP_WIDTH_CHARS,
+                min(
+                    MAX_SLIP_WIDTH_CHARS,
+                    int(
+                        data.get("pos_width_chars", DEFAULT_SLIP_WIDTH_CHARS)
+                        or DEFAULT_SLIP_WIDTH_CHARS
+                    ),
+                ),
+            )
             self.pos_qr_mode = str(data.get("pos_qr_mode", "raster") or "raster")
             self.pos_qr_module_px = int(data.get("pos_qr_module_px", 4) or 4)
             self.serial_config = data.get("serial_config") or {}

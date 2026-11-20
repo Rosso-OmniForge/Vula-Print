@@ -58,6 +58,19 @@ DEFAULT_LABEL_LAYOUT = {
     "barcode_narrow":   1,
     "barcode_wide":     2,
 }
+
+#: POS slip width, in characters per line at Font A (12 dots per character at
+#: 203 dpi). 32 = 58 mm, 48 = 80 mm, 64 = 112 mm.
+#:
+#: Deliberately NOT raised to 48. No existing till has a pos_width_chars key in
+#: settings.json, so a higher default would silently re-format every slip at
+#: every deployment. Operators choose 80 mm in the POS slip layout dialog.
+DEFAULT_SLIP_WIDTH_CHARS = 32
+
+#: Hard bounds. Enforced at load (a hand-edited settings.json must not be able
+#: to set 999 columns) and again in the layout dialog.
+MIN_SLIP_WIDTH_CHARS = 24
+MAX_SLIP_WIDTH_CHARS = 80
 # Per-user state lives under vula_platform.app_dir():
 #   Linux:   ~/.config/vula_print/
 #   Windows: %APPDATA%\VulaPrint\

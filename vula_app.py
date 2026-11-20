@@ -40,6 +40,7 @@ from vula_ui.history import HistoryMixin
 from vula_ui.history_tab import HistoryTabMixin
 from vula_ui.misc import MiscMixin
 from vula_ui.label_layout import LabelLayoutMixin
+from vula_ui.slip_layout import SlipLayoutMixin
 
 
 import logging
@@ -49,6 +50,7 @@ _log = logging.getLogger("vula.app")
 class VulaPrintApp(
     MiscMixin,
     LabelLayoutMixin,
+    SlipLayoutMixin,
     HistoryMixin,
     HistoryTabMixin,
     PreviewMixin,
