@@ -901,13 +901,32 @@ class POSSlipPrintJob(QThread):
 
         # ── Totals ──────────────────────────────────────────────────
         out += self._txt(self._line_sep())
-        # "Goods total", not "Subtotal before disc": the order's
-        # subtotal_before_discount_cents is the sum of line totals AFTER
-        # per-line specials, so the old label was false.
+        # Shelf total: Σ(unit_price × qty), before ANY discount — the figure a
+        # customer can check against the price tags, and the only one the
+        # discount rows below can foot from. It is NOT
+        # subtotal_before_discount_cents, which already has the per-line
+        # discounts applied and therefore can never express them.
+        #
+        # Slips printed before this shipped carry no gross_cents; falling back to
+        # subtotal_before_discount_cents reproduces the original document exactly
+        # (and the discount rows below stay suppressed, because their figures are
+        # 0 on those rows).
+        gross_cents = int(totals.get("gross_cents", 0) or 0)
+        if gross_cents <= 0:
+            gross_cents = int(totals.get("subtotal_before_discount_cents", 0) or 0)
         out += self._txt(self._col2(
             "Goods total:",
-            f"{cur} {self._cents_to_amount(totals.get('subtotal_before_discount_cents', 0) or 0)}",
+            f"{cur} {self._cents_to_amount(gross_cents)}",
         ))
+
+        # Per-line discounts, aggregated. One row, not a row per line: the
+        # itemised campaign labels are already printed against each item above.
+        line_cents = int(totals.get("line_discount_cents", 0) or 0)
+        if line_cents > 0:
+            out += self._txt(self._col2(
+                "  Line discounts:",
+                f"-{cur} {self._cents_to_amount(line_cents)}",
+            ))
 
         # One row per discount that actually happened. A sale with no discount
         # must not print "-R 0.00" rows implying one existed.
@@ -915,14 +934,26 @@ class POSSlipPrintJob(QThread):
         if issued_cents > 0:
             issued_label = str(totals.get("manual_discount_label", "") or "Issued")
             out += self._txt(self._col2(
-                f"{issued_label[: max(4, self.width_chars - 16)]}:",
+                f"  {issued_label[: max(4, self.width_chars - 18)]}:",
                 f"-{cur} {self._cents_to_amount(issued_cents)}",
+            ))
+
+        # The invoice-level discount: everything taken off the shelf price,
+        # excluding the ambassador promo and the voucher — both print their own
+        # row, and counting them here would print the same rand twice. The
+        # column therefore foots as:
+        #     goods − invoice discount − promo = subtotal
+        invoice_cents = int(totals.get("invoice_discount_cents", 0) or 0)
+        if invoice_cents > 0:
+            out += self._txt(self._col2(
+                "Invoice discount:",
+                f"-{cur} {self._cents_to_amount(invoice_cents)}",
             ))
 
         promo_cents = int(totals.get("ambassador_discount_cents", 0) or 0)
         if promo_cents > 0:
             out += self._txt(self._col2(
-                "Promo:",
+                "  Promo:",
                 f"-{cur} {self._cents_to_amount(promo_cents)}",
             ))
 
