@@ -518,7 +518,12 @@ class POSSlipPrintJob(QThread):
         return bytes(values)
 
     def _line_sep(self, ch: str = "-") -> str:
-        return ch * self.width_chars
+        # One column short of the head on purpose: a line that fills the
+        # last printable column makes the printer autowrap, and the
+        # trailing LF then advances a second time — two physical lines
+        # for every row that sits on the margin. Measured on the 40-item
+        # fixture: 60 such rows at 58 mm ≈ 25 cm of surplus paper.
+        return ch * max(1, self.width_chars - 1)
 
     def _col2(self, left: str, right: str) -> str:
         """Two-column layout. Guarantees the result fits within
@@ -527,20 +532,25 @@ class POSSlipPrintJob(QThread):
         product title + qty) plus a long right column (large-rand
         line total) produced a line wider than width_chars, which
         _txt then hard-truncated from the right, silently chopping
-        the money column off the receipt (audit H11)."""
+        the money column off the receipt (audit H11).
+
+        Every bound is one column short of the head, for the same reason
+        as _line_sep(): a row padded to exactly width_chars lands on the
+        printer's right margin and costs two physical lines, not one."""
+        w = max(1, self.width_chars - 1)
         l = str(left or "")
         r = str(right or "")
-        if len(r) >= self.width_chars:
+        if len(r) >= w:
             # Right column alone fills/exceeds the line. Give it the
             # whole line — left dropped, price preserved.
-            return r[: self.width_chars]
-        avail = self.width_chars - len(r) - 1  # one separator space
+            return r[:w]
+        avail = w - len(r) - 1  # one separator space
         if len(l) > avail:
             if avail >= 2:
                 l = l[: avail - 1] + "…"
             else:
                 l = l[:avail]
-        pad = self.width_chars - len(l) - len(r)
+        pad = w - len(l) - len(r)
         return f"{l}{' ' * pad}{r}"
 
     def _txt(self, text: str = "") -> bytes:
@@ -558,11 +568,16 @@ class POSSlipPrintJob(QThread):
         #   * 0x7F       — DEL.
         #   * 0x80-0x9F  — C1 controls (rare but interpreted by some
         #                  ESC/POS clones as extended commands).
-        # \t and \n are harmless and preserved.
+        #
+        # \t and \n are NOT harmless: a newline inside a _col2 row breaks
+        # the line after the padding was already computed, and a tab
+        # advances to the next tab stop, which can push past the right
+        # margin. Backend fields really do carry them (store.address is
+        # deliberately multi-line), so flatten both to a space.
         cleaned_chars = []
         for c in str(text):
             if c == "\t" or c == "\n":
-                cleaned_chars.append(c)
+                cleaned_chars.append(" ")
                 continue
             o = ord(c)
             if o < 0x20:
@@ -573,8 +588,9 @@ class POSSlipPrintJob(QThread):
                 continue
             cleaned_chars.append(c)
         cleaned = "".join(cleaned_chars)
-        if len(cleaned) > self.width_chars:
-            cleaned = cleaned[: self.width_chars]
+        limit = max(1, self.width_chars - 1)
+        if len(cleaned) > limit:
+            cleaned = cleaned[:limit]
         return (cleaned + "\n").encode("ascii", errors="replace")
 
     # ── QR / logo raster ───────────────────────────────────────────────
@@ -776,8 +792,10 @@ class POSSlipPrintJob(QThread):
         cur = "R" if currency == "ZAR" else currency
 
         # Print area in dots. 58 mm → 384 dots, 80 mm → 576 dots.
-        # Derived from width_chars: Font A is 12 dots per char.
-        max_width_dots = self.width_chars * 12
+        # Derived from width_chars: Font A is 12 dots per char. One column
+        # short, matching _line_sep()/_col2(), so the raster never spans the
+        # full head (some firmware clips the trailing dot column).
+        max_width_dots = max(1, self.width_chars - 1) * 12
 
         # Marketing and the thank-you belong on slips a CUSTOMER receives. The
         # same table and this same renderer also print web-order picking and
@@ -1065,19 +1083,14 @@ class POSSlipPrintJob(QThread):
         ):
             out += self._txt(line[: self.width_chars])
         out += self._esc(ESC, 0x61, 0x00)
-
-        # ── Thank you ───────────────────────────────────────────────
-        # Same wording pos_slip_preview.html already prints, so the paper and
-        # the on-screen preview agree. Skipped on picking/packing slips for the
-        # same reason the marketing block is.
         if is_customer_slip:
             out += self._txt(self._line_sep())
             out += self._esc(ESC, 0x61, 0x01)     # center
             out += self._txt("Thank you for your purchase")
             out += self._esc(ESC, 0x61, 0x00)     # left
 
-        out += bytes([LF, LF, LF])
-        out += self._esc(GS, 0x56, 0x41, 0x00)        # full cut
+        out += bytes([LF] * 5)
+        out += self._esc(GS, 0x56, 0x41, 0x00)
         return bytes(out)
 
     def run(self):
@@ -1086,9 +1099,9 @@ class POSSlipPrintJob(QThread):
         _t0 = _t.monotonic()
         try:
             payload = self._build_receipt_bytes()
-            log.info("POSSlip: %db, width=%d, qr=%s -> %s",
-                     len(payload), self.width_chars, self.qr_mode,
-                     self.printer_device)
+            log.info("POSSlip: %db, width=%d, usable=%d, lines=%d, qr=%s -> %s",
+                     len(payload), self.width_chars, self.width_chars - 1,
+                     payload.count(0x0A), self.qr_mode, self.printer_device)
             try:
                 from vula_printer_target import PrinterTarget, dispatch_print
                 target = PrinterTarget.from_assignment(self.printer_device)
@@ -1142,7 +1155,12 @@ class POSEODReportPrintJob(QThread):
         return bytes(values)
 
     def _line_sep(self, ch: str = "-") -> str:
-        return ch * self.width_chars
+        # One column short of the head on purpose: a line that fills the
+        # last printable column makes the printer autowrap, and the
+        # trailing LF then advances a second time — two physical lines
+        # for every row that sits on the margin. Measured on the 40-item
+        # fixture: 60 such rows at 58 mm ≈ 25 cm of surplus paper.
+        return ch * max(1, self.width_chars - 1)
 
     def _col2(self, left: str, right: str) -> str:
         """Two-column layout. Guarantees the result fits within
@@ -1151,20 +1169,25 @@ class POSEODReportPrintJob(QThread):
         product title + qty) plus a long right column (large-rand
         line total) produced a line wider than width_chars, which
         _txt then hard-truncated from the right, silently chopping
-        the money column off the receipt (audit H11)."""
+        the money column off the receipt (audit H11).
+
+        Every bound is one column short of the head, for the same reason
+        as _line_sep(): a row padded to exactly width_chars lands on the
+        printer's right margin and costs two physical lines, not one."""
+        w = max(1, self.width_chars - 1)
         l = str(left or "")
         r = str(right or "")
-        if len(r) >= self.width_chars:
+        if len(r) >= w:
             # Right column alone fills/exceeds the line. Give it the
             # whole line — left dropped, price preserved.
-            return r[: self.width_chars]
-        avail = self.width_chars - len(r) - 1  # one separator space
+            return r[:w]
+        avail = w - len(r) - 1  # one separator space
         if len(l) > avail:
             if avail >= 2:
                 l = l[: avail - 1] + "…"
             else:
                 l = l[:avail]
-        pad = self.width_chars - len(l) - len(r)
+        pad = w - len(l) - len(r)
         return f"{l}{' ' * pad}{r}"
 
     def _txt(self, text: str = "") -> bytes:
@@ -1172,10 +1195,13 @@ class POSEODReportPrintJob(QThread):
         # POSSlipPrintJob._txt (see that method's comment for the
         # detailed rationale — ESC/POS injection vectors, why stripping
         # non-ASCII here would be worse than visible "?" substitution).
+        # \t and \n are flattened to a space for the same reason as the
+        # slip: a newline breaks a _col2 row after the padding was
+        # computed, and a tab advances to the next tab stop.
         cleaned_chars = []
         for c in str(text):
             if c == "\t" or c == "\n":
-                cleaned_chars.append(c)
+                cleaned_chars.append(" ")
                 continue
             o = ord(c)
             if o < 0x20:
@@ -1188,9 +1214,12 @@ class POSEODReportPrintJob(QThread):
         cleaned = "".join(cleaned_chars)
         # Truncate to configured receipt width — without this a 58 mm
         # printer wraps long _col2 lines at its own narrower width and
-        # misaligns the money columns.
-        if len(cleaned) > self.width_chars:
-            cleaned = cleaned[: self.width_chars]
+        # misaligns the money columns. One column short, matching
+        # _line_sep()/_col2(), so no row lands on the right margin and
+        # costs a second physical line.
+        limit = max(1, self.width_chars - 1)
+        if len(cleaned) > limit:
+            cleaned = cleaned[:limit]
         return (cleaned + "\n").encode("ascii", errors="replace")
 
     def _build_receipt_bytes(self) -> bytes:
@@ -1243,7 +1272,7 @@ class POSEODReportPrintJob(QThread):
                 sales_cents = int(row.get("sales_cents", 0) or 0)
                 out += self._txt(self._col2(name, f"R {self._cents_to_amount(sales_cents)}"))
 
-        out += bytes([LF, LF, LF])
+        out += bytes([LF] * 5)
         out += self._esc(GS, 0x56, 0x41, 0x00)
         return bytes(out)
 
